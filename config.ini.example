@@ -1,0 +1,10 @@
+[Pipefy]
+source = up-and-up
+pipefy_api_url = https://api.pipefy.com/graphql
+pipefy_api_token = YOUR_PIPEFY_API_TOKEN_HERE
+org_id = YOUR_ORG_ID_HERE
+
+[PaperTrail]
+papertrail_log_token =
+papertrail_host = logs.papertrailapp.com
+; papertrail_port = 12345

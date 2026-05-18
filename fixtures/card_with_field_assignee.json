@@ -1,0 +1,24 @@
+{
+  "id": "C3",
+  "title": "Field-level assignee swap",
+  "url": "https://app.pipefy.com/cards/C3",
+  "current_phase": {"id": "P1", "name": "Design"},
+  "assignees": [],
+  "fields": [
+    {
+      "name": "creative_specialist",
+      "value": "[\"300111\", \"300999\"]",
+      "array_value": [
+        {"id": "300111", "name": "Kate Smith"},
+        {"id": "300999", "name": "Bystander"}
+      ],
+      "field": {"id": "creative_specialist", "label": "Creative Specialist", "type": "assignee_select"}
+    },
+    {
+      "name": "notes",
+      "value": "irrelevant",
+      "array_value": null,
+      "field": {"id": "notes", "label": "Notes", "type": "long_text"}
+    }
+  ]
+}

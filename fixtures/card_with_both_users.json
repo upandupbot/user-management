@@ -1,0 +1,12 @@
+{
+  "id": "C2",
+  "title": "Both users + bystander",
+  "url": "https://app.pipefy.com/cards/C2",
+  "current_phase": {"id": "P1", "name": "In Progress"},
+  "assignees": [
+    {"id": "300111", "name": "Kate Smith", "email": "kate.smith@upandup.com"},
+    {"id": "300222", "name": "Robyn Seth", "email": "robyn.seth@upandup.com"},
+    {"id": "300999", "name": "Bystander", "email": "by@upandup.com"}
+  ],
+  "fields": []
+}

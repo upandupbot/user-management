@@ -1,0 +1,8 @@
+{
+  "id": "C4",
+  "title": "Card in Finance Recon",
+  "url": "https://app.pipefy.com/cards/C4",
+  "current_phase": {"id": "P9", "name": "  finance RECON "},
+  "assignees": [{"id": "300111", "name": "Kate Smith", "email": "kate.smith@upandup.com"}],
+  "fields": []
+}

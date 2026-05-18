@@ -1,0 +1,8 @@
+{
+  "id": "C1",
+  "title": "Only old user, card-level",
+  "url": "https://app.pipefy.com/cards/C1",
+  "current_phase": {"id": "P1", "name": "In Progress"},
+  "assignees": [{"id": "300111", "name": "Kate Smith", "email": "kate.smith@upandup.com"}],
+  "fields": []
+}
