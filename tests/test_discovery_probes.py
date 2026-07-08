@@ -5,8 +5,18 @@ from swap_assignee.card_iterator import (
     probe_card_level_assignee,
     probe_field_value,
 )
+from swap_assignee.web import _norm_role_label
 
 from _fakes import FakeClient
+
+
+def test_norm_role_label_dedupes_variants():
+    assert _norm_role_label("Account Manager") == "account manager"
+    assert _norm_role_label("  account   MANAGER ") == "account manager"
+    assert _norm_role_label("Tester(s)") == "tester"
+    assert _norm_role_label("Tester") == "tester"
+    assert _norm_role_label("") == ""
+    assert _norm_role_label(None) == ""
 
 
 def test_probe_card_level_hit():

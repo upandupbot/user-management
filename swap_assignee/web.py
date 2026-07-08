@@ -137,6 +137,20 @@ def _gc_preview_store() -> None:
         _PREVIEW_STORE.pop(k, None)
 
 
+def _norm_role_label(label: str) -> str:
+    """Normalize an assignee-field label into a role key.
+
+    Backend pipes often carry near-duplicate labels for the same human role
+    ("Reviewer" in three phases, "Tester(s)" vs "Tester"). The UI shows ONE
+    role per key; at scan time the key expands back to every matching field
+    in each pipe. Lowercased, whitespace collapsed, trailing "(s)" dropped.
+    """
+    s = " ".join((label or "").strip().lower().split())
+    if s.endswith("(s)"):
+        s = s[:-3].strip()
+    return s
+
+
 def _discover_resolve_user(client, pipes: List[Dict[str, str]], user_input: str, org_id_override):
     """Resolve a user org-wide (no specific pipe chosen yet).
 
@@ -966,18 +980,28 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pipesAlerts"></div>
   </section>
 
-  <!-- Step 3: phases -->
+  <!-- Step 3: roles + phases -->
   <section id="phasesPanel" class="panel hidden">
     <div class="panel-head">
       <span class="step">03</span>
-      <h2>Skip these phases</h2>
-      <span class="hint">Ticked phases are ignored — recommended ones come pre-ticked</span>
+      <h2>Narrow the search</h2>
+      <span class="hint">Fewer roles = faster scan · ticked phases are skipped</span>
     </div>
-    <div class="col" style="max-width: 640px;">
-      <label>Phases across the selected pipes <span class="small" id="phasePickCount"></span></label>
-      <div id="phasePickList" class="field-list"></div>
-      <div class="small" style="margin-top: 8px; color: var(--muted);">
-        Cards sitting in a ticked phase are left untouched (Completed, Cancelled, etc.).
+    <div class="row">
+      <div class="col" style="flex: 1 1 300px; max-width: 520px;">
+        <label>Roles to swap <span class="small" id="rolePickCount"></span></label>
+        <div id="rolePickList" class="field-list"></div>
+        <div class="small" style="margin-top: 8px; color: var(--muted);">
+          Tick the role(s) this person holds — e.g. Account Manager. Ticking
+          everything searches every assignee field, which is slower.
+        </div>
+      </div>
+      <div class="col" style="flex: 1 1 300px; max-width: 520px;">
+        <label>Skip these phases <span class="small" id="phasePickCount"></span></label>
+        <div id="phasePickList" class="field-list"></div>
+        <div class="small" style="margin-top: 8px; color: var(--muted);">
+          Cards sitting in a ticked phase are left untouched (Completed, Cancelled, etc.).
+        </div>
       </div>
     </div>
     <div class="actions">
@@ -1256,6 +1280,7 @@ $('pipesBtn').addEventListener('click', async () => {
     setBusy('pipesSpin', 'pipesStatus', false, '');
     (data.errors || []).forEach(w => $('pipesAlerts').appendChild(alertEl('warn', escapeHtml(w))));
     renderPhasePick(data.phases || []);
+    renderRolePick(data.roles || []);
     $('phasesPanel').classList.remove('hidden');
     $('phasesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
@@ -1288,6 +1313,42 @@ function renderPhasePick(phases) {
 function getExcludedPhases() {
   return Array.from(document.querySelectorAll('#phasePickList input[type=checkbox]:checked'))
     .map(cb => cb.dataset.phase);
+}
+
+function renderRolePick(roles) {
+  const host = $('rolePickList');
+  host.innerHTML = '';
+  roles.forEach(r => {
+    const row = document.createElement('label');
+    row.className = 'row-item';
+    row.innerHTML = `
+      <input type="checkbox" data-role="${escapeAttr(r.key)}">
+      <span class="name">${escapeHtml(r.label)}</span>
+      <span class="meta">${r.pipes} pipe${r.pipes === 1 ? '' : 's'} · ${r.fields} field${r.fields === 1 ? '' : 's'}</span>
+    `;
+    host.appendChild(row);
+  });
+  if (!roles.length) {
+    host.innerHTML = '<div class="small" style="padding:10px 14px;">No assignee fields found on the selected pipes.</div>';
+  }
+  updateRoleCount();
+  host.addEventListener('change', updateRoleCount);
+}
+
+function updateRoleCount() {
+  const all = document.querySelectorAll('#rolePickList input[type=checkbox]');
+  const on = document.querySelectorAll('#rolePickList input[type=checkbox]:checked');
+  $('rolePickCount').textContent = all.length
+    ? (on.length === all.length ? `(all ${all.length} roles)` : `(${on.length} of ${all.length} roles)`)
+    : '';
+}
+
+// Returns null when every role is ticked (= no narrowing, scan all fields).
+function getSelectedRoles() {
+  const all = Array.from(document.querySelectorAll('#rolePickList input[type=checkbox]'));
+  const on = all.filter(cb => cb.checked);
+  if (!all.length || on.length === all.length) return null;
+  return on.map(cb => cb.dataset.role);
 }
 
 // ---------- step 3 -> 4: multi-pipe field-level scan ----------
@@ -1327,6 +1388,11 @@ async function runWizardScan() {
     $('phasesAlerts').appendChild(alertEl('error', 'No pipes selected — go back to step 02.'));
     return;
   }
+  const roleBoxes = document.querySelectorAll('#rolePickList input[type=checkbox]');
+  if (roleBoxes.length && !document.querySelectorAll('#rolePickList input[type=checkbox]:checked').length) {
+    $('phasesAlerts').appendChild(alertEl('error', 'Tick at least one role to search.'));
+    return;
+  }
   wizGroups.clear();
   _scanError = null;
   $('pipeGroups').innerHTML = '';
@@ -1364,6 +1430,7 @@ async function runWizardScan() {
         org_id: $('orgId').value.trim() || null,
         pipe_ids: pipeIds,
         exclude_phases: getExcludedPhases(),
+        roles: getSelectedRoles(),
         throttle_ms: parseInt($('throttleMs').value, 10) || 0,
       }),
     });
@@ -1546,8 +1613,10 @@ function finalizePipeGroup(g, evt) {
   g.token = evt.token || null;
   g.status.textContent = '';
   if (evt.no_fields) {
-    g.count.textContent = 'no assignee fields';
-    g.empty.textContent = 'This pipe has no assignee fields — nothing to swap.';
+    g.count.textContent = evt.no_matching_roles ? 'no matching roles' : 'no assignee fields';
+    g.empty.textContent = evt.no_matching_roles
+      ? 'None of the selected roles exist on this pipe — nothing searched.'
+      : 'This pipe has no assignee fields — nothing to swap.';
     g.empty.classList.remove('hidden');
     return;
   }
@@ -2474,11 +2543,12 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
     @app.post("/api/wizard/phases")
     def api_wizard_phases():
-        """Step 2: union of phase names across the selected pipes.
+        """Step 2: phases AND roles across the selected pipes.
 
-        Each entry aggregates how many pipes have that phase and the total
-        card count. `suggested` marks phases we recommend excluding: done /
-        terminal-named phases plus the tool's default exclusion list.
+        Phases: union of names with card counts; `suggested` marks the ones
+        we recommend excluding. Roles: assignee-field labels deduped via
+        `_norm_role_label` — the UI offers them as a narrowing filter so a
+        scan for e.g. "Account Manager" only queries those fields.
         """
         body = request.get_json(force=True, silent=True) or {}
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
@@ -2490,6 +2560,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
         default_norm = {_norm(n) for n in DEFAULT_EXCLUDED_PHASES}
         agg: Dict[str, Dict[str, Any]] = {}
+        roles_agg: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
         names = {p["id"]: p["name"] for p in KNOWN_PIPES}
         for pid in pipe_ids:
@@ -2509,8 +2580,28 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     ent["cards_count"] += int(ph.get("cards_count") or 0)
                     if kind == "skipped" or key in default_norm:
                         ent["suggested"] = True
+            try:
+                fields = discover_assignee_fields(client, pid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("wizard: field discovery failed for %s: %s", pid, exc)
+                errors.append(f"Could not list roles for {names.get(pid, pid)}.")
+                continue
+            seen_in_pipe: set = set()
+            for meta in fields.values():
+                label = meta.get("label") or meta.get("id") or ""
+                key = _norm_role_label(label)
+                if not key:
+                    continue
+                ent = roles_agg.setdefault(key, {
+                    "key": key, "label": label, "pipes": 0, "fields": 0,
+                })
+                ent["fields"] += 1
+                if key not in seen_in_pipe:
+                    ent["pipes"] += 1
+                    seen_in_pipe.add(key)
         phases = sorted(agg.values(), key=lambda e: (not e["suggested"], str(e["name"]).lower()))
-        return jsonify({"phases": phases, "errors": errors})
+        roles = sorted(roles_agg.values(), key=lambda e: str(e["label"]).lower())
+        return jsonify({"phases": phases, "roles": roles, "errors": errors})
 
     @app.post("/api/wizard/scan/stream")
     def api_wizard_scan_stream():
@@ -2528,6 +2619,10 @@ def create_app(config_path: str = "config.ini") -> Flask:
         org_id_override = (body.get("org_id") or "").strip() or None
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
         exclude_phases = list(body.get("exclude_phases") or [])
+        # Optional role narrowing: normalized role keys. Empty/absent = all roles.
+        role_keys = {
+            _norm_role_label(r) for r in (body.get("roles") or []) if r
+        }
         throttle_ms = body.get("throttle_ms", 250)
         if not old_input or not new_input or not pipe_ids:
             return jsonify({"error": "old_user, new_user, and pipe_ids are required."}), 400
@@ -2556,6 +2651,13 @@ def create_app(config_path: str = "config.ini") -> Flask:
                             "message": f"Could not discover fields: {exc}",
                         }) + "\n"
                         continue
+                    # Role narrowing: keep only fields whose label matches a
+                    # selected role key. Fewer fields = fewer findCards calls.
+                    if role_keys:
+                        fields = {
+                            fid: m for fid, m in fields.items()
+                            if _norm_role_label(m.get("label") or fid) in role_keys
+                        }
                     yield json.dumps({
                         "type": "pipe_start", "pipe_id": pid, "pipe_name": pname,
                         "fields": len(fields),
@@ -2564,6 +2666,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         yield json.dumps({
                             "type": "pipe_done", "pipe_id": pid, "token": None,
                             "plans": 0, "no_fields": True,
+                            "no_matching_roles": bool(role_keys),
                         }) + "\n"
                         pipes_scanned += 1
                         continue
