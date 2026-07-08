@@ -1289,7 +1289,7 @@ $('pipesBtn').addEventListener('click', async () => {
     const data = await api('/api/wizard/phases', { pipe_ids: pipeIds });
     setBusy('pipesSpin', 'pipesStatus', false, '');
     (data.errors || []).forEach(w => $('pipesAlerts').appendChild(alertEl('warn', escapeHtml(w))));
-    renderPhasePick(data.phases || []);
+    renderPhasePick(data.phases_by_pipe || []);
     renderRolePick(data.roles_by_pipe || []);
     $('phasesPanel').classList.remove('hidden');
     $('phasesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1301,28 +1301,47 @@ $('pipesBtn').addEventListener('click', async () => {
   }
 });
 
-function renderPhasePick(phases) {
+// Phases grouped by pipe: exclusions apply per pipe, so skipping
+// "Completed" under Creative doesn't touch other pipes' phases.
+function renderPhasePick(phasesByPipe) {
   const host = $('phasePickList');
   host.innerHTML = '';
-  phases.forEach(ph => {
-    const row = document.createElement('label');
-    row.className = 'row-item';
-    row.innerHTML = `
-      <input type="checkbox" data-phase="${escapeAttr(ph.name)}" ${ph.suggested ? 'checked' : ''}>
-      <span class="name">${escapeHtml(ph.name)}</span>
-      ${ph.suggested ? '<span class="pill">auto</span>' : ''}
-      <span class="meta">${ph.pipes} pipe${ph.pipes === 1 ? '' : 's'} · ~${Number(ph.cards_count || 0).toLocaleString()} cards</span>
-    `;
-    host.appendChild(row);
+  let total = 0, sug = 0;
+  phasesByPipe.forEach(entry => {
+    if (!entry.phases || !entry.phases.length) return;
+    const head = document.createElement('div');
+    head.className = 'row-head';
+    head.textContent = entry.pipe_name;
+    host.appendChild(head);
+    entry.phases.forEach(ph => {
+      total++;
+      if (ph.suggested) sug++;
+      const row = document.createElement('label');
+      row.className = 'row-item';
+      row.innerHTML = `
+        <input type="checkbox" data-pipe="${escapeAttr(entry.pipe_id)}" data-phase="${escapeAttr(ph.name)}" ${ph.suggested ? 'checked' : ''}>
+        <span class="name">${escapeHtml(ph.name)}</span>
+        ${ph.suggested ? '<span class="pill">auto</span>' : ''}
+        <span class="meta" style="display:inline;">~${Number(ph.cards_count || 0).toLocaleString()} cards</span>
+      `;
+      host.appendChild(row);
+    });
   });
-  const sug = phases.filter(p => p.suggested).length;
-  $('phasePickCount').textContent = phases.length
-    ? `(${phases.length} phases, ${sug} pre-ticked)` : '(no phases found)';
+  if (!total) {
+    host.innerHTML = '<div class="small" style="padding:10px 14px;">No phases found on the selected pipes.</div>';
+  }
+  $('phasePickCount').textContent = total ? `(${total} phases, ${sug} pre-ticked)` : '';
 }
 
-function getExcludedPhases() {
-  return Array.from(document.querySelectorAll('#phasePickList input[type=checkbox]:checked'))
-    .map(cb => cb.dataset.phase);
+// {pipe_id: [phase names]} — ticked = excluded, per pipe.
+function getExcludedPhasesByPipe() {
+  const map = {};
+  document.querySelectorAll('#phasePickList input[type=checkbox]').forEach(cb => {
+    const pid = cb.dataset.pipe;
+    map[pid] = map[pid] || [];
+    if (cb.checked) map[pid].push(cb.dataset.phase);
+  });
+  return map;
 }
 
 // Roles grouped by pipe: the same human role (e.g. Reviewer) can exist on
@@ -1454,7 +1473,7 @@ async function runWizardScan() {
         new_user: $('newUser').value.trim(),
         org_id: $('orgId').value.trim() || null,
         pipe_ids: pipeIds,
-        exclude_phases: getExcludedPhases(),
+        exclude_phases_by_pipe: getExcludedPhasesByPipe(),
         roles_by_pipe: getSelectedRolesByPipe(),
         throttle_ms: parseInt($('throttleMs').value, 10) || 0,
       }),
@@ -2584,7 +2603,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
             return " ".join((s or "").strip().lower().split())
 
         default_norm = {_norm(n) for n in DEFAULT_EXCLUDED_PHASES}
-        agg: Dict[str, Dict[str, Any]] = {}
+        phases_by_pipe: List[Dict[str, Any]] = []
         roles_by_pipe: List[Dict[str, Any]] = []
         errors: List[str] = []
         names = {p["id"]: p["name"] for p in KNOWN_PIPES}
@@ -2595,16 +2614,20 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 log.warning("wizard: phase fetch failed for %s: %s", pid, exc)
                 errors.append(f"Could not fetch phases for {names.get(pid, pid)}.")
                 continue
+            pipe_phases: List[Dict[str, Any]] = []
             for kind in ("active", "skipped"):
                 for ph in info[kind]:
-                    key = _norm(ph["name"])
-                    ent = agg.setdefault(key, {
-                        "name": ph["name"], "pipes": 0, "cards_count": 0, "suggested": False,
+                    pipe_phases.append({
+                        "name": ph["name"],
+                        "cards_count": int(ph.get("cards_count") or 0),
+                        "suggested": kind == "skipped" or _norm(ph["name"]) in default_norm,
                     })
-                    ent["pipes"] += 1
-                    ent["cards_count"] += int(ph.get("cards_count") or 0)
-                    if kind == "skipped" or key in default_norm:
-                        ent["suggested"] = True
+            pipe_phases.sort(key=lambda e: (not e["suggested"], str(e["name"]).lower()))
+            phases_by_pipe.append({
+                "pipe_id": pid,
+                "pipe_name": names.get(pid, pid),
+                "phases": pipe_phases,
+            })
             try:
                 fields = discover_assignee_fields(client, pid)
             except Exception as exc:  # noqa: BLE001
@@ -2632,8 +2655,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 "pipe_name": names.get(pid, pid),
                 "roles": sorted(pipe_roles.values(), key=lambda e: str(e["label"]).lower()),
             })
-        phases = sorted(agg.values(), key=lambda e: (not e["suggested"], str(e["name"]).lower()))
-        return jsonify({"phases": phases, "roles_by_pipe": roles_by_pipe, "errors": errors})
+        return jsonify({
+            "phases_by_pipe": phases_by_pipe,
+            "roles_by_pipe": roles_by_pipe,
+            "errors": errors,
+        })
 
     @app.post("/api/wizard/scan/stream")
     def api_wizard_scan_stream():
@@ -2651,6 +2677,13 @@ def create_app(config_path: str = "config.ini") -> Flask:
         org_id_override = (body.get("org_id") or "").strip() or None
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
         exclude_phases = list(body.get("exclude_phases") or [])
+        # Per-pipe phase exclusions {pipe_id: [names]}; falls back to the
+        # flat `exclude_phases` list for any pipe not in the map.
+        raw_excl = body.get("exclude_phases_by_pipe") or {}
+        exclude_by_pipe = {
+            str(pid): [str(n) for n in (names_ or []) if n]
+            for pid, names_ in raw_excl.items()
+        } if isinstance(raw_excl, dict) else {}
         # Optional role narrowing. Preferred: `roles_by_pipe` {pipe_id: [keys]}
         # so a role ticked under Creative doesn't widen the Media scan.
         # Legacy: flat `roles` list applied to every pipe.
@@ -2719,7 +2752,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         "include_card_level": False,   # wizard is field-level only
                         "card_add_only": False,
                         "field_ids": list(fields.keys()),
-                        "exclude_phases": exclude_phases,
+                        "exclude_phases": exclude_by_pipe.get(pid, exclude_phases),
                         "throttle_ms": throttle_ms,
                     }
                     plans_n = 0
