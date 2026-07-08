@@ -198,12 +198,12 @@ INDEX_HTML = r"""<!doctype html>
       --coral-soft: #FBD3CB;
       --orange: #EE5A45;       /* selection accent */
       --blush: #F4A89E;        /* slipstream blush pink */
-      --ok: #1F6E3F;
-      --ok-bg: #E7F0E8;
-      --warn: #8A5A0E;
-      --warn-bg: #F6EBD3;
-      --danger: #B7301F;
-      --danger-bg: #F8E2DD;
+      --ok: #2E2B28;           /* success reads calm ink on blush — no traffic-light green */
+      --ok-bg: #FBF0EB;
+      --warn: #96652F;         /* warm terracotta-tan */
+      --warn-bg: #F7EDDD;
+      --danger: #C8392B;       /* deep coral — errors stay in the brand family */
+      --danger-bg: #FBE2DC;
       --shadow: 0 24px 64px rgba(20, 18, 16, 0.10);
       --radius: 20px;          /* soft, rounded — like their pill menu */
     }
@@ -465,7 +465,7 @@ INDEX_HTML = r"""<!doctype html>
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; border: 1px solid currentColor; }
-    .badge.ok { background: transparent; color: var(--ok); }
+    .badge.ok { background: transparent; color: var(--coral); }
     .badge.warn { background: transparent; color: var(--warn); }
 
     /* Phase scan strip — compact two-row table so long pipes
@@ -522,7 +522,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .alert.error { background: var(--danger-bg); border-color: var(--danger); color: var(--danger); }
     .alert.warn  { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
-    .alert.ok    { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+    .alert.ok    { background: var(--ok-bg); border-color: var(--coral); color: var(--ink); }
 
     /* ---------- Resolved users summary ---------- */
     .resolved {
@@ -888,7 +888,7 @@ INDEX_HTML = r"""<!doctype html>
       <label for="gatePw">Access password</label>
       <input id="gatePw" type="password" placeholder="Shared team password" autocomplete="current-password">
     </div>
-    <div id="gateError" class="alert err hidden" style="margin-bottom: 14px;"></div>
+    <div id="gateError" class="alert error hidden" style="margin-bottom: 14px;"></div>
     <div class="actions">
       <button id="gateGo" class="primary">Continue</button>
       <span id="gateSpin" class="spinner"></span>
@@ -1688,6 +1688,7 @@ function buildPlanRows(p, i, mode, showMeta) {
 // ---------- developer panel: log polling ----------
 let logSince = 0;
 let logTimer = null;
+let logsEnabled = true;  // switched off in hosted mode (dev panel hidden)
 function fmtTs(t) {
   const d = new Date(t * 1000);
   const hh = String(d.getHours()).padStart(2, '0');
@@ -1725,7 +1726,7 @@ async function pollLogs() {
   }
 }
 function startLogPolling() {
-  if (logTimer) return;
+  if (!logsEnabled || logTimer) return;
   logTimer = setInterval(pollLogs, 1500);
   pollLogs();
 }
@@ -1799,6 +1800,11 @@ async function initGate() {
     const r = await fetch('/api/session');
     const s = await r.json();
     gatePasswordRequired = !!s.password_required;
+    // Hosted mode: operators don't need the developer terminal.
+    if (gatePasswordRequired) {
+      logsEnabled = false;
+      $('devPanel').classList.add('hidden');
+    }
     if (s.authed) { unlockApp(s.email); return; }
   } catch (e) { /* fall through to the gate */ }
   // Local no-password mode: a previously saved email is enough.
