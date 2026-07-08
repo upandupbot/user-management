@@ -208,11 +208,11 @@ INDEX_HTML = r"""<!doctype html>
       --rule: #E6E2DC;         /* hairline rules — light, airy */
       --border: #E6E2DC;
       --border-strong: #131211;
-      --coral: #EE5A45;        /* slipstream coral */
+      --coral: #F2623A  /* slipstream coral */
       --coral-deep: #C8392B;
       --coral-soft: #FBD3CB;
       --orange: #EE5A45;       /* selection accent */
-      --blush: #F4A89E;        /* slipstream blush pink */
+      --blush: #F9BEC0  /* slipstream blush pink */
       --ok: #2E2B28;           /* success reads calm ink on blush — no traffic-light green */
       --ok-bg: #FBF0EB;
       --warn: #96652F;         /* warm terracotta-tan */
