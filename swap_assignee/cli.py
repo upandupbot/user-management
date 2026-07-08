@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from .config import load_config, mask_secret
 from .pipefy_client import PipefyClient
@@ -18,12 +18,20 @@ from .user_resolver import (
     scan_pipe_cards_for_user,
     UserResolutionError,
 )
-from .card_iterator import discover_assignee_fields, iter_cards
+from .card_iterator import discover_assignee_fields, iter_cards, iter_cards_fast_union
 from .swap_engine import (
     DEFAULT_EXCLUDED_PHASES,
     execute_plan,
     plan_card,
 )
+from .audit import (
+    ALLOWED_EMAIL_DOMAINS,
+    AuditStore,
+    is_allowed_email,
+    normalize_email,
+    record_swap,
+)
+from .sheets_sink import build_sheet_sink
 
 
 log = logging.getLogger("swap_assignee")
@@ -61,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--exclude-phase",
         action="append",
         default=None,
-        help='Phase name to skip (case-insensitive). Repeatable. Defaults to "Cancelled", "Completed", "Finance Recon" if omitted.',
+        help='Phase name to skip (case-insensitive). Repeatable. Defaults to "Cancelled", "Completed Jobs", "Completed Review Tasks", "Completed", "Finance Recon" if omitted.',
     )
     p.add_argument("--field", action="append", default=None, help="Restrict to a specific assignee field (id or label, quote labels with spaces). Repeatable.")
     p.add_argument("--all-fields", action="store_true", help="Operate on every assignee field on the pipe.")
@@ -78,14 +86,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Skip card-level assignees.",
     )
+    p.add_argument(
+        "--card-add-only",
+        action="store_true",
+        help=(
+            "At the card-level, ADD the new user but do NOT remove the old user. "
+            "Pipefy's updateCard mutation re-notifies every assignee whenever the "
+            "assignee list changes; by appending instead of swapping, only the new "
+            "user gets pinged. Remove the old user manually in the Pipefy admin "
+            "panel afterwards. Does not affect field-level swaps."
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="Actually mutate. Default is dry-run.")
     p.add_argument("--yes", action="store_true", help="Skip confirmation prompt for bulk apply.")
+    p.add_argument(
+        "--operator-email",
+        default=None,
+        help=(
+            "Your company email (used for the audit trail). Required with --apply. "
+            "Must be on an approved Up&Up domain. Falls back to SWAP_OPERATOR_EMAIL env var."
+        ),
+    )
     p.add_argument("--config", default="config.ini", help="Path to config.ini (default: ./config.ini).")
     p.add_argument("--limit", type=int, default=None, help="Cap cards considered (for testing).")
     p.add_argument("--throttle-ms", type=int, default=250, help="Sleep between mutations (ms).")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--report", default=None, help="Write CSV report to this path.")
     p.add_argument("--org-id", default=None, help="Override organization ID (otherwise auto-detected from pipe).")
+    p.add_argument("--no-cache", action="store_true", help="Bypass the on-disk cache for pipe members and org users.")
+    p.add_argument("--clear-cache", action="store_true", help="Delete cached pipe/org lookups before running.")
     p.add_argument("--confirm-threshold", type=int, default=5, help="Prompt before applying when more than N cards would change.")
     p.add_argument(
         "--preview-limit",
@@ -106,6 +135,29 @@ def _setup_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+
+def _cli_plan_to_dict(plan) -> Dict[str, object]:
+    """Shape a CardPlan into the dict the audit layer expects (one row per action)."""
+    return {
+        "card_id": plan.card_id,
+        "card_url": plan.card_url,
+        "title": plan.title,
+        "phase_name": plan.phase_name,
+        "client": getattr(plan, "client", "") or "",
+        "actions": [
+            {
+                "scope": a.scope,
+                "field_label": a.field_label,
+                "old_ids": list(a.old_ids),
+                "new_ids": list(a.new_ids),
+                "old_names": list(getattr(a, "old_names", []) or []),
+                "new_names": list(getattr(a, "new_names", []) or []),
+                "mode": getattr(a, "mode", "swap"),
+            }
+            for a in plan.actions
+        ],
+    }
 
 
 def _print_preview(plans, *, old_user, new_user, limit: int, file=None) -> None:
@@ -132,9 +184,13 @@ def _print_preview(plans, *, old_user, new_user, limit: int, file=None) -> None:
             scope = "card-level" if action.scope == "card" else f"field {action.field_id}"
             old_ids = ",".join(action.old_ids) or "(none)"
             new_ids = ",".join(action.new_ids) or "(none)"
+            if getattr(action, "mode", "swap") == "add_only":
+                detail = f"add {new_user.id}; KEEP {old_user.id} (remove manually in Pipefy)"
+                scope = f"{scope} (ADD-ONLY)"
+            else:
+                detail = f"remove {old_user.id}, add {new_user.id}"
             file.write(
-                f"        - {scope}: [{old_ids}] -> [{new_ids}]"
-                f"  (remove {old_user.id}, add {new_user.id})\n"
+                f"        - {scope}: [{old_ids}] -> [{new_ids}]  ({detail})\n"
             )
     if len(shown) < total:
         file.write(f"... {total - len(shown)} more not shown (raise --preview-limit to see all).\n")
@@ -359,39 +415,54 @@ def _list_users_mode(client, pipe_id: str, org_id_override: Optional[str]) -> in
     return 0
 
 
-def _resolve_users(client, pipe_id: str, old_input: str, new_input: str, org_id_override: Optional[str]):
-    ctx = fetch_pipe_context(client, pipe_id)
+def _resolve_users(client, pipe_id: str, old_input: str, new_input: str, org_id_override: Optional[str], *, use_cache: bool = True):
+    import time as _time
+    t0 = _time.time()
+    ctx = fetch_pipe_context(client, pipe_id, use_cache=use_cache)
     org_id = org_id_override or ctx.get("org_id")
     org_users: List[User] = []
     if org_id:
         try:
-            org_users = fetch_org_users(client, org_id)
+            org_users = fetch_org_users(client, org_id, use_cache=use_cache)
         except Exception as exc:
             log.warning("Could not fetch org users for org %s: %s", org_id, exc)
     members = ctx["members"]
     log.info(
-        "Resolving users against %d pipe members and %d org users (org_id=%s)",
-        len(members), len(org_users), org_id or "?",
+        "Resolving users against %d pipe members and %d org users (org_id=%s) [%.2fs setup]",
+        len(members), len(org_users), org_id or "?", _time.time() - t0,
     )
 
-    def _resolve_with_fallback(value: str) -> User:
+    # First pass: try the in-memory pools for both users.
+    pending: List[str] = []
+    resolved: Dict[str, User] = {}
+    for value in (old_input, new_input):
+        if value in resolved:
+            continue
         try:
-            return resolve_user(value, members, org_users)
-        except UserResolutionError as primary_exc:
-            log.warning(
-                "User '%s' not found in pipe members or org users; "
-                "scanning pipe cards for an existing assignee match...",
-                value,
-            )
-            found = scan_pipe_cards_for_user(client, pipe_id, value)
-            if found:
-                log.info("Resolved '%s' via card scan: id=%s name=%s", value, found.id, found.name)
-                return found
-            raise primary_exc
+            resolved[value] = resolve_user(value, members, org_users)
+        except UserResolutionError:
+            pending.append(value)
 
-    old_user = _resolve_with_fallback(old_input)
-    new_user = _resolve_with_fallback(new_input)
-    return ctx, old_user, new_user
+    # Second pass: if any are still missing, scan pipe cards ONCE for all of them.
+    if pending:
+        from .user_resolver import scan_pipe_cards_for_users
+        log.warning(
+            "User(s) %s not found in pipe members or org users; scanning pipe cards (single pass)...",
+            ", ".join(repr(v) for v in pending),
+        )
+        found_map = scan_pipe_cards_for_users(client, pipe_id, pending)
+        for value, user in found_map.items():
+            if user is not None:
+                log.info("Resolved '%s' via card scan: id=%s name=%s", value, user.id, user.name)
+                resolved[value] = user
+
+    # Final pass: re-raise the original error for any still-missing values.
+    for value in (old_input, new_input):
+        if value not in resolved:
+            # Re-invoke to get a consistent error message.
+            resolve_user(value, members, org_users)
+
+    return ctx, resolved[old_input], resolved[new_input]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -404,10 +475,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("ERROR: Pipefy API token missing. Set [Pipefy] pipefy_api_token in config.ini or PIPEFY_API_TOKEN env var.", file=sys.stderr)
         return 2
 
+    # Resolve operator email (CLI flag > env). Required only when applying.
+    import os as _os
+    operator_email = normalize_email(args.operator_email or _os.environ.get("SWAP_OPERATOR_EMAIL"))
+    if args.apply and not is_allowed_email(operator_email):
+        print(
+            "ERROR: --apply requires a valid company email for the audit trail.\n"
+            "       Pass --operator-email you@upandupgroup.com (or set SWAP_OPERATOR_EMAIL).\n"
+            f"       Approved domains: {', '.join(sorted(ALLOWED_EMAIL_DOMAINS))}",
+            file=sys.stderr,
+        )
+        return 2
+
     attach_papertrail(cfg.papertrail_token, cfg.papertrail_host, cfg.papertrail_port)
     log.debug("Using Pipefy URL %s with token %s", cfg.pipefy_api_url, mask_secret(cfg.pipefy_api_token))
 
     client = PipefyClient(cfg.pipefy_api_url, cfg.pipefy_api_token)
+    audit_store = AuditStore()
+    audit_sheet_sink = build_sheet_sink(cfg.audit_sheet_id, cfg.audit_service_account_file)
+
+    if args.clear_cache:
+        from .user_resolver import clear_cache
+        n = clear_cache()
+        log.info("Cleared %d cached entr%s.", n, "y" if n == 1 else "ies")
+
+    use_cache = not args.no_cache
 
     # --list-users mode: enumerate pipe members + org users, then exit.
     if args.list_users:
@@ -439,7 +531,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Resolve users (fail-fast).
     try:
         pipe_ctx, old_user, new_user = _resolve_users(
-            client, args.pipe_id, args.old_user, args.new_user, args.org_id or cfg.org_id
+            client, args.pipe_id, args.old_user, args.new_user, args.org_id or cfg.org_id, use_cache=use_cache
         )
     except UserResolutionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -560,6 +652,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"New user:       {new_user.name} <{new_user.email}> (id {new_user.id})")
     print(f"Excluded:       {', '.join(excluded_phases)}")
     print(f"Mode:           {'APPLY' if args.apply else 'DRY-RUN  (re-run with --apply to mutate)'}")
+    if args.card_add_only and args.include_card_level:
+        print("Card-level:     ADD-ONLY (keep old user; remove manually in Pipefy to avoid notification spam)")
     print()
 
     # First pass: plan everything.
@@ -567,9 +661,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cards_scanned = 0
     cards_in_excluded = 0
     cards_already_swapped = 0
-    log.info("Scan started: paging cards from pipe %s ...", args.pipe_id)
-    HEARTBEAT_EVERY = 200
-    for card in iter_cards(client, args.pipe_id):
+    use_fast_path = args.include_card_level or bool(field_filter)
+    if use_fast_path:
+        print(f"Scan mode:      server-side fast union (card_level={args.include_card_level}, fields={len(field_filter)})")
+        card_source = iter_cards_fast_union(
+            client, args.pipe_id, old_user.id,
+            include_card_level=args.include_card_level,
+            field_ids=field_filter,
+            old_user_email=old_user.email,
+            exclude_phases=excluded_phases,
+        )
+    else:
+        print("Scan mode:      full pipe scan (nothing selected)")
+        card_source = iter_cards(client, args.pipe_id, exclude_phases=excluded_phases)
+    for card in card_source:
         cards_scanned += 1
         if args.limit is not None and cards_scanned > args.limit:
             cards_scanned -= 1
@@ -586,30 +691,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             excluded_phases=excluded_phases,
             include_card_level=args.include_card_level,
             field_filter=field_filter,
+            card_add_only=args.card_add_only,
         )
         if plan.skipped_reason:
             cards_in_excluded += 1
-            # Per-card skip noise — only useful at DEBUG. Big pipes can have 1000+ skips.
-            log.debug("SKIP card %s (%s): %s", plan.card_id, plan.title, plan.skipped_reason)
-        elif not plan.actions:
+            log.info("SKIP card %s (%s): %s", plan.card_id, plan.title, plan.skipped_reason)
+            continue
+        if not plan.actions:
             # Could be already-swapped, or old user simply not present.
             log.debug("No-op for card %s (%s)", plan.card_id, plan.title)
             cards_already_swapped += 1
-        else:
-            log.debug(
-                "PLAN card %s '%s' [%s] -> %d action(s)",
-                plan.card_id, plan.title, plan.phase_name, len(plan.actions),
-            )
-            plans.append(plan)
-        if cards_scanned % HEARTBEAT_EVERY == 0:
-            log.info(
-                "Progress: %d scanned (excluded=%d, no-op=%d, to-swap=%d)",
-                cards_scanned, cards_in_excluded, cards_already_swapped, len(plans),
-            )
-    log.info(
-        "Scan complete: %d cards scanned (excluded=%d, no-op=%d, to-swap=%d)",
-        cards_scanned, cards_in_excluded, cards_already_swapped, len(plans),
-    )
+            continue
+        log.info(
+            "PLAN card %s '%s' [%s] -> %d action(s)",
+            plan.card_id, plan.title, plan.phase_name, len(plan.actions),
+        )
+        plans.append(plan)
 
     card_level_changes = sum(1 for p in plans for a in p.actions if a.scope == "card")
     field_level_changes = sum(1 for p in plans for a in p.actions if a.scope.startswith("field:"))
@@ -670,9 +767,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for plan in plans:
                 results = execute_plan(client, plan, throttle_ms=args.throttle_ms)
                 any_ok = False
+                err_msgs: List[str] = []
                 for action, err in results:
                     if err:
                         errors.append(f"{plan.card_url or plan.card_id}: {err}")
+                        err_msgs.append(str(err))
                         report.write(
                             card_id=plan.card_id,
                             card_url=plan.card_url,
@@ -698,6 +797,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         )
                 if any_ok:
                     cards_changed += 1
+                # Audit every applied card (local 30-day store + optional webhook).
+                status = "ok" if any_ok and not err_msgs else ("partial" if any_ok else "error")
+                try:
+                    record_swap(
+                        store=audit_store,
+                        webhook_url=cfg.audit_webhook_url,
+                        operator_email=operator_email,
+                        source="cli",
+                        pipe_id=str(args.pipe_id),
+                        pipe_name=pipe_ctx.get("pipe_name") or "",
+                        old_user=f"{old_user.name} <{old_user.email}>".strip(),
+                        new_user=f"{new_user.name} <{new_user.email}>".strip(),
+                        plan_dict=_cli_plan_to_dict(plan),
+                        status=status,
+                        error="; ".join(err_msgs),
+                        sheet_sink=audit_sheet_sink,
+                    )
+                except Exception:  # noqa: BLE001 - audit must never block applies
+                    log.exception("audit logging failed for card %s", plan.card_id)
     finally:
         report.close()
 

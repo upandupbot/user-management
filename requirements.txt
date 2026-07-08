@@ -1,3 +1,11 @@
 requests>=2.31
 flask>=3.0
 pytest>=7.0
+
+# Production WSGI server for hosted deployments (Render / Fly.io).
+gunicorn>=21.2 ; sys_platform != "win32"
+
+# Optional: direct Google Sheets audit sink (service-account auth).
+# Only needed if you set [Audit] sheet_id + service_account_file in config.ini.
+google-api-python-client>=2.100
+google-auth>=2.23

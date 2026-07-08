@@ -86,7 +86,14 @@ class PipefyClient:
 
             errors = data.get("errors") if isinstance(data, dict) else None
             if errors:
-                msg = "; ".join(str(e.get("message", e)) for e in errors)
+                def _err_msg(e):
+                    if isinstance(e, dict):
+                        return str(e.get("message", e))
+                    return str(e)
+                # Pipefy sometimes returns `errors` as a bare string instead of a list.
+                if isinstance(errors, (str, bytes)) or isinstance(errors, dict):
+                    errors = [errors]
+                msg = "; ".join(_err_msg(e) for e in errors)
                 if any(tok in msg.lower() for tok in ("rate limit", "throttle", "too many")):
                     if attempt > self.max_retries:
                         raise RateLimitError(msg)

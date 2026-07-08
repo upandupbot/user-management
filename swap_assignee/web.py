@@ -1,37 +1,68 @@
-"""Local web UI for the Pipefy assignee swap.
+"""Web UI for the Pipefy assignee swap.
 
-Run with:
+Local use:
     python -m swap_assignee.web
 then open http://127.0.0.1:5000 in a browser.
 
+Hosted use (Render / Fly.io):
+    gunicorn -w 1 --threads 8 -b 0.0.0.0:$PORT 'swap_assignee.web:create_app()'
+Set SWAP_WEB_PASSWORD to require a shared password + company email before the
+UI (and every API route) can be used. Keep a single worker process — preview
+plans and the log ring live in process memory.
+
 This is a thin wrapper around the same functions the CLI uses
 (`_resolve_users`, `discover_assignee_fields`, `iter_cards`, `plan_card`,
-`execute_plan`). No auth — bind to localhost only.
+`execute_plan`).
 """
 from __future__ import annotations
 
 import collections
+import hashlib
+import json
 import logging
+import os
 import secrets
 import threading
 import time
 import webbrowser
+from datetime import timedelta
 from typing import Any, Deque, Dict, List
 
 try:
-    from flask import Flask, jsonify, request, Response
+    from flask import Flask, jsonify, request, session, Response
+    from werkzeug.middleware.proxy_fix import ProxyFix
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "Flask is required for the web UI. Install with: pip install -r requirements.txt"
     ) from exc
 
-from .card_iterator import discover_assignee_fields, iter_cards
+from .card_iterator import (
+    discover_assignee_fields,
+    fetch_active_phases,
+    iter_cards,
+    iter_cards_fast_union,
+    probe_card_level_assignee,
+    probe_field_value,
+)
 from .cli import _resolve_users  # reuse exactly the CLI's resolution flow
 from .config import load_config, mask_secret
 from .papertrail_logger import attach_papertrail
 from .pipefy_client import PipefyClient
 from .swap_engine import DEFAULT_EXCLUDED_PHASES, execute_plan, plan_card
-from .user_resolver import UserResolutionError
+from .user_resolver import (
+    UserResolutionError,
+    fetch_org_users,
+    fetch_pipe_context,
+    resolve_user,
+)
+from .audit import (
+    ALLOWED_EMAIL_DOMAINS,
+    AuditStore,
+    is_allowed_email,
+    normalize_email,
+    record_swap,
+)
+from .sheets_sink import build_sheet_sink
 
 
 log = logging.getLogger("swap_assignee.web")
@@ -78,11 +109,68 @@ _PREVIEW_STORE: Dict[str, Dict[str, Any]] = {}
 _PREVIEW_TTL_SECONDS = 30 * 60  # 30 minutes
 
 
+# Curated list of pipes shown in the "Pipe" dropdown and probed by the
+# "Find pipes" discovery scan. Add new entries here (or use the
+# "Other (enter ID)…" option in the UI to type one ad-hoc).
+# Source of truth lives in PIPES.md.
+KNOWN_PIPES: List[Dict[str, str]] = [
+    {"id": "305705781", "name": "Account Management"},
+    {"id": "306751836", "name": "Always On (Social Organic)"},
+    {"id": "305709782", "name": "Creative"},
+    {"id": "306828440", "name": "Events and Activations"},
+    {"id": "305743818", "name": "Media"},
+    {"id": "306683702", "name": "MTN CBU | Social Media"},
+    {"id": "306766298", "name": "MTN EBU - Social Media"},
+    {"id": "306766315", "name": "MTN MoMo - Social Media"},
+    {"id": "306773031", "name": "PR Management"},
+    {"id": "305787071", "name": "Production"},
+    {"id": "305766460", "name": "Retail"},
+    {"id": "305723961", "name": "Social Community Management"},
+    {"id": "305709783", "name": "Strategy"},
+]
+
+
 def _gc_preview_store() -> None:
     now = time.time()
     expired = [k for k, v in _PREVIEW_STORE.items() if now - v["created_at"] > _PREVIEW_TTL_SECONDS]
     for k in expired:
         _PREVIEW_STORE.pop(k, None)
+
+
+def _discover_resolve_user(client, pipes: List[Dict[str, str]], user_input: str, org_id_override):
+    """Resolve a user org-wide (no specific pipe chosen yet).
+
+    Pipefy user ids are org-global, so one successful resolution works for
+    every pipe. We accumulate member pools pipe by pipe (disk-cached) plus
+    the org user list, and stop at the first match. Raises
+    UserResolutionError if the user is nowhere to be found.
+    """
+    members_pool: list = []
+    org_users: list = []
+    org_id = org_id_override
+    last_err: Exception | None = None
+    for p in pipes:
+        try:
+            ctx = fetch_pipe_context(client, p["id"])
+        except Exception as exc:  # noqa: BLE001 - skip unreachable pipes
+            log.warning("discover: could not fetch context for pipe %s: %s", p["id"], exc)
+            last_err = exc
+            continue
+        members_pool.extend(ctx.get("members") or [])
+        if not org_id:
+            org_id = ctx.get("org_id")
+        if org_id and not org_users:
+            try:
+                org_users = fetch_org_users(client, org_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("discover: could not fetch org users: %s", exc)
+        try:
+            return resolve_user(user_input, members_pool, org_users)
+        except UserResolutionError as exc:
+            last_err = exc
+    if isinstance(last_err, UserResolutionError):
+        raise last_err
+    raise UserResolutionError(f"Could not resolve {user_input!r} in any known pipe.")
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -93,29 +181,31 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,500;0,700;1,500&family=Inter:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,500;0,700;0,800;0,900;1,500;1,700;1,900&family=Inter:wght@400;500;600;700&display=swap">
   <style>
     :root {
-      --bg: #FBF7F2;
+      --bg: #FFFFFF;           /* the site is white-first */
       --surface: #FFFFFF;
-      --surface-2: #FAF4EE;
-      --ink: #1F1A17;
-      --ink-2: #4B403A;
-      --muted: #8A7E76;
-      --border: #ECE2D7;
-      --border-strong: #D9CABB;
-      --coral: #E94B3C;
+      --surface-2: #F4F1ED;    /* warm neutral, like their imagery backdrops */
+      --ink: #131211;          /* near-black, Up&Up logo */
+      --ink-2: #363330;
+      --muted: #8A847C;
+      --rule: #E6E2DC;         /* hairline rules — light, airy */
+      --border: #E6E2DC;
+      --border-strong: #131211;
+      --coral: #EE5A45;        /* slipstream coral */
       --coral-deep: #C8392B;
-      --coral-soft: #F8B5AC;
-      --blush: #F2A8A2;
-      --ok: #2F7D4F;
-      --ok-bg: #E6F4EC;
-      --warn: #9A6B14;
-      --warn-bg: #FBEFD4;
-      --danger: #C8392B;
-      --danger-bg: #FBE3DE;
-      --shadow: 0 1px 2px rgba(31,26,23,0.04), 0 6px 18px rgba(31,26,23,0.06);
-      --radius: 10px;
+      --coral-soft: #FBD3CB;
+      --orange: #EE5A45;       /* selection accent */
+      --blush: #F4A89E;        /* slipstream blush pink */
+      --ok: #1F6E3F;
+      --ok-bg: #E7F0E8;
+      --warn: #8A5A0E;
+      --warn-bg: #F6EBD3;
+      --danger: #B7301F;
+      --danger-bg: #F8E2DD;
+      --shadow: 0 24px 64px rgba(20, 18, 16, 0.10);
+      --radius: 20px;          /* soft, rounded — like their pill menu */
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
@@ -124,91 +214,162 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--ink);
       font-family: "Inter", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       font-size: 14px;
-      line-height: 1.5;
+      line-height: 1.55;
       -webkit-font-smoothing: antialiased;
     }
     .serif {
-      font-family: "Bodoni Moda", "Bodoni MT", Didot, "Playfair Display", Georgia, serif;
-      font-weight: 700;
-      letter-spacing: -0.005em;
+      font-family: "Bodoni Moda", "Bodoni MT", Didot, Georgia, serif;
+      font-weight: 800;
+      letter-spacing: -0.01em;
     }
 
     /* ---------- Header ---------- */
     header {
       background: var(--bg);
-      padding: 28px 32px 20px;
-      border-bottom: 1px solid var(--border);
+      padding: 30px 40px 24px;
+      border-bottom: 1px solid var(--rule);
     }
-    .wrap { max-width: 1080px; margin: 0 auto; }
+    .wrap { max-width: 1140px; margin: 0 auto; }
+    .topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
     .brand {
       font-family: "Bodoni Moda", "Bodoni MT", Didot, Georgia, serif;
-      font-weight: 700;
-      font-size: 44px;
-      line-height: 1;
-      letter-spacing: -0.01em;
+      font-weight: 800;
+      font-size: 64px;
+      line-height: 0.9;
+      letter-spacing: -0.03em;
       user-select: none;
+      color: var(--ink);
+      text-transform: lowercase;
     }
     .brand .b1 { color: var(--coral); }
-    .brand .b2 { color: var(--blush); }
-    .sub {
-      margin-top: 6px;
-      color: var(--ink-2);
-      font-size: 13px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+    .brand .b2 {
+      color: var(--blush);
+      font-family: "Inter", -apple-system, "Segoe UI", sans-serif;
+      font-weight: 800;
+      letter-spacing: -0.05em;
     }
+    .brand .amp {
+      font-style: italic;
+      font-weight: 700;
+      color: var(--ink);
+      padding: 0 2px;
+    }
+    .sub {
+      margin: 0;
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      text-align: right;
+      max-width: 280px;
+    }
+    .sub .dot { color: var(--coral); margin: 0 6px; }
+
+    /* Hero strip — sans-led statement with a serif accent word,
+       echoing "CREATIVITY ELEVATES everything" on theupandupgroup.com */
+    .hero {
+      padding: 72px 40px 56px;
+      border-bottom: 1px solid var(--rule);
+      background: var(--bg);
+    }
+    .hero .wrap { display: grid; grid-template-columns: 1fr auto; gap: 40px; align-items: end; }
+    .hero h1 {
+      margin: 0;
+      font-family: "Inter", -apple-system, "Segoe UI", sans-serif;
+      font-weight: 800;
+      font-size: clamp(48px, 7.5vw, 104px);
+      line-height: 0.94;
+      letter-spacing: -0.04em;
+      text-transform: uppercase;
+      color: var(--ink);
+    }
+    .hero h1 em {
+      font-family: "Bodoni Moda", Georgia, serif;
+      font-style: normal;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--coral);
+    }
+    .hero .kicker {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--ink);
+      max-width: 220px;
+      text-align: right;
+      line-height: 1.5;
+      padding-bottom: 6px;
+    }
+    .hero .kicker .rule { display: block; height: 2px; background: var(--ink); margin-bottom: 12px; width: 56px; margin-left: auto; }
 
     /* ---------- Layout ---------- */
-    main { padding: 28px 32px 96px; }
+    main { padding: 0 40px 96px; }
     .panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 24px 26px;
-      margin-bottom: 20px;
+      background: transparent;
+      border: 0;
+      border-bottom: 1px solid var(--rule);
+      border-radius: 0;
+      box-shadow: none;
+      padding: 36px 0 40px;
+      margin: 0;
     }
+    .panel:last-of-type { border-bottom: 0; }
     .panel-head {
-      display: flex; align-items: baseline; gap: 14px;
-      margin-bottom: 18px;
+      display: grid;
+      grid-template-columns: 92px 1fr auto;
+      align-items: baseline;
+      gap: 20px;
+      margin-bottom: 24px;
     }
     .panel-head .step {
       font-family: "Bodoni Moda", Georgia, serif;
-      font-weight: 500;
+      font-weight: 900;
       font-style: italic;
-      font-size: 28px;
-      line-height: 1;
+      font-size: 72px;
+      line-height: 0.8;
       color: var(--coral);
+      letter-spacing: -0.04em;
     }
     .panel-head h2 {
       margin: 0;
-      font-family: "Bodoni Moda", Georgia, serif;
-      font-weight: 700;
-      font-size: 22px;
+      font-family: "Inter", -apple-system, "Segoe UI", sans-serif;
+      font-weight: 800;
+      font-size: 30px;
+      line-height: 1;
       color: var(--ink);
-      letter-spacing: -0.01em;
+      letter-spacing: -0.03em;
+      text-transform: uppercase;
     }
     .panel-head .hint {
-      margin-left: auto;
-      font-size: 12px;
+      font-size: 10.5px;
+      font-weight: 600;
       color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      text-align: right;
+      max-width: 220px;
+      line-height: 1.5;
     }
 
     /* ---------- Form ---------- */
-    .row { display: flex; gap: 14px; flex-wrap: wrap; }
+    .row { display: flex; gap: 18px; flex-wrap: wrap; }
     .row > .col { flex: 1 1 240px; min-width: 0; }
     label {
       display: block;
-      font-size: 12px;
-      color: var(--ink-2);
-      margin-bottom: 6px;
-      font-weight: 500;
+      font-size: 10.5px;
+      color: var(--ink);
+      margin-bottom: 8px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
     }
-    input[type=text], input[type=number], textarea, select {
+    input[type=text], input[type=email], input[type=password], input[type=search], input[type=number], textarea, select {
       width: 100%;
-      padding: 10px 12px;
-      border: 1px solid var(--border-strong);
-      border-radius: 8px;
+      padding: 13px 20px;
+      border: 1px solid var(--ink);
+      border-radius: 999px;
       font-size: 14px;
       font-family: inherit;
       background: var(--surface);
@@ -218,43 +379,78 @@ INDEX_HTML = r"""<!doctype html>
     input:focus, textarea:focus, select:focus {
       outline: none;
       border-color: var(--coral);
-      box-shadow: 0 0 0 3px rgba(233,75,60,0.15);
+      box-shadow: 0 0 0 3px var(--coral-soft);
     }
-    textarea { resize: vertical; min-height: 70px; font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px; }
+    textarea { resize: vertical; min-height: 84px; border-radius: 16px; font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px; }
 
-    /* ---------- Buttons ---------- */
+    /* ---------- Buttons — pill-shaped, like the site's floating menu ---------- */
     button {
       cursor: pointer;
-      border: 1px solid var(--border-strong);
-      border-radius: 8px;
-      padding: 9px 18px;
-      font-size: 14px;
-      font-weight: 500;
-      font-family: inherit;
+      border: 1px solid var(--ink);
+      border-radius: 999px;
+      padding: 13px 26px;
+      font-size: 11.5px;
+      font-weight: 700;
+      font-family: "Inter", sans-serif;
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
       background: var(--surface);
       color: var(--ink);
-      transition: background .12s, border-color .12s, transform .04s;
+      transition: background .12s, color .12s, border-color .12s, transform .04s;
     }
-    button:hover { border-color: var(--ink-2); }
+    button:hover { background: var(--ink); color: var(--bg); }
     button:active { transform: translateY(1px); }
     button.primary {
+      background: var(--ink);
+      color: var(--bg);
+      border-color: var(--ink);
+    }
+    button.primary:hover { background: var(--coral); color: #fff; border-color: var(--coral); }
+    button.ghost { background: transparent; border-color: var(--ink); }
+    button.danger {
       background: var(--coral);
       color: #fff;
       border-color: var(--coral);
     }
-    button.primary:hover { background: var(--coral-deep); border-color: var(--coral-deep); }
-    button.ghost { background: transparent; }
-    button.danger {
-      background: var(--coral-deep);
-      color: #fff;
-      border-color: var(--coral-deep);
+    button.danger:hover { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+    button:disabled:hover { border-color: var(--ink); background: var(--surface); color: var(--ink); }
+    button.primary:disabled:hover { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+    button.danger:disabled:hover { background: var(--coral); color: #fff; border-color: var(--coral); }
+    button + button { margin-left: 10px; }
+
+    /* Pipe chips — horizontal, wrapping selector replacing the legacy <select> */
+    .pipe-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 4px;
     }
-    button.danger:hover { background: #a82e22; border-color: #a82e22; }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-    button:disabled:hover { border-color: var(--border-strong); background: var(--surface); }
-    button.primary:disabled:hover { background: var(--coral); border-color: var(--coral); }
-    button.danger:disabled:hover { background: var(--coral-deep); border-color: var(--coral-deep); }
-    button + button { margin-left: 8px; }
+    .pipe-chip {
+      display: inline-block;
+      padding: 8px 14px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      user-select: none;
+      transition: background .12s, color .12s;
+      font-family: inherit;
+    }
+    .pipe-chip:hover {
+      background: var(--coral);
+      color: #fff;
+      border-color: var(--coral);
+    }
+    .pipe-chip.active {
+      background: var(--ink);
+      color: var(--bg);
+      border-color: var(--ink);
+    }
+    .pipe-chip.active:hover { background: var(--coral); color: #fff; border-color: var(--coral); }
 
     .actions { margin-top: 18px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .spinner {
@@ -268,59 +464,204 @@ INDEX_HTML = r"""<!doctype html>
     .spinner.on { display: inline-block; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 500; letter-spacing: 0.02em; }
-    .badge.ok { background: var(--ok-bg); color: var(--ok); }
-    .badge.warn { background: var(--warn-bg); color: var(--warn); }
-    .badge.err { background: var(--danger-bg); color: var(--danger); }
+    .badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; border: 1px solid currentColor; }
+    .badge.ok { background: transparent; color: var(--ok); }
+    .badge.warn { background: transparent; color: var(--warn); }
+
+    /* Phase scan strip — compact two-row table so long pipes
+       don't produce a 10-line vertical staircase. */
+    .phase-strip {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px 14px;
+      align-items: baseline;
+      margin: 14px 0 4px;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .phase-strip .ps-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .phase-strip .ps-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-width: 0;
+    }
+    .phase-strip .ps-pill {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 3px 8px;
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      border: 1px solid currentColor;
+      line-height: 1.3;
+      white-space: nowrap;
+    }
+    .phase-strip .ps-pill.warn { color: var(--warn); }
+    .phase-strip .ps-pill.ok { color: var(--ok); }
+    .phase-strip .ps-pill .ps-count {
+      font-weight: 700;
+      opacity: 0.75;
+      font-variant-numeric: tabular-nums;
+    }
+    .badge.err { background: transparent; color: var(--danger); }
 
     .alert {
-      padding: 11px 14px; border-radius: 8px; margin-top: 12px;
-      font-size: 13px; border: 1px solid transparent;
+      padding: 14px 18px; border-radius: 14px; margin-top: 14px;
+      font-size: 13px; border: 1px solid var(--border); border-left-width: 5px;
+      font-weight: 500;
     }
-    .alert.error { background: var(--danger-bg); border-color: #f3c5bd; color: var(--danger); }
-    .alert.warn  { background: var(--warn-bg); border-color: #f0d99f; color: var(--warn); }
-    .alert.ok    { background: var(--ok-bg); border-color: #c3e4d0; color: var(--ok); }
+    .alert.error { background: var(--danger-bg); border-color: var(--danger); color: var(--danger); }
+    .alert.warn  { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+    .alert.ok    { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
 
     /* ---------- Resolved users summary ---------- */
     .resolved {
       background: var(--surface-2);
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px 14px;
+      border-radius: var(--radius);
+      padding: 20px 24px;
       font-size: 13.5px;
     }
-    .resolved .label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .resolved .label { color: var(--ink); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.18em; font-weight: 700; }
     .resolved .swap {
-      display: flex; align-items: center; gap: 14px; margin-top: 4px;
+      display: flex; align-items: center; gap: 18px; margin-top: 10px;
       flex-wrap: wrap;
     }
     .resolved .user { display: flex; flex-direction: column; }
-    .resolved .user b { font-weight: 600; color: var(--ink); }
-    .resolved .user .email { color: var(--muted); font-size: 12.5px; }
-    .resolved .arrow { color: var(--coral); font-size: 20px; line-height: 1; }
+    .resolved .user b { font-family: "Bodoni Moda", Georgia, serif; font-weight: 700; font-size: 18px; color: var(--ink); letter-spacing: -0.01em; }
+    .resolved .user .email { color: var(--muted); font-size: 12px; font-family: ui-monospace, Consolas, monospace; }
+    .resolved .arrow { color: var(--coral); font-size: 28px; line-height: 1; font-family: "Bodoni Moda", Georgia, serif; font-style: italic; font-weight: 700; }
 
     /* ---------- Field list ---------- */
     .field-list {
       max-height: 300px; overflow-y: auto;
       border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--surface-2);
-      padding: 4px 0;
+      border-radius: var(--radius);
+      background: var(--surface);
+      padding: 0;
     }
     .field-list .row-item {
-      display: flex; align-items: center; gap: 10px;
-      padding: 8px 14px;
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 14px;
       border-bottom: 1px solid var(--border);
       cursor: pointer;
     }
     .field-list .row-item:last-child { border-bottom: 0; }
-    .field-list .row-item:hover { background: #F5EDE4; }
+    .field-list .row-item:hover { background: var(--surface-2); }
     .field-list input[type=checkbox] { margin: 0; accent-color: var(--coral); width: 16px; height: 16px; }
-    .field-list .name { font-size: 13.5px; color: var(--ink); flex: 1; }
-    .field-list .pill {
-      font-size: 11px; color: var(--muted);
-      background: #fff; border: 1px solid var(--border);
+    /* Per-card selection checkboxes in the preview/results table use orange so
+       they read as a distinct "what will I apply" control, separate from the
+       coral scope checkboxes above. */
+    .card-pick, #selectAllCards { accent-color: var(--orange); width: 16px; height: 16px; cursor: pointer; }
+    .card-pick:disabled { accent-color: var(--muted); cursor: default; }
+
+    /* Preview filter toolbar: text search + per-client / per-phase toggle chips */
+    .plan-filters {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 16px;
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .plan-filters #cardSearch {
+      flex: 1 1 240px;
+      min-width: 180px;
+      padding: 7px 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      font-family: inherit;
+      font-size: 13px;
+    }
+    .filter-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .fg-label {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); font-weight: 700;
+    }
+
+    /* Dropdown multiselect filters (Client / Phase) */
+    .filter-dd { position: relative; }
+    .filter-dd-btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      font-family: inherit; font-size: 13px; font-weight: 600;
+      cursor: pointer;
+    }
+    .filter-dd-btn:hover { border-color: var(--coral); }
+    .filter-dd-btn .dd-badge {
+      font-size: 11px; font-weight: 700;
       padding: 1px 7px; border-radius: 999px;
+      background: var(--orange); color: #fff;
+    }
+    .filter-dd-btn .dd-caret { color: var(--muted); font-size: 11px; }
+    .filter-dd-panel {
+      position: absolute; z-index: 40; top: calc(100% + 4px); left: 0;
+      min-width: 220px; max-width: 320px;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(14,14,14,0.18);
+      padding: 8px;
+    }
+    .dd-actions { display: flex; gap: 6px; margin-bottom: 6px; }
+    .dd-actions button {
+      flex: 1; padding: 5px 8px;
+      border: 1px solid var(--border); border-radius: 5px;
+      background: var(--surface-2); color: var(--ink);
+      font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+    }
+    .dd-actions button:hover { border-color: var(--coral); color: var(--coral); }
+    .dd-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+    .dd-opt {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 6px; border-radius: 5px;
+      font-size: 13px; cursor: pointer; user-select: none;
+    }
+    .dd-opt:hover { background: var(--surface-2); }
+    .dd-opt input { accent-color: var(--orange); width: 15px; height: 15px; cursor: pointer; }
+    .dd-opt .dd-opt-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dd-opt .dd-opt-n { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+    /* Expandable per-card "what changes" detail row */
+    .row-exp {
+      border: none; background: none; cursor: pointer;
+      color: var(--muted); font-size: 12px; line-height: 1;
+      padding: 0 6px 0 0; font-family: inherit;
+    }
+    .row-exp:hover { color: var(--coral); }
+    .row-exp[aria-expanded="true"] { color: var(--coral); }
+    tr.detail-row > td { background: var(--surface-2); padding: 8px 12px; }
+    .chg { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 2px 0; font-size: 12px; }
+    .chg-scope { font-weight: 700; color: var(--ink); }
+    .chg-before { color: var(--muted); }
+    .chg-arrow { color: var(--coral); font-weight: 700; }
+    .chg-after { color: var(--ink); font-weight: 600; }
+    .card-client { color: var(--muted); font-size: 11px; }
+    .field-list .name { font-size: 13.5px; color: var(--ink); flex: 1; font-weight: 500; }
+    .field-list .pill {
+      font-size: 9.5px; color: var(--coral); font-weight: 700;
+      background: transparent; border: 1px solid currentColor;
+      padding: 2px 10px; border-radius: 999px;
+      text-transform: uppercase; letter-spacing: 0.14em;
     }
     .field-list .meta {
       display: none;
@@ -336,40 +677,45 @@ INDEX_HTML = r"""<!doctype html>
 
     /* ---------- Results ---------- */
     .summary-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0;
       margin-top: 4px;
+      border: 1.5px solid var(--ink);
     }
     .tile {
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
-      text-align: center;
+      background: var(--surface);
+      border: 0;
+      border-right: 1px solid var(--ink);
+      border-radius: 0;
+      padding: 22px 18px;
+      text-align: left;
     }
+    .tile:last-child { border-right: 0; }
     .tile .val {
       font-family: "Bodoni Moda", Georgia, serif;
-      font-size: 30px; font-weight: 700; line-height: 1;
+      font-size: 56px; font-weight: 900; line-height: 0.9;
       color: var(--ink);
+      letter-spacing: -0.03em;
     }
     .tile .lbl {
-      font-size: 11px; color: var(--muted);
-      margin-top: 6px;
-      text-transform: uppercase; letter-spacing: 0.06em;
+      font-size: 10px; color: var(--ink); font-weight: 700;
+      margin-top: 10px;
+      text-transform: uppercase; letter-spacing: 0.2em;
     }
-    .tile.accent .val { color: var(--coral); }
+    .tile.accent .val { color: var(--coral); font-style: italic; }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
     th {
       background: var(--surface-2);
-      font-weight: 600; color: var(--muted);
-      text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.06em;
+      font-weight: 700; color: var(--muted);
+      text-transform: uppercase; font-size: 10px; letter-spacing: 0.16em;
       position: sticky; top: 0; z-index: 1;
+      border-bottom: 1px solid var(--border);
     }
-    tbody tr:hover { background: #FCF7F1; }
-    td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
-    a { color: var(--coral); text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    tbody tr:hover { background: var(--surface-2); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+    a { color: var(--coral); text-decoration: none; font-weight: 600; border-bottom: 1px solid transparent; }
+    a:hover { border-bottom-color: var(--coral); }
 
     .hidden { display: none !important; }
     .small { font-size: 12px; color: var(--muted); }
@@ -377,36 +723,47 @@ INDEX_HTML = r"""<!doctype html>
 
     /* ---------- Developer panel ---------- */
     .dev {
-      margin-top: 28px;
+      margin-top: 36px;
       border: 1px solid var(--border);
       border-radius: var(--radius);
       background: var(--surface);
+      overflow: hidden;
     }
     .dev > summary {
       cursor: pointer;
-      padding: 14px 20px;
+      padding: 16px 22px;
       list-style: none;
-      display: flex; align-items: center; gap: 10px;
-      font-size: 13px;
-      color: var(--ink-2);
+      display: flex; align-items: center; gap: 12px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--ink);
       user-select: none;
+      background: var(--bg);
     }
     .dev > summary::-webkit-details-marker { display: none; }
     .dev > summary::before {
-      content: "›";
+      content: "+";
       display: inline-block;
-      font-size: 18px;
-      color: var(--muted);
+      font-family: "Bodoni Moda", Georgia, serif;
+      font-size: 22px;
+      line-height: 0.6;
+      color: var(--coral);
       transition: transform .15s;
+      font-weight: 700;
     }
-    .dev[open] > summary::before { transform: rotate(90deg); }
+    .dev[open] > summary::before { content: "–"; }
     .dev > summary .tag {
       margin-left: auto;
       color: var(--muted);
       font-family: ui-monospace, Consolas, monospace;
-      font-size: 11.5px;
+      font-size: 10.5px;
+      letter-spacing: 0.08em;
+      text-transform: none;
+      font-weight: 400;
     }
-    .dev-body { padding: 4px 20px 20px; border-top: 1px solid var(--border); }
+    .dev-body { padding: 8px 22px 24px; border-top: 1px solid var(--border); }
     .dev-body h4 {
       margin: 18px 0 8px;
       font-size: 11px;
@@ -422,17 +779,18 @@ INDEX_HTML = r"""<!doctype html>
     }
     .check input { accent-color: var(--coral); }
     .log {
-      background: #1B1410;
-      color: #F4E4D6;
+      background: #1B1917;
+      color: #F2EFEA;
       font-family: ui-monospace, "SF Mono", Consolas, monospace;
       font-size: 12px;
-      line-height: 1.5;
-      padding: 12px 14px;
-      border-radius: 8px;
-      height: 240px;
+      line-height: 1.55;
+      padding: 14px 16px;
+      border-radius: 14px;
+      height: 260px;
       overflow-y: auto;
       white-space: pre-wrap;
       word-break: break-word;
+      border: 1px solid var(--border);
     }
     .log .lvl-WARNING { color: #F8C572; }
     .log .lvl-ERROR { color: #F49890; }
@@ -446,52 +804,123 @@ INDEX_HTML = r"""<!doctype html>
 
     /* ---------- Modal ---------- */
     .modal-backdrop {
-      position: fixed; inset: 0; background: rgba(31,26,23,0.45);
+      position: fixed; inset: 0; background: rgba(20, 18, 16, 0.45);
       display: flex; align-items: center; justify-content: center;
       z-index: 100;
-      backdrop-filter: blur(2px);
+      backdrop-filter: blur(3px);
     }
     .modal {
       background: var(--surface);
-      border-radius: var(--radius);
-      padding: 26px 28px;
-      max-width: 460px;
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 36px 38px;
+      max-width: 480px;
       width: 92%;
-      box-shadow: 0 24px 48px rgba(0,0,0,0.25);
+      box-shadow: var(--shadow);
     }
     .modal h3 {
-      margin: 0 0 10px;
-      font-family: "Bodoni Moda", Georgia, serif;
-      font-weight: 700;
-      font-size: 22px;
+      margin: 0 0 14px;
+      font-family: "Inter", -apple-system, sans-serif;
+      font-weight: 800;
+      font-size: 28px;
+      line-height: 1;
+      text-transform: uppercase;
+      letter-spacing: -0.03em;
     }
-    .modal p { margin: 0 0 18px; color: var(--ink-2); }
+    .modal p { margin: 0 0 22px; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
     .modal .actions { justify-content: flex-end; margin-top: 0; }
+    .modal.modal-wide { max-width: 920px; }
+    .modal.modal-wide .actions { margin-top: 18px; align-items: center; }
+
+    /* ---------- results grouped by pipe ---------- */
+    .pipe-group {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      margin-bottom: 24px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(20, 18, 16, 0.05);
+    }
+    .pipe-group .pg-head {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .pipe-group .pg-head h3 {
+      margin: 0;
+      font-family: "Bodoni Moda", Georgia, serif;
+      font-weight: 800;
+      font-size: 22px;
+      letter-spacing: -0.01em;
+    }
+    .pipe-group .pg-sub { color: var(--muted); font-size: 12px; }
+    .pipe-group .pg-status { margin-left: auto; font-size: 12px; color: var(--muted); }
+    .pipe-group .pg-body { max-height: 420px; overflow-y: auto; }
+    .pipe-group .pg-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 18px;
+      border-top: 1px solid var(--border);
+    }
+    .pipe-group .pg-empty { padding: 14px 18px; color: var(--muted); font-size: 13px; }
+    .pipe-group .pg-alert { margin: 12px 18px; }
   </style>
 </head>
 <body>
 
+<!-- Sign-in gate — blocks the whole app until a valid company email (and,
+     when hosted, the shared password) is accepted by the server. The server
+     enforces this on every API route; the overlay is just the front door. -->
+<div id="gateBackdrop" class="modal-backdrop">
+  <div class="modal">
+    <h3>Who's swapping?</h3>
+    <p>Enter your company email so we can keep an audit trail of who changed what.
+       Only approved Up&amp;Up group domains are allowed.</p>
+    <div class="col" style="margin-bottom: 14px;">
+      <label for="gateEmail">Company email</label>
+      <input id="gateEmail" type="email" placeholder="you@upandupgroup.com" autocomplete="email">
+    </div>
+    <div class="col hidden" id="gatePwRow" style="margin-bottom: 14px;">
+      <label for="gatePw">Access password</label>
+      <input id="gatePw" type="password" placeholder="Shared team password" autocomplete="current-password">
+    </div>
+    <div id="gateError" class="alert err hidden" style="margin-bottom: 14px;"></div>
+    <div class="actions">
+      <button id="gateGo" class="primary">Continue</button>
+      <span id="gateSpin" class="spinner"></span>
+    </div>
+    <p class="small" id="gateDomains" style="margin: 16px 0 0; color: var(--muted);"></p>
+  </div>
+</div>
+
 <header>
-  <div class="wrap">
+  <div class="wrap topbar">
     <div class="brand"><span class="b1">slip</span><span class="b2">stream</span></div>
-    <div class="sub">Pipefy Assignee Swap</div>
+    <div class="sub">An Up<span class="amp">&amp;</span>Up Tool <span class="dot">&bull;</span> Pipefy Operations</div>
   </div>
 </header>
 
+<section class="hero">
+  <div class="wrap">
+    <h1>Swap <em>people</em>,<br>not pipelines.</h1>
+    <div class="kicker"><span class="rule"></span>Bulk reassignment for Pipefy &mdash; preview every change before a single card moves.</div>
+  </div>
+</section>
+
 <main class="wrap">
 
-  <!-- Step 1 -->
+  <!-- Step 1: who -->
   <section class="panel">
     <div class="panel-head">
       <span class="step">01</span>
-      <h2>Choose your pipe</h2>
+      <h2>Who's being replaced?</h2>
       <span class="hint">Email is preferred — names can be ambiguous</span>
     </div>
     <div class="row">
-      <div class="col">
-        <label for="pipeId">Pipe ID</label>
-        <input id="pipeId" type="text" placeholder="305705781" autocomplete="off">
-      </div>
       <div class="col">
         <label for="oldUser">Remove user</label>
         <input id="oldUser" type="text" placeholder="leaving@dydx.digital" autocomplete="off">
@@ -502,79 +931,102 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="actions">
-      <button id="loadBtn" class="primary">Continue</button>
-      <span id="loadSpin" class="spinner"></span>
-      <span id="loadStatus" class="small"></span>
+      <button id="usersBtn" class="primary">Continue</button>
+      <span id="usersSpin" class="spinner"></span>
+      <span id="usersStatus" class="small"></span>
     </div>
-    <div id="loadAlerts"></div>
+    <div id="usersAlerts"></div>
   </section>
 
-  <!-- Step 2 -->
-  <section id="optionsPanel" class="panel hidden">
+  <!-- Step 2: pipes -->
+  <section id="pipesPanel" class="panel hidden">
     <div class="panel-head">
       <span class="step">02</span>
-      <h2>Pick what to swap</h2>
-      <span class="hint">Card-level is the top-of-card assignee list</span>
+      <h2>Pick pipes to check</h2>
+      <span class="hint">Tick the pipes you want to scan</span>
     </div>
-
     <div class="resolved" style="margin-bottom: 18px;">
       <div class="label">Swap</div>
       <div id="resolvedUsers" class="swap"></div>
     </div>
-
-    <div class="row" style="margin-bottom: 14px;">
-      <div class="col" style="flex: 2 1 380px;">
-        <label>Assignee fields</label>
-        <div id="fieldList" class="field-list"></div>
-      </div>
-      <div class="col" style="flex: 1 1 220px;">
-        <label for="excludePhases">Skip cards in these phases</label>
-        <textarea id="excludePhases" placeholder="Cancelled, Completed, Finance Recon"></textarea>
-        <div class="small" style="margin-top: 6px;">Comma-separated, case-insensitive.</div>
-      </div>
+    <div class="col" style="max-width: 640px;">
+      <label>Pipes to scan <span class="small" id="pipePickCount"></span></label>
+      <div id="pipePickList" class="field-list"></div>
+      <!--div class="small" style="margin-top: 8px; color: var(--muted);">
+        Pipefy can't reliably tell us which pipes someone works in (user-group
+        access is invisible to the API) — so the scan simply checks every pipe
+        you leave ticked.
+      </div-->
     </div>
-
     <div class="actions">
-      <button id="previewBtn" class="primary">Test run</button>
-      <button id="applyBtn" class="danger" disabled>Apply changes…</button>
-      <span id="runSpin" class="spinner"></span>
-      <span id="runStatus" class="small"></span>
+      <button id="pipesBtn" class="primary">Continue</button>
+      <span id="pipesSpin" class="spinner"></span>
+      <span id="pipesStatus" class="small"></span>
     </div>
+    <div id="pipesAlerts"></div>
   </section>
 
-  <!-- Step 3 -->
-  <section id="resultsPanel" class="panel hidden">
+  <!-- Step 3: phases -->
+  <section id="phasesPanel" class="panel hidden">
     <div class="panel-head">
       <span class="step">03</span>
-      <h2 id="resultsTitle">Results</h2>
-      <span class="hint" id="resultsHint"></span>
+      <h2>Skip these phases</h2>
+      <span class="hint">Ticked phases are ignored — recommended ones come pre-ticked</span>
     </div>
+    <div class="col" style="max-width: 640px;">
+      <label>Phases across the selected pipes <span class="small" id="phasePickCount"></span></label>
+      <div id="phasePickList" class="field-list"></div>
+      <div class="small" style="margin-top: 8px; color: var(--muted);">
+        Cards sitting in a ticked phase are left untouched (Completed, Cancelled, etc.).
+      </div>
+    </div>
+    <div class="actions">
+      <button id="scanBtn" class="primary">Find their jobs</button>
+      <span id="scanSpin" class="spinner"></span>
+      <span id="scanStatus" class="small"></span>
+    </div>
+    <div id="phasesAlerts"></div>
+  </section>
 
-    <div id="resultMode" class="alert ok"></div>
-    <div class="summary-grid" id="summaryGrid" style="margin-top: 14px;"></div>
+  <!-- Step 4: results, grouped by pipe -->
+  <section id="resultsPanel" class="panel hidden">
+    <div class="panel-head">
+      <span class="step">04</span>
+      <h2 id="resultsTitle">Their jobs, by pipe</h2>
+      <span class="hint" id="resultsHint">Nothing changes in Pipefy until you click Apply on a pipe.</span>
+    </div>
+    <div id="scanSummary" class="alert hidden" style="margin-bottom: 16px;"></div>
+    <div id="pipeGroups"></div>
+  </section>
 
-    <div id="errorBox" class="alert error hidden"></div>
-
-    <div id="planTableWrap" style="margin-top: 18px;">
-      <h4 style="margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600;">
-        Affected cards <span id="planCount" class="small" style="font-weight: 400;"></span>
-      </h4>
-      <div style="max-height: 460px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
+  <!-- History panel -->
+  <details class="dev" id="historyPanel">
+    <summary>
+      <span>History</span>
+      <span class="tag">recent applies &middot; last 30 days</span>
+    </summary>
+    <div class="dev-body">
+      <div class="log-bar">
+        <button id="historyRefresh" class="ghost" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
+        <span class="small" id="historyStatus">&mdash;</span>
+      </div>
+      <div style="max-height: 360px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
         <table>
           <thead>
             <tr>
-              <th style="width: 36px;">#</th>
+              <th style="width: 150px;">When</th>
+              <th>Operator</th>
               <th>Card</th>
-              <th style="width: 180px;">Phase</th>
-              <th>Change</th>
-              <th style="width: 96px;">Status</th>
+              <th style="width: 90px;">Scope</th>
+              <th>Before &rarr; After</th>
+              <th style="width: 80px;">Status</th>
             </tr>
           </thead>
-          <tbody id="planTbody"></tbody>
+          <tbody id="historyTbody"></tbody>
         </table>
       </div>
     </div>
-  </section>
+  </details>
 
   <!-- Developer panel -->
   <details class="dev" id="devPanel">
@@ -635,11 +1087,40 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<!-- Recent applies modal -->
+<div id="recentModal" class="modal-backdrop hidden">
+  <div class="modal modal-wide">
+    <h3>Recent applies</h3>
+    <p class="small" style="margin: 0 0 14px; color: var(--muted);">
+      Last 30 days from this machine's local audit log.
+      <span id="recentSyncNote"></span>
+    </p>
+    <div id="recentBody" style="max-height: 52vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 150px;">When</th>
+            <th>Operator</th>
+            <th>Card</th>
+            <th style="width: 90px;">Scope</th>
+            <th>Before &rarr; After</th>
+            <th style="width: 80px;">Status</th>
+          </tr>
+        </thead>
+        <tbody id="recentTbody"></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <span class="small" id="recentStatus" style="margin-right: auto; color: var(--muted);"></span>
+      <button id="recentClose" class="ghost">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 
-let previewToken = null;
-let lastPlanCount = 0;
+let operatorEmail = '';  // set once the sign-in gate is cleared
 
 // ---------- helpers ----------
 async function api(path, body) {
@@ -649,12 +1130,14 @@ async function api(path, body) {
     body: JSON.stringify(body || {}),
   });
   const data = await r.json().catch(() => ({}));
+  if (r.status === 401) { showGate(); throw new Error('Session expired — sign in again.'); }
   if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
   return data;
 }
 function setBusy(spinnerId, statusId, busy, msg) {
   $(spinnerId).classList.toggle('on', !!busy);
-  $(statusId).textContent = msg || '';
+  const st = statusId && $(statusId);
+  if (st) st.textContent = msg || '';
 }
 function clearAlerts(id) { $(id).innerHTML = ''; }
 function alertEl(kind, html) {
@@ -670,248 +1153,537 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
-// ---------- initial info ----------
-async function loadInitial() {
-  try {
-    const info = await api('/api/info', {});
-    if (info.default_excluded_phases) {
-      $('excludePhases').value = info.default_excluded_phases.join(', ');
-    }
-  } catch (e) {
-    /* ignore — non-fatal */
-  }
-}
+// ---------- wizard state ----------
+// One group per scanned pipe: token + plan rows + apply controls.
+const wizGroups = new Map();
+let wizUsers = null;   // response of /api/wizard/users (resolved users + membership)
 
-// ---------- step 1: load ----------
-$('loadBtn').addEventListener('click', async () => {
-  clearAlerts('loadAlerts');
-  $('optionsPanel').classList.add('hidden');
-  $('resultsPanel').classList.add('hidden');
-  $('applyBtn').disabled = true;
-  previewToken = null;
-
-  const pipeId = $('pipeId').value.trim();
+// ---------- step 1: resolve users ----------
+$('usersBtn').addEventListener('click', async () => {
+  clearAlerts('usersAlerts');
+  ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   const oldUser = $('oldUser').value.trim();
   const newUser = $('newUser').value.trim();
-  const orgId = $('orgId').value.trim();
-  if (!pipeId || !oldUser || !newUser) {
-    $('loadAlerts').appendChild(alertEl('error', 'Pipe ID, remove user, and add user are required.'));
+  if (!oldUser || !newUser) {
+    $('usersAlerts').appendChild(alertEl('error', 'Both the remove user and the add user are required.'));
     return;
   }
-
-  setBusy('loadSpin', 'loadStatus', true, 'Fetching pipe and resolving users…');
+  setBusy('usersSpin', 'usersStatus', true, 'Resolving users and checking pipe membership…');
   try {
-    const data = await api('/api/load', {
-      pipe_id: pipeId, old_user: oldUser, new_user: newUser, org_id: orgId || null,
+    const data = await api('/api/wizard/users', {
+      old_user: oldUser, new_user: newUser, org_id: $('orgId').value.trim() || null,
     });
-    setBusy('loadSpin', 'loadStatus', false, '');
-
-    const oldU = data.old_user, newU = data.new_user;
-    $('resolvedUsers').innerHTML = `
-      <div class="user">
-        <b>${escapeHtml(oldU.name || '(no name)')}</b>
-        <span class="email">${escapeHtml(oldU.email)}</span>
-      </div>
-      <span class="arrow">→</span>
-      <div class="user">
-        <b>${escapeHtml(newU.name || '(no name)')}</b>
-        <span class="email">${escapeHtml(newU.email)}</span>
-      </div>
-      <div class="user" style="margin-left:auto;">
-        <span class="email">on pipe</span>
-        <b>${escapeHtml(data.pipe_name || data.pipe_id)}</b>
-      </div>
-    `;
-    (data.warnings || []).forEach(w => $('loadAlerts').appendChild(alertEl('warn', escapeHtml(w))));
-
-    const fl = $('fieldList');
-    fl.innerHTML = '';
-    fl.classList.toggle('show-meta', $('showMetaCb').checked);
-
-    const mkRow = (id, name, pill, meta, checked) => {
-      const row = document.createElement('label');
-      row.className = 'row-item';
-      row.innerHTML = `
-        <input type="checkbox" data-field="${escapeAttr(id)}" ${checked?'checked':''}>
-        <span class="name">${escapeHtml(name)}</span>
-        ${pill ? `<span class="pill">${escapeHtml(pill)}</span>` : ''}
-        ${meta ? `<span class="meta">${escapeHtml(meta)}</span>` : ''}
-      `;
-      return row;
-    };
-    fl.appendChild(mkRow('__card__', 'Card-level assignees', 'card', '(top-of-card assignee list)', true));
-    (data.fields || []).forEach(f => {
-      const meta = `${f.id} · internal_id=${f.internal_id || '?'} · ${f.type}`;
-      fl.appendChild(mkRow(f.id, f.label || '(no label)', 'field', meta, false));
-    });
-    if (!data.fields || data.fields.length === 0) {
-      const d = document.createElement('div');
-      d.className = 'small';
-      d.style.padding = '10px 14px';
-      d.textContent = 'No assignee fields discovered on this pipe.';
-      fl.appendChild(d);
-    }
-
-    $('optionsPanel').classList.remove('hidden');
-    $('optionsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    wizUsers = data;
+    setBusy('usersSpin', 'usersStatus', false, '');
+    renderResolvedUsers(data);
+    renderPipePick(data);
+    $('pipesPanel').classList.remove('hidden');
+    $('pipesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
-    setBusy('loadSpin', 'loadStatus', false, '');
-    $('loadAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
+    setBusy('usersSpin', 'usersStatus', false, '');
+    $('usersAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
   }
 });
 
-// ---------- step 2: preview / apply ----------
-function gatherRunPayload() {
-  const fieldIds = Array.from(document.querySelectorAll('#fieldList input[type=checkbox]:checked'))
-    .map(cb => cb.dataset.field);
-  const includeCardLevel = fieldIds.includes('__card__');
-  const realFieldIds = fieldIds.filter(x => x !== '__card__');
-  const excluded = $('excludePhases').value.split(/[,\n]/).map(s => s.trim()).filter(Boolean);
-  const throttleMs = parseInt($('throttleMs').value, 10) || 0;
-  return {
-    pipe_id: $('pipeId').value.trim(),
-    old_user: $('oldUser').value.trim(),
-    new_user: $('newUser').value.trim(),
-    org_id: $('orgId').value.trim() || null,
-    include_card_level: includeCardLevel,
-    field_ids: realFieldIds,
-    exclude_phases: excluded,
-    throttle_ms: throttleMs,
-  };
+function renderResolvedUsers(data) {
+  const oldU = data.old_user, newU = data.new_user;
+  $('resolvedUsers').innerHTML = `
+    <div class="user">
+      <b>${escapeHtml(oldU.name || '(no name)')}</b>
+      <span class="email">${escapeHtml(oldU.email)}</span>
+    </div>
+    <span class="arrow">→</span>
+    <div class="user">
+      <b>${escapeHtml(newU.name || '(no name)')}</b>
+      <span class="email">${escapeHtml(newU.email)}</span>
+    </div>
+  `;
 }
 
-$('previewBtn').addEventListener('click', async () => {
-  $('resultsPanel').classList.add('hidden');
-  $('applyBtn').disabled = true;
-  setBusy('runSpin', 'runStatus', true, 'Scanning cards — large pipes can take a minute…');
-  startLogPolling();
+function renderPipePick(data) {
+  const host = $('pipePickList');
+  host.innerHTML = '';
+  const pipes = data.pipes || [];
+  pipes.forEach(p => {
+    const row = document.createElement('label');
+    row.className = 'row-item';
+    row.innerHTML = `
+      <input type="checkbox" data-pipe="${escapeAttr(p.id)}">
+      <span class="name">${escapeHtml(p.name)}</span>
+    `;
+    host.appendChild(row);
+  });
+  $('pipePickCount').textContent = pipes.length
+    ? `(${pipes.length} pipe${pipes.length === 1 ? '' : 's'} — tick the ones to search)` : '';
+  $('pipesBtn').disabled = pipes.length === 0;
+}
+
+function getSelectedPipeIds() {
+  return Array.from(document.querySelectorAll('#pipePickList input[type=checkbox]:checked'))
+    .map(cb => cb.dataset.pipe);
+}
+
+// ---------- step 2 -> 3: phases across the selected pipes ----------
+$('pipesBtn').addEventListener('click', async () => {
+  clearAlerts('pipesAlerts');
+  ['phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
+  const pipeIds = getSelectedPipeIds();
+  if (!pipeIds.length) {
+    $('pipesAlerts').appendChild(alertEl('error', 'Tick at least one pipe.'));
+    return;
+  }
+  setBusy('pipesSpin', 'pipesStatus', true, 'Collecting phases across the selected pipes…');
   try {
-    const data = await api('/api/preview', gatherRunPayload());
-    previewToken = data.token;
-    lastPlanCount = data.plans.length;
-    renderResults(data, 'preview');
-    $('applyBtn').disabled = data.plans.length === 0;
-    setBusy('runSpin', 'runStatus', false, 'Test run complete. Plans cached for ~30 min.');
+    const data = await api('/api/wizard/phases', { pipe_ids: pipeIds });
+    setBusy('pipesSpin', 'pipesStatus', false, '');
+    (data.errors || []).forEach(w => $('pipesAlerts').appendChild(alertEl('warn', escapeHtml(w))));
+    renderPhasePick(data.phases || []);
+    $('phasesPanel').classList.remove('hidden');
+    $('phasesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
-    setBusy('runSpin', 'runStatus', false, '');
-    alert('Test run failed: ' + e.message);
+    setBusy('pipesSpin', 'pipesStatus', false, '');
+    $('pipesAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
   }
 });
 
-$('applyBtn').addEventListener('click', () => {
-  if (!previewToken) { alert('Run a test run first.'); return; }
+function renderPhasePick(phases) {
+  const host = $('phasePickList');
+  host.innerHTML = '';
+  phases.forEach(ph => {
+    const row = document.createElement('label');
+    row.className = 'row-item';
+    row.innerHTML = `
+      <input type="checkbox" data-phase="${escapeAttr(ph.name)}" ${ph.suggested ? 'checked' : ''}>
+      <span class="name">${escapeHtml(ph.name)}</span>
+      ${ph.suggested ? '<span class="pill">auto</span>' : ''}
+      <span class="meta">${ph.pipes} pipe${ph.pipes === 1 ? '' : 's'} · ~${Number(ph.cards_count || 0).toLocaleString()} cards</span>
+    `;
+    host.appendChild(row);
+  });
+  const sug = phases.filter(p => p.suggested).length;
+  $('phasePickCount').textContent = phases.length
+    ? `(${phases.length} phases, ${sug} pre-ticked)` : '(no phases found)';
+}
+
+function getExcludedPhases() {
+  return Array.from(document.querySelectorAll('#phasePickList input[type=checkbox]:checked'))
+    .map(cb => cb.dataset.phase);
+}
+
+// ---------- step 3 -> 4: multi-pipe field-level scan ----------
+let _scanError = null;
+
+$('scanBtn').addEventListener('click', runWizardScan);
+
+async function runWizardScan() {
+  clearAlerts('phasesAlerts');
+  const pipeIds = getSelectedPipeIds();
+  if (!pipeIds.length) {
+    $('phasesAlerts').appendChild(alertEl('error', 'No pipes selected — go back to step 02.'));
+    return;
+  }
+  wizGroups.clear();
+  _scanError = null;
+  $('pipeGroups').innerHTML = '';
+  const sum = $('scanSummary');
+  sum.className = 'alert';
+  sum.classList.remove('hidden');
+  sum.textContent = 'Scanning — jobs stream in below as they are found…';
+  $('resultsPanel').classList.remove('hidden');
+  $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setBusy('scanSpin', 'scanStatus', true, 'Scanning selected pipes…');
+  $('scanBtn').disabled = true;
+  startLogPolling();
+  try {
+    const resp = await fetch('/api/wizard/scan/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        old_user: $('oldUser').value.trim(),
+        new_user: $('newUser').value.trim(),
+        org_id: $('orgId').value.trim() || null,
+        pipe_ids: pipeIds,
+        exclude_phases: getExcludedPhases(),
+        throttle_ms: parseInt($('throttleMs').value, 10) || 0,
+      }),
+    });
+    if (resp.status === 401) { showGate(); return; }
+    if (!resp.ok || !resp.body) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || ('HTTP ' + resp.status));
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try { handleScanEvent(JSON.parse(line)); } catch (_) {}
+      }
+    }
+    buf = buf.trim();
+    if (buf) { try { handleScanEvent(JSON.parse(buf)); } catch (_) {} }
+    if (_scanError) throw new Error(_scanError);
+    setBusy('scanSpin', 'scanStatus', false, 'Scan complete — review below.');
+  } catch (e) {
+    setBusy('scanSpin', 'scanStatus', false, '');
+    $('scanSummary').className = 'alert error';
+    $('scanSummary').textContent = 'Scan failed: ' + (e.message || e);
+  } finally {
+    $('scanBtn').disabled = false;
+  }
+}
+
+function handleScanEvent(evt) {
+  const g = evt.pipe_id ? wizGroups.get(evt.pipe_id) : null;
+  switch (evt.type) {
+    case 'pipe_start':
+      createPipeGroup(evt);
+      break;
+    case 'phase_skip':
+      if (g) { g.skipped++; updateGroupStatus(g); }
+      break;
+    case 'phase_scan_start':
+      if (g) { g.scanning++; updateGroupStatus(g); }
+      break;
+    case 'plan':
+      if (g) addPlanToGroup(g, evt.plan);
+      break;
+    case 'progress':
+    case 'summary':
+      if (g) { g.scanned = evt.cards_scanned ?? g.scanned; updateGroupStatus(g); }
+      break;
+    case 'pipe_done':
+      if (g) finalizePipeGroup(g, evt);
+      break;
+    case 'pipe_error':
+      pipeGroupError(evt);
+      break;
+    case 'all_done': {
+      const s = $('scanSummary');
+      s.className = 'alert ok';
+      const withJobs = Array.from(wizGroups.values()).filter(x => x.plans > 0);
+      if (evt.total_plans) {
+        const who = wizUsers ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
+        s.innerHTML = `<b>${escapeHtml(who)}</b> has <b>${evt.total_plans}</b> job(s) across <b>${withJobs.length}</b> pipe(s): `
+          + withJobs.map(x => `${escapeHtml(x.name)} (${x.plans})`).join(', ')
+          + '. Review and Apply per pipe below.';
+      } else {
+        s.textContent = 'No jobs found in the selected pipes (outside the excluded phases).';
+      }
+      break;
+    }
+    case 'error':
+      _scanError = evt.message || 'Scan failed.';
+      break;
+    default:
+      break;
+  }
+}
+
+// ---------- per-pipe result groups ----------
+function createPipeGroup(evt) {
+  const el = document.createElement('section');
+  el.className = 'pipe-group';
+  el.dataset.pipeId = evt.pipe_id;
+  el.innerHTML = `
+    <div class="pg-head">
+      <h3>${escapeHtml(evt.pipe_name)}</h3>
+      ${evt.role ? `<span class="pill">${escapeHtml(evt.role)}</span>` : ''}
+      <span class="pg-sub pg-count">scanning…</span>
+      <span class="pg-status"></span>
+    </div>
+    <div class="pg-alert alert error hidden"></div>
+    <div class="pg-body hidden">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 34px; text-align: center;"><input type="checkbox" class="pg-select-all" checked title="Select / deselect all"></th>
+            <th style="width: 36px;">#</th>
+            <th>Card</th>
+            <th style="width: 180px;">Phase</th>
+            <th>Change</th>
+            <th style="width: 96px;">Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="pg-empty hidden"></div>
+    <div class="pg-actions hidden">
+      <button class="danger pg-apply" disabled>Apply changes…</button>
+      <span class="spinner pg-spin"></span>
+      <span class="small pg-apply-status"></span>
+    </div>
+  `;
+  $('pipeGroups').appendChild(el);
+  const g = {
+    id: evt.pipe_id, name: evt.pipe_name, role: evt.role || '',
+    token: null, plans: 0, scanned: 0, skipped: 0, scanning: 0, done: false,
+    el,
+    tbody: el.querySelector('tbody'),
+    body: el.querySelector('.pg-body'),
+    empty: el.querySelector('.pg-empty'),
+    actions: el.querySelector('.pg-actions'),
+    applyBtn: el.querySelector('.pg-apply'),
+    applyStatus: el.querySelector('.pg-apply-status'),
+    spin: el.querySelector('.pg-spin'),
+    alertBox: el.querySelector('.pg-alert'),
+    count: el.querySelector('.pg-count'),
+    status: el.querySelector('.pg-status'),
+  };
+  g.applyBtn.addEventListener('click', () => askApplyGroup(g));
+  el.querySelector('.pg-select-all').addEventListener('change', (e) => {
+    g.tbody.querySelectorAll('.card-pick:not(:disabled)').forEach(b => { b.checked = e.target.checked; });
+    updateGroupSelection(g);
+  });
+  g.tbody.addEventListener('change', (e) => {
+    if (e.target.classList && e.target.classList.contains('card-pick')) updateGroupSelection(g);
+  });
+  wizGroups.set(evt.pipe_id, g);
+  return g;
+}
+
+function updateGroupStatus(g) {
+  if (g.done) return;
+  const bits = [];
+  if (g.scanned) bits.push(`scanned ${g.scanned}`);
+  if (g.skipped) bits.push(`${g.skipped} phase(s) skipped`);
+  g.status.textContent = bits.join(' · ');
+}
+
+function addPlanToGroup(g, plan) {
+  g.plans++;
+  g.body.classList.remove('hidden');
+  const showMeta = $('showMetaCb').checked;
+  const { main, detail } = buildPlanRows(plan, g.plans, 'preview', showMeta);
+  g.tbody.appendChild(main);
+  g.tbody.appendChild(detail);
+  g.count.textContent = `${g.plans} job${g.plans === 1 ? '' : 's'}`;
+}
+
+function finalizePipeGroup(g, evt) {
+  g.done = true;
+  g.token = evt.token || null;
+  g.status.textContent = '';
+  if (evt.no_fields) {
+    g.count.textContent = 'no assignee fields';
+    g.empty.textContent = 'This pipe has no assignee fields — nothing to swap.';
+    g.empty.classList.remove('hidden');
+    return;
+  }
+  if (!g.plans) {
+    g.count.textContent = 'no jobs';
+    g.empty.textContent = 'No jobs found for this user (outside the excluded phases).';
+    g.empty.classList.remove('hidden');
+    return;
+  }
+  g.count.textContent = `${g.plans} job${g.plans === 1 ? '' : 's'}`;
+  g.actions.classList.remove('hidden');
+  updateGroupSelection(g);
+}
+
+function pipeGroupError(evt) {
+  let g = wizGroups.get(evt.pipe_id);
+  if (!g) g = createPipeGroup({ pipe_id: evt.pipe_id, pipe_name: evt.pipe_name || evt.pipe_id, role: null });
+  g.done = true;
+  g.count.textContent = 'error';
+  g.status.textContent = '';
+  g.alertBox.textContent = evt.message || 'Scan failed for this pipe.';
+  g.alertBox.classList.remove('hidden');
+}
+
+function groupSelectedIds(g) {
+  return Array.from(g.tbody.querySelectorAll('.card-pick:checked:not(:disabled)'))
+    .map(c => c.dataset.cardId);
+}
+
+function updateGroupSelection(g) {
+  const boxes = Array.from(g.tbody.querySelectorAll('.card-pick:not(:disabled)'));
+  const checked = boxes.filter(b => b.checked);
+  const sa = g.el.querySelector('.pg-select-all');
+  if (sa) {
+    sa.checked = boxes.length > 0 && checked.length === boxes.length;
+    sa.indeterminate = checked.length > 0 && checked.length < boxes.length;
+  }
+  if (g.token && boxes.length) {
+    g.count.textContent = checked.length === boxes.length
+      ? `${boxes.length} job${boxes.length === 1 ? '' : 's'}`
+      : `${checked.length} of ${boxes.length} selected`;
+  }
+  g.applyBtn.disabled = !g.token || checked.length === 0;
+}
+
+// ---------- per-pipe apply (shared confirm modal) ----------
+let _pendingApplyGroup = null;
+
+function askApplyGroup(g) {
+  const ids = groupSelectedIds(g);
+  if (!g.token) { alert('Run the scan first.'); return; }
+  if (!ids.length) { alert('Tick at least one card to change.'); return; }
+  _pendingApplyGroup = g;
   $('confirmText').textContent =
-    `This will modify ${lastPlanCount} card${lastPlanCount === 1 ? '' : 's'} in Pipefy. ` +
+    `This will modify ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
     `This action cannot be undone. Are you sure?`;
   $('confirmModal').classList.remove('hidden');
-});
-
-$('confirmCancel').addEventListener('click', () => $('confirmModal').classList.add('hidden'));
-
-$('confirmGo').addEventListener('click', async () => {
-  $('confirmModal').classList.add('hidden');
-  setBusy('runSpin', 'runStatus', true, 'Applying changes…');
-  $('applyBtn').disabled = true;
-  $('previewBtn').disabled = true;
-  startLogPolling();
-  try {
-    const data = await api('/api/apply', { token: previewToken });
-    renderResults(data, 'apply');
-    setBusy('runSpin', 'runStatus', false, 'Apply complete.');
-    previewToken = null;
-  } catch (e) {
-    setBusy('runSpin', 'runStatus', false, '');
-    alert('Apply failed: ' + e.message);
-  } finally {
-    $('previewBtn').disabled = false;
-  }
-});
-
-// ---------- results render ----------
-function renderResults(data, mode) {
-  const panel = $('resultsPanel');
-  panel.classList.remove('hidden');
-  const m = $('resultMode');
-  if (mode === 'preview') {
-    m.className = 'alert ok';
-    m.textContent = data.plans.length === 0
-      ? 'Test run: no cards would be modified — the old user is not assigned anywhere matching your scope.'
-      : `Test run: ${data.plans.length} card(s) would be modified. Nothing has been changed in Pipefy yet.`;
-    $('resultsTitle').textContent = 'Test run results';
-    $('resultsHint').textContent = 'Nothing has been written to Pipefy.';
-  } else {
-    const errCount = (data.errors || []).length;
-    m.className = errCount ? 'alert error' : 'alert ok';
-    m.textContent = errCount
-      ? `Applied with ${data.cards_changed} card(s) changed and ${errCount} error(s).`
-      : `Applied. ${data.cards_changed} card(s) changed successfully.`;
-    $('resultsTitle').textContent = 'Apply results';
-    $('resultsHint').textContent = errCount ? 'See errors below.' : 'All changes written.';
-  }
-
-  const grid = $('summaryGrid');
-  grid.innerHTML = '';
-  const tiles = [
-    ['Scanned',        data.cards_scanned, false],
-    ['Excluded phase', data.cards_in_excluded, false],
-    ['Already done',   data.cards_already_swapped, false],
-    ['To swap',        data.plans.length, true],
-    ['Card-level',     data.card_level_changes, false],
-    ['Field-level',    data.field_level_changes, false],
-  ];
-  if (mode === 'apply') {
-    tiles.push(['Changed', data.cards_changed, true]);
-    tiles.push(['Errors', (data.errors || []).length, false]);
-  }
-  tiles.forEach(([lbl, val, accent]) => {
-    const t = document.createElement('div');
-    t.className = 'tile' + (accent ? ' accent' : '');
-    t.innerHTML = `<div class="val">${val ?? 0}</div><div class="lbl">${escapeHtml(lbl)}</div>`;
-    grid.appendChild(t);
-  });
-
-  const errBox = $('errorBox');
-  if (mode === 'apply' && (data.errors || []).length) {
-    errBox.classList.remove('hidden');
-    errBox.innerHTML = '<b>Errors:</b><br>' + data.errors.map(e => escapeHtml(e)).join('<br>');
-  } else {
-    errBox.classList.add('hidden');
-  }
-
-  const tbody = $('planTbody');
-  tbody.innerHTML = '';
-  $('planCount').textContent = `(${data.plans.length})`;
-  const showMeta = $('showMetaCb').checked;
-  data.plans.forEach((p, i) => {
-    const tr = document.createElement('tr');
-    const acts = (p.actions || []).map(a => {
-      const scope = a.scope === 'card' ? 'card-level' : `field ${a.field_id}`;
-      return `<div>${escapeHtml(scope)}</div>`;
-    }).join('');
-    let statusHtml = '<span class="badge ok">planned</span>';
-    if (mode === 'apply') {
-      if (p.status === 'ok') statusHtml = '<span class="badge ok">swapped</span>';
-      else if (p.status === 'error') statusHtml = '<span class="badge err">error</span>';
-      else statusHtml = '<span class="badge warn">' + escapeHtml(p.status || '?') + '</span>';
-    }
-    const titleHtml = p.card_url
-      ? `<a href="${escapeAttr(p.card_url)}" target="_blank" rel="noopener">${escapeHtml(p.title || '(untitled)')}</a>`
-      : escapeHtml(p.title || '(untitled)');
-    tr.innerHTML = `
-      <td class="num">${i + 1}</td>
-      <td>${titleHtml}${showMeta ? `<div class="small mono">id ${escapeHtml(p.card_id)}</div>` : ''}</td>
-      <td>${escapeHtml(p.phase_name || '?')}</td>
-      <td>${acts}</td>
-      <td>${statusHtml}</td>
-    `;
-    tbody.appendChild(tr);
-  });
 }
 
-// ---------- developer panel: field meta toggle ----------
-$('showMetaCb').addEventListener('change', () => {
-  $('fieldList').classList.toggle('show-meta', $('showMetaCb').checked);
+$('confirmCancel').addEventListener('click', () => {
+  _pendingApplyGroup = null;
+  $('confirmModal').classList.add('hidden');
 });
+
+$('confirmGo').addEventListener('click', async () => {
+  const g = _pendingApplyGroup;
+  _pendingApplyGroup = null;
+  $('confirmModal').classList.add('hidden');
+  if (!g || !g.token) return;
+  g.applyBtn.disabled = true;
+  g.spin.classList.add('on');
+  g.applyStatus.textContent = 'Applying…';
+  startLogPolling();
+  try {
+    const data = await api('/api/apply', {
+      token: g.token, card_ids: groupSelectedIds(g), operator_email: operatorEmail,
+    });
+    renderGroupApply(g, data);
+  } catch (e) {
+    g.applyStatus.textContent = '';
+    g.alertBox.textContent = 'Apply failed: ' + (e.message || e);
+    g.alertBox.classList.remove('hidden');
+    g.applyBtn.disabled = false;
+  } finally {
+    g.spin.classList.remove('on');
+  }
+});
+
+function renderGroupApply(g, data) {
+  const showMeta = $('showMetaCb').checked;
+  g.tbody.innerHTML = '';
+  (data.plans || []).forEach((p, i) => {
+    const { main, detail } = buildPlanRows(p, i + 1, 'apply', showMeta);
+    g.tbody.appendChild(main);
+    g.tbody.appendChild(detail);
+  });
+  const errs = data.errors || [];
+  if (errs.length) {
+    g.alertBox.innerHTML = '<b>Errors:</b><br>' + errs.map(x => escapeHtml(x)).join('<br>');
+    g.alertBox.classList.remove('hidden');
+  } else {
+    g.alertBox.classList.add('hidden');
+  }
+  const remaining = data.remaining || 0;
+  g.applyStatus.innerHTML =
+    `${data.cards_changed} card(s) changed.` +
+    (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '') +
+    ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
+  g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
+  g.count.textContent = `${data.cards_changed} changed`;
+  if (!remaining) {
+    g.token = null;
+  }
+  updateGroupSelection(g);
+}
+
+// Expand / collapse a card's "what changes" detail row (all groups).
+$('pipeGroups').addEventListener('click', (e) => {
+  const btn = e.target.closest && e.target.closest('.row-exp');
+  if (!btn) return;
+  const tr = btn.closest('tr');
+  const detail = tr && tr.nextElementSibling;
+  if (!detail || !detail.classList.contains('detail-row')) return;
+  const open = detail.dataset.open === '1';
+  detail.dataset.open = open ? '' : '1';
+  detail.style.display = open ? 'none' : '';
+  btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+  btn.textContent = open ? '▸' : '▾';
+});
+
+function actionsCellHtml(p, showMeta) {
+  return (p.actions || []).map(a => {
+    if (a.scope === 'card') {
+      if (a.mode === 'add_only') {
+        return '<div>Card assignees <span class="pill" style="background:var(--warn-bg);color:var(--warn);">add-only</span></div>';
+      }
+      return '<div>Card assignees</div>';
+    }
+    const label = a.field_label || a.field_id || 'field';
+    const slug = showMeta && a.field_id && a.field_id !== a.field_label
+      ? ` <span class="small mono">${escapeHtml(a.field_id)}</span>`
+      : '';
+    return `<div>${escapeHtml(label)}${slug}</div>`;
+  }).join('');
+}
+
+function scopeLabel(a) {
+  if (a.scope === 'card') return 'Card assignees';
+  return a.field_label || a.field_id || 'Field';
+}
+
+function detailHtml(p) {
+  const rows = (p.actions || []).map(a => {
+    const before = (a.old_names && a.old_names.length ? a.old_names : (a.old_ids || []));
+    const after = (a.new_names && a.new_names.length ? a.new_names : (a.new_ids || []));
+    return `<div class="chg">
+      <span class="chg-scope">${escapeHtml(scopeLabel(a))}:</span>
+      <span class="chg-before">${escapeHtml(before.join(', ') || '—')}</span>
+      <span class="chg-arrow">→</span>
+      <span class="chg-after">${escapeHtml(after.join(', ') || '—')}</span>
+    </div>`;
+  }).join('');
+  return rows || '<div class="small muted">No detail.</div>';
+}
+
+// Build the main row + its (hidden) detail row for one plan.
+function buildPlanRows(p, i, mode, showMeta) {
+  const acts = actionsCellHtml(p, showMeta);
+  let statusHtml = '<span class="badge ok">planned</span>';
+  let stillPlanned = true;
+  if (mode === 'apply') {
+    stillPlanned = p.status === 'planned';
+    if (p.status === 'ok') statusHtml = '<span class="badge ok">swapped</span>';
+    else if (p.status === 'error') statusHtml = '<span class="badge err">error</span>';
+    else if (p.status === 'planned') statusHtml = '<span class="badge ok">planned</span>';
+    else statusHtml = '<span class="badge warn">' + escapeHtml(p.status || '?') + '</span>';
+  }
+  const titleHtml = p.card_url
+    ? `<a href="${escapeAttr(p.card_url)}" target="_blank" rel="noopener">${escapeHtml(p.title || '(untitled)')}</a>`
+    : escapeHtml(p.title || '(untitled)');
+  const client = p.client || '';
+  const pickCell = stillPlanned
+    ? `<td style="text-align:center;"><input type="checkbox" class="card-pick" data-card-id="${escapeAttr(p.card_id)}" checked></td>`
+    : `<td style="text-align:center;"><input type="checkbox" disabled ${p.status === 'ok' ? 'checked' : ''}></td>`;
+
+  const main = document.createElement('tr');
+  main.className = 'plan-row';
+  main.dataset.phase = p.phase_name || '';
+  main.dataset.client = client;
+  main.dataset.search = `${p.title || ''} ${client}`.toLowerCase();
+  main.innerHTML = `
+    ${pickCell}
+    <td class="num">${i}</td>
+    <td>
+      <button type="button" class="row-exp" aria-expanded="false" title="Show what changes">▸</button>
+      ${titleHtml}
+      ${client ? `<div class="card-client">${escapeHtml(client)}</div>` : ''}
+      ${showMeta ? `<div class="small mono">id ${escapeHtml(p.card_id)}</div>` : ''}
+    </td>
+    <td>${escapeHtml(p.phase_name || '?')}</td>
+    <td>${acts}</td>
+    <td>${statusHtml}</td>
+  `;
+  const detail = document.createElement('tr');
+  detail.className = 'detail-row';
+  detail.style.display = 'none';
+  detail.innerHTML = `<td></td><td></td><td colspan="4">${detailHtml(p)}</td>`;
+  return { main, detail };
+}
 
 // ---------- developer panel: log polling ----------
 let logSince = 0;
@@ -962,7 +1734,161 @@ $('devPanel').addEventListener('toggle', () => {
 });
 $('logClear').addEventListener('click', () => { $('logView').innerHTML = ''; });
 
-loadInitial();
+// ---------- sign-in gate ----------
+const GATE_KEY = 'slipstream.operatorEmail';
+let gatePasswordRequired = false;
+
+async function tryAuth(email, password) {
+  try {
+    const r = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: password || '' }),
+    });
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok && data.ok, data };
+  } catch (e) {
+    return { ok: false, data: { error: 'Network error — is the server running?' } };
+  }
+}
+
+function showGate() {
+  $('gatePwRow').classList.toggle('hidden', !gatePasswordRequired);
+  $('gateBackdrop').classList.remove('hidden');
+  ($('gateEmail').value ? $('gatePw') : $('gateEmail')).focus();
+}
+
+function unlockApp(email) {
+  operatorEmail = email;
+  $('gateBackdrop').classList.add('hidden');
+  $('oldUser').focus();
+}
+
+async function submitGate() {
+  const email = ($('gateEmail').value || '').trim().toLowerCase();
+  const password = $('gatePw').value || '';
+  const errBox = $('gateError');
+  errBox.classList.add('hidden');
+  if (!email) { errBox.textContent = 'Enter your company email.'; errBox.classList.remove('hidden'); return; }
+  if (gatePasswordRequired && !password) { errBox.textContent = 'Enter the access password.'; errBox.classList.remove('hidden'); return; }
+  setBusy('gateSpin', null, true);
+  const { ok, data } = await tryAuth(email, password);
+  setBusy('gateSpin', null, false);
+  if (ok) {
+    try { localStorage.setItem(GATE_KEY, email); } catch (e) {}
+    unlockApp(email);
+  } else {
+    errBox.textContent = (data && data.error) || 'That email is not on an approved domain.';
+    errBox.classList.remove('hidden');
+    /* if (data && data.allowed_domains) {
+      $('gateDomains').textContent = 'Approved domains: ' + data.allowed_domains.join(', ');
+    }*/
+  }
+}
+
+$('gateGo').addEventListener('click', submitGate);
+$('gateEmail').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitGate(); });
+$('gatePw').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitGate(); });
+
+async function initGate() {
+  let saved = '';
+  try { saved = localStorage.getItem(GATE_KEY) || ''; } catch (e) {}
+  if (saved) $('gateEmail').value = saved;
+  // Ask the server whether we already have a signed session cookie.
+  try {
+    const r = await fetch('/api/session');
+    const s = await r.json();
+    gatePasswordRequired = !!s.password_required;
+    if (s.authed) { unlockApp(s.email); return; }
+  } catch (e) { /* fall through to the gate */ }
+  // Local no-password mode: a previously saved email is enough.
+  if (saved && !gatePasswordRequired) {
+    const { ok } = await tryAuth(saved);
+    if (ok) { unlockApp(saved); return; }
+    try { localStorage.removeItem(GATE_KEY); } catch (e) {}
+  }
+  showGate();
+}
+
+// ---------- history ----------
+function fmtHistTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;
+  return d.toLocaleString();
+}
+
+async function loadHistory() {
+  $('historyStatus').textContent = 'Loading…';
+  try {
+    const r = await fetch('/api/history');
+    const data = await r.json();
+    const rows = data.records || [];
+    const n = renderHistoryInto(rows, $('historyTbody'));
+    $('historyStatus').textContent = `${n} record${n === 1 ? '' : 's'}`;
+  } catch (e) {
+    $('historyStatus').textContent = 'load error';
+  }
+}
+
+// Shared renderer for both the History panel and the "Recent applies" modal.
+function renderHistoryInto(rows, tbody) {
+  tbody.innerHTML = '';
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="small" style="padding:14px;">No applies recorded yet.</td></tr>';
+    return 0;
+  }
+  const frag = document.createDocumentFragment();
+  rows.forEach(rec => {
+    const tr = document.createElement('tr');
+    const scope = rec.scope === 'card' ? 'Card-level' : (rec.field_label || rec.scope || '');
+    const change = `${escapeHtml(rec.before || '—')} <span style="color:var(--muted);">→</span> ${escapeHtml(rec.after || '—')}`;
+    const cardCell = rec.card_url
+      ? `<a href="${escapeHtml(rec.card_url)}" target="_blank" rel="noopener">${escapeHtml(rec.title || rec.card_id || 'card')}</a>`
+      : escapeHtml(rec.title || rec.card_id || '');
+    const stKind = rec.status === 'ok' ? 'ok' : (rec.status === 'error' ? 'err' : 'warn');
+    tr.innerHTML =
+      `<td class="small">${escapeHtml(fmtHistTs(rec.ts))}</td>` +
+      `<td class="small">${escapeHtml(rec.operator_email || rec.os_user || '')}</td>` +
+      `<td>${cardCell}</td>` +
+      `<td class="small">${escapeHtml(scope)}</td>` +
+      `<td class="small">${change}</td>` +
+      `<td><span class="badge ${stKind}">${escapeHtml(rec.status || '')}</span></td>`;
+    frag.appendChild(tr);
+  });
+  tbody.appendChild(frag);
+  return rows.length;
+}
+
+// "Recent applies" modal — opened from the Apply results header.
+async function openRecentModal() {
+  $('recentModal').classList.remove('hidden');
+  $('recentStatus').textContent = 'Loading…';
+  $('recentSyncNote').textContent = '';
+  try {
+    const r = await fetch('/api/history');
+    const data = await r.json();
+    const rows = data.records || [];
+    const n = renderHistoryInto(rows, $('recentTbody'));
+    $('recentStatus').textContent = `${n} record${n === 1 ? '' : 's'} · last 30 days`;
+    $('recentSyncNote').textContent = data.sheet_sync
+      ? 'Also mirrored to the shared Google Sheet.'
+      : 'Local only — set [Audit] webhook_url to also mirror to a shared Sheet.';
+  } catch (e) {
+    $('recentStatus').textContent = 'load error';
+  }
+}
+
+function closeRecentModal() { $('recentModal').classList.add('hidden'); }
+$('recentClose').addEventListener('click', closeRecentModal);
+$('recentModal').addEventListener('click', (e) => { if (e.target === $('recentModal')) closeRecentModal(); });
+
+$('historyRefresh').addEventListener('click', loadHistory);
+$('historyPanel').addEventListener('toggle', () => {
+  if ($('historyPanel').open) loadHistory();
+});
+
+initGate();
 </script>
 </body>
 </html>
@@ -976,20 +1902,127 @@ def create_app(config_path: str = "config.ini") -> Flask:
         raise SystemExit(
             "Pipefy API token missing. Set [Pipefy] pipefy_api_token in config.ini or PIPEFY_API_TOKEN env var."
         )
+
+    # ---------- auth / session setup ----------
+    # When SWAP_WEB_PASSWORD (or [Web] password) is set, every API route
+    # requires a signed-in session (company email + shared password).
+    password_required = bool(cfg.web_password)
+    if cfg.web_secret_key:
+        app.secret_key = cfg.web_secret_key
+    elif cfg.web_password:
+        # Stable across restarts/workers without a second secret to manage.
+        app.secret_key = hashlib.sha256(b"swap-web-session:" + cfg.web_password.encode()).hexdigest()
+    else:
+        app.secret_key = secrets.token_hex(32)  # local, no-auth mode
+    app.permanent_session_lifetime = timedelta(days=14)
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        # HTTPS-only cookies when hosted; opt out for local testing with a
+        # password by setting SWAP_WEB_ALLOW_INSECURE_COOKIE=1.
+        SESSION_COOKIE_SECURE=password_required
+        and not os.environ.get("SWAP_WEB_ALLOW_INSECURE_COOKIE"),
+    )
+    # Render/Fly terminate TLS at a proxy; trust one hop of X-Forwarded-*.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # type: ignore[method-assign]
+
+    _AUTH_FAIL_LOCK = threading.Lock()
+    _auth_failures = {"count": 0, "window_start": 0.0}
+
+    def _throttle_failed_auth() -> bool:
+        """Cheap brute-force guard: after 10 failures in 10 min, refuse."""
+        now = time.time()
+        with _AUTH_FAIL_LOCK:
+            if now - _auth_failures["window_start"] > 600:
+                _auth_failures["window_start"] = now
+                _auth_failures["count"] = 0
+            _auth_failures["count"] += 1
+            return _auth_failures["count"] > 10
+
     attach_papertrail(cfg.papertrail_token, cfg.papertrail_host, cfg.papertrail_port)
     _install_log_capture()
     client = PipefyClient(cfg.pipefy_api_url, cfg.pipefy_api_token)
+    audit_store = AuditStore()
+    audit_sheet_sink = build_sheet_sink(
+        cfg.audit_sheet_id,
+        cfg.audit_service_account_file,
+        service_account_json=cfg.audit_service_account_json,
+    )
+
+    @app.before_request
+    def _require_session():
+        """Server-side gate: with a password configured, every API route
+        except sign-in/status needs an authenticated session."""
+        if not password_required:
+            return None
+        path = request.path
+        if not path.startswith("/api/") or path in ("/api/auth", "/api/session"):
+            return None
+        if session.get("operator_email"):
+            return None
+        return jsonify({"error": "Not signed in.", "auth_required": True}), 401
 
     @app.get("/")
     def index() -> Response:  # type: ignore[override]
         return Response(INDEX_HTML, mimetype="text/html; charset=utf-8")
+
+    @app.get("/api/session")
+    def api_session():
+        email = normalize_email(session.get("operator_email") or "")
+        return jsonify({
+            "authed": bool(email) and is_allowed_email(email),
+            "email": email,
+            "password_required": password_required,
+        })
 
     @app.post("/api/info")
     def info():
         return jsonify({
             "token_mask": mask_secret(cfg.pipefy_api_token),
             "default_excluded_phases": list(DEFAULT_EXCLUDED_PHASES),
+            "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
         })
+
+    @app.post("/api/auth")
+    def api_auth():
+        """Sign in: validate the operator email against the company allow-list
+        and, when configured, the shared password. On success a signed session
+        cookie is issued; every other API route requires it (see
+        `_require_session`). Apply requests also re-check the email.
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        email = normalize_email(body.get("email"))
+        if not is_allowed_email(email):
+            return jsonify({
+                "ok": False,
+                "error": "Enter a valid company email on an approved domain.",
+                "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
+            }), 403
+        if password_required:
+            supplied = str(body.get("password") or "")
+            if not secrets.compare_digest(supplied, cfg.web_password or ""):
+                if _throttle_failed_auth():
+                    log.warning("auth: too many failed password attempts")
+                    return jsonify({"ok": False, "error": "Too many attempts. Try again later."}), 429
+                time.sleep(0.5)  # slow down guessing
+                return jsonify({"ok": False, "error": "Wrong password."}), 403
+        session.permanent = True
+        session["operator_email"] = email
+        log.info("auth: %s signed in", email)
+        return jsonify({"ok": True, "email": email})
+
+    @app.get("/api/history")
+    def api_history():
+        rows = audit_store.recent(limit=300, days=30)
+        return jsonify({
+            "records": rows,
+            "count": len(rows),
+            "sheet_sync": bool(cfg.audit_webhook_url) or audit_sheet_sink is not None,
+        })
+
+    @app.get("/api/pipes")
+    def api_pipes():
+        return jsonify({"pipes": KNOWN_PIPES})
 
     @app.post("/api/logs")
     def api_logs():
@@ -1054,28 +2087,81 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "warnings": warnings,
         })
 
-    def _run_preview(body: Dict[str, Any]) -> Dict[str, Any]:
+    def _iter_preview_events(body: Dict[str, Any]):
+        """Generator that yields preview events as dicts.
+
+        Event types:
+          - {"type":"resolved", "old_user":..., "new_user":..., "pipe_name":...}
+          - {"type":"phase_skip", "phase":..., "cards_count":...}
+          - {"type":"phase_scan_start", "phase":..., "cards_count":...}
+          - {"type":"plan", "plan":{...}}
+          - {"type":"progress", "cards_scanned":N, "plans":M, "in_excluded":X, "already_swapped":Y}
+          - {"type":"summary", ...}
+          - {"type":"done", "token":...}
+          - {"type":"error", "message":...}
+
+        Designed so both the JSON `/api/preview` and the NDJSON streaming
+        endpoint can drive identical work.
+        """
         pipe_id = (body.get("pipe_id") or "").strip()
         old_user = (body.get("old_user") or "").strip()
         new_user = (body.get("new_user") or "").strip()
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         include_card_level = bool(body.get("include_card_level", True))
+        card_add_only = bool(body.get("card_add_only", False))
         field_ids = list(body.get("field_ids") or [])
         exclude_phases = list(body.get("exclude_phases") or DEFAULT_EXCLUDED_PHASES)
 
-        # Re-resolve (cheap; ensures the IDs we apply against are current).
         pipe_ctx, old_u, new_u = _resolve_users(client, pipe_id, old_user, new_user, org_id_override)
+        yield {
+            "type": "resolved",
+            "pipe_id": pipe_ctx.get("pipe_id") or pipe_id,
+            "pipe_name": pipe_ctx.get("pipe_name") or "",
+            "old_user": {"id": old_u.id, "name": old_u.name, "email": old_u.email},
+            "new_user": {"id": new_u.id, "name": new_u.name, "email": new_u.email},
+        }
 
-        # The UI shows an explicit checkbox per discovered field; we pass exactly
-        # the user's selection. Empty set => field-level off (card-level may still run).
         field_filter = set(field_ids)
+        use_fast_path = include_card_level or bool(field_filter)
 
-        plans = []
+        # Emit phase metadata up-front so the UI can show what we're
+        # skipping vs. scanning before any cards arrive. We do this even
+        # for field-only scans so the user can see which phases match
+        # the done-name patterns / `done` flag — for field scans these
+        # are filtered client-side after findCards returns, but knowing
+        # what's classified as terminal is still useful.
+        if use_fast_path:
+            try:
+                phases_info = fetch_active_phases(client, pipe_id, exclude_phases=exclude_phases)
+                for ph in phases_info["skipped"]:
+                    yield {"type": "phase_skip", "phase": ph["name"], "cards_count": ph["cards_count"], "done": ph["done"]}
+                for ph in phases_info["active"]:
+                    yield {"type": "phase_scan_start", "phase": ph["name"], "cards_count": ph["cards_count"]}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("phase meta probe failed: %s", exc)
+
+        plans: List[Any] = []
         cards_scanned = 0
         cards_in_excluded = 0
         cards_already_swapped = 0
-        log.info("Web preview: scanning pipe %s ...", pipe_id)
-        for card in iter_cards(client, pipe_id):
+
+        if use_fast_path:
+            log.info(
+                "Web preview: fast scan pipe %s (card_level=%s, fields=%d) old_user=%s",
+                pipe_id, include_card_level, len(field_filter), old_u.id,
+            )
+            card_source = iter_cards_fast_union(
+                client, pipe_id, old_u.id,
+                include_card_level=include_card_level,
+                field_ids=field_filter,
+                old_user_email=old_u.email,
+                exclude_phases=exclude_phases,
+            )
+        else:
+            log.info("Web preview: nothing selected; falling back to full scan of %s", pipe_id)
+            card_source = iter_cards(client, pipe_id, exclude_phases=exclude_phases)
+
+        for card in card_source:
             cards_scanned += 1
             plan = plan_card(
                 card,
@@ -1084,20 +2170,40 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 excluded_phases=exclude_phases,
                 include_card_level=include_card_level,
                 field_filter=field_filter,
+                card_add_only=card_add_only,
+                id_names={old_u.id: old_u.name, new_u.id: new_u.name},
             )
             if plan.skipped_reason:
                 cards_in_excluded += 1
-                continue
-            if not plan.actions:
+            elif not plan.actions:
                 cards_already_swapped += 1
-                continue
-            plans.append(plan)
-            if len(plans) % 100 == 0:
-                log.info("  %d plans, %d scanned so far", len(plans), cards_scanned)
+            else:
+                plans.append(plan)
+                yield {"type": "plan", "plan": _plan_to_dict(plan)}
+
+            # Heartbeat every card so the browser progress UI feels alive,
+            # but throttle on big runs to keep payload sane.
+            if cards_scanned <= 50 or cards_scanned % 25 == 0:
+                yield {
+                    "type": "progress",
+                    "cards_scanned": cards_scanned,
+                    "plans": len(plans),
+                    "in_excluded": cards_in_excluded,
+                    "already_swapped": cards_already_swapped,
+                }
+
         log.info("Web preview: %d scanned, %d to swap", cards_scanned, len(plans))
 
         card_level_changes = sum(1 for p in plans for a in p.actions if a.scope == "card")
         field_level_changes = sum(1 for p in plans for a in p.actions if a.scope.startswith("field:"))
+
+        summary = {
+            "cards_scanned": cards_scanned,
+            "cards_in_excluded": cards_in_excluded,
+            "cards_already_swapped": cards_already_swapped,
+            "card_level_changes": card_level_changes,
+            "field_level_changes": field_level_changes,
+        }
 
         token = secrets.token_urlsafe(16)
         _gc_preview_store()
@@ -1105,23 +2211,40 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "created_at": time.time(),
             "plans": plans,
             "throttle_ms": int(body.get("throttle_ms", 250)),
-            "summary": {
-                "cards_scanned": cards_scanned,
-                "cards_in_excluded": cards_in_excluded,
-                "cards_already_swapped": cards_already_swapped,
-                "card_level_changes": card_level_changes,
-                "field_level_changes": field_level_changes,
-            },
+            "summary": summary,
+            "pipe_id": pipe_ctx.get("pipe_id") or pipe_id,
+            "pipe_name": pipe_ctx.get("pipe_name") or "",
+            "old_user": f"{old_u.name} <{old_u.email}>".strip(),
+            "new_user": f"{new_u.name} <{new_u.email}>".strip(),
         }
 
+        yield {"type": "summary", **summary}
+        yield {"type": "done", "token": token}
+
+    def _run_preview(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Back-compat single-shot preview — drains the event stream."""
+        resolved: Dict[str, Any] = {}
+        plan_dicts: List[Dict[str, Any]] = []
+        summary: Dict[str, Any] = {}
+        token: str = ""
+        for evt in _iter_preview_events(body):
+            t = evt.get("type")
+            if t == "resolved":
+                resolved = evt
+            elif t == "plan":
+                plan_dicts.append(evt["plan"])
+            elif t == "summary":
+                summary = {k: v for k, v in evt.items() if k != "type"}
+            elif t == "done":
+                token = evt.get("token", "")
         return {
             "token": token,
-            "cards_scanned": cards_scanned,
-            "cards_in_excluded": cards_in_excluded,
-            "cards_already_swapped": cards_already_swapped,
-            "card_level_changes": card_level_changes,
-            "field_level_changes": field_level_changes,
-            "plans": [_plan_to_dict(p) for p in plans],
+            **summary,
+            "plans": plan_dicts,
+            "pipe_id": resolved.get("pipe_id", ""),
+            "pipe_name": resolved.get("pipe_name", ""),
+            "old_user": resolved.get("old_user"),
+            "new_user": resolved.get("new_user"),
         }
 
     @app.post("/api/preview")
@@ -1135,42 +2258,381 @@ def create_app(config_path: str = "config.ini") -> Flask:
             log.exception("preview failed")
             return jsonify({"error": f"Preview failed: {exc}"}), 500
 
+    @app.post("/api/preview/stream")
+    def api_preview_stream():
+        body = request.get_json(force=True, silent=True) or {}
+
+        def _gen():
+            try:
+                for evt in _iter_preview_events(body):
+                    yield json.dumps(evt) + "\n"
+            except UserResolutionError as exc:
+                yield json.dumps({"type": "error", "message": str(exc), "kind": "resolution"}) + "\n"
+            except Exception as exc:  # noqa: BLE001
+                log.exception("preview stream failed")
+                yield json.dumps({"type": "error", "message": f"Preview failed: {exc}"}) + "\n"
+
+        # text/plain-friendly NDJSON; disable proxy buffering when we can.
+        resp = Response(_gen(), mimetype="application/x-ndjson")
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
+    @app.post("/api/discover/stream")
+    def api_discover_stream():
+        """Probe every curated pipe for the given user (NDJSON stream).
+
+        Cheap `first:1` index lookups only — one card-level probe per pipe
+        plus one findCards probe per assignee field (retried with the email
+        when the id finds nothing). No full scans, no fallbacks: probe
+        failures surface as "unknown" rather than eating the API budget.
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        user_input = (body.get("old_user") or "").strip()
+        org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
+        if not user_input:
+            return jsonify({"error": "old_user is required."}), 400
+
+        def _gen():
+            try:
+                try:
+                    user = _discover_resolve_user(client, KNOWN_PIPES, user_input, org_id_override)
+                except UserResolutionError as exc:
+                    yield json.dumps({"type": "error", "message": str(exc), "kind": "resolution"}) + "\n"
+                    return
+                yield json.dumps({
+                    "type": "start",
+                    "user": {"id": user.id, "name": user.name, "email": user.email},
+                    "pipes": len(KNOWN_PIPES),
+                }) + "\n"
+                hits = 0
+                for p in KNOWN_PIPES:
+                    pid = p["id"]
+                    role = None
+                    try:
+                        ctx = fetch_pipe_context(client, pid)
+                        for m in ctx.get("members") or []:
+                            if str(m.id) == str(user.id):
+                                role = m.role
+                                break
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("discover: pipe context failed for %s: %s", pid, exc)
+                    card_hit = probe_card_level_assignee(client, pid, user.id)
+                    fields_out = []
+                    try:
+                        fields = discover_assignee_fields(client, pid)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("discover: field discovery failed for %s: %s", pid, exc)
+                        fields = {}
+                    for fid, meta in fields.items():
+                        hit = probe_field_value(client, pid, fid, user.id)
+                        if hit is False and user.email:
+                            hit = probe_field_value(client, pid, fid, user.email)
+                        fields_out.append({"id": fid, "label": meta.get("label") or fid, "hit": hit})
+                    any_hit = bool(card_hit) or any(f["hit"] for f in fields_out)
+                    unknown = card_hit is None or any(f["hit"] is None for f in fields_out)
+                    if any_hit:
+                        hits += 1
+                    yield json.dumps({
+                        "type": "pipe",
+                        "pipe_id": pid,
+                        "pipe_name": p["name"],
+                        "role": role,
+                        "card_level": card_hit,
+                        "fields": fields_out,
+                        "any_hit": any_hit,
+                        "unknown": unknown,
+                    }) + "\n"
+                yield json.dumps({"type": "done", "hits": hits, "checked": len(KNOWN_PIPES)}) + "\n"
+            except Exception as exc:  # noqa: BLE001
+                log.exception("discover stream failed")
+                yield json.dumps({"type": "error", "message": f"Discovery failed: {exc}"}) + "\n"
+
+        resp = Response(_gen(), mimetype="application/x-ndjson")
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
+    # ---------- user-first wizard ----------
+
+    @app.post("/api/wizard/users")
+    def api_wizard_users():
+        """Step 1: resolve both users org-wide.
+
+        Returns the curated pipe list for the picker. We deliberately do NOT
+        report per-pipe membership: most people get pipe access through
+        Pipefy user groups ("restricted view"), which the API's
+        `pipe.members` list does not include — filtering on it silently
+        misses real assignees. The operator picks which pipes to scan.
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        old_input = (body.get("old_user") or "").strip()
+        new_input = (body.get("new_user") or "").strip()
+        org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
+        if not old_input or not new_input:
+            return jsonify({"error": "old_user and new_user are required."}), 400
+        if old_input.lower() == new_input.lower():
+            return jsonify({"error": "Old user and new user are the same value."}), 400
+        try:
+            old_u = _discover_resolve_user(client, KNOWN_PIPES, old_input, org_id_override)
+            new_u = _discover_resolve_user(client, KNOWN_PIPES, new_input, org_id_override)
+        except UserResolutionError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - network / API failure
+            log.exception("wizard users failed")
+            return jsonify({"error": f"Pipefy API error: {exc}"}), 500
+        if old_u.id == new_u.id:
+            return jsonify({"error": "Old user and new user resolved to the same Pipefy user id."}), 400
+
+        return jsonify({
+            "old_user": {"id": old_u.id, "name": old_u.name, "email": old_u.email},
+            "new_user": {"id": new_u.id, "name": new_u.name, "email": new_u.email},
+            "pipes": [{"id": p["id"], "name": p["name"]} for p in KNOWN_PIPES],
+        })
+
+    @app.post("/api/wizard/phases")
+    def api_wizard_phases():
+        """Step 2: union of phase names across the selected pipes.
+
+        Each entry aggregates how many pipes have that phase and the total
+        card count. `suggested` marks phases we recommend excluding: done /
+        terminal-named phases plus the tool's default exclusion list.
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        if not pipe_ids:
+            return jsonify({"error": "pipe_ids is required."}), 400
+
+        def _norm(s):
+            return " ".join((s or "").strip().lower().split())
+
+        default_norm = {_norm(n) for n in DEFAULT_EXCLUDED_PHASES}
+        agg: Dict[str, Dict[str, Any]] = {}
+        errors: List[str] = []
+        names = {p["id"]: p["name"] for p in KNOWN_PIPES}
+        for pid in pipe_ids:
+            try:
+                info = fetch_active_phases(client, pid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("wizard: phase fetch failed for %s: %s", pid, exc)
+                errors.append(f"Could not fetch phases for {names.get(pid, pid)}.")
+                continue
+            for kind in ("active", "skipped"):
+                for ph in info[kind]:
+                    key = _norm(ph["name"])
+                    ent = agg.setdefault(key, {
+                        "name": ph["name"], "pipes": 0, "cards_count": 0, "suggested": False,
+                    })
+                    ent["pipes"] += 1
+                    ent["cards_count"] += int(ph.get("cards_count") or 0)
+                    if kind == "skipped" or key in default_norm:
+                        ent["suggested"] = True
+        phases = sorted(agg.values(), key=lambda e: (not e["suggested"], str(e["name"]).lower()))
+        return jsonify({"phases": phases, "errors": errors})
+
+    @app.post("/api/wizard/scan/stream")
+    def api_wizard_scan_stream():
+        """Step 3: field-level scan of the selected pipes (NDJSON stream).
+
+        Runs the existing single-pipe preview machinery once per pipe with
+        ALL of that pipe's assignee fields selected and card-level OFF.
+        Every event is tagged with its pipe_id; each pipe finishes with a
+        `pipe_done` event carrying that pipe's apply token, so the existing
+        /api/apply endpoint works per pipe unchanged.
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        old_input = (body.get("old_user") or "").strip()
+        new_input = (body.get("new_user") or "").strip()
+        org_id_override = (body.get("org_id") or "").strip() or None
+        pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        exclude_phases = list(body.get("exclude_phases") or [])
+        throttle_ms = body.get("throttle_ms", 250)
+        if not old_input or not new_input or not pipe_ids:
+            return jsonify({"error": "old_user, new_user, and pipe_ids are required."}), 400
+        names = {p["id"]: p["name"] for p in KNOWN_PIPES}
+
+        def _gen():
+            try:
+                try:
+                    # Early validation: fail fast with a clean error before any
+                    # pipe work if the leaver can't be resolved at all.
+                    _discover_resolve_user(
+                        client, KNOWN_PIPES, old_input, org_id_override or cfg.org_id
+                    )
+                except UserResolutionError as exc:
+                    yield json.dumps({"type": "error", "message": str(exc), "kind": "resolution"}) + "\n"
+                    return
+                total_plans = 0
+                pipes_scanned = 0
+                for pid in pipe_ids:
+                    pname = names.get(pid, pid)
+                    try:
+                        fields = discover_assignee_fields(client, pid)
+                    except Exception as exc:  # noqa: BLE001
+                        yield json.dumps({
+                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
+                            "message": f"Could not discover fields: {exc}",
+                        }) + "\n"
+                        continue
+                    yield json.dumps({
+                        "type": "pipe_start", "pipe_id": pid, "pipe_name": pname,
+                        "fields": len(fields),
+                    }) + "\n"
+                    if not fields:
+                        yield json.dumps({
+                            "type": "pipe_done", "pipe_id": pid, "token": None,
+                            "plans": 0, "no_fields": True,
+                        }) + "\n"
+                        pipes_scanned += 1
+                        continue
+                    sub_body = {
+                        "pipe_id": pid,
+                        "old_user": old_input,
+                        "new_user": new_input,
+                        "org_id": org_id_override,
+                        "include_card_level": False,   # wizard is field-level only
+                        "card_add_only": False,
+                        "field_ids": list(fields.keys()),
+                        "exclude_phases": exclude_phases,
+                        "throttle_ms": throttle_ms,
+                    }
+                    plans_n = 0
+                    try:
+                        for evt in _iter_preview_events(sub_body):
+                            t = evt.get("type")
+                            if t == "plan":
+                                plans_n += 1
+                            if t == "done":
+                                yield json.dumps({
+                                    "type": "pipe_done", "pipe_id": pid,
+                                    "token": evt.get("token"), "plans": plans_n,
+                                }) + "\n"
+                            else:
+                                yield json.dumps({**evt, "pipe_id": pid}) + "\n"
+                        total_plans += plans_n
+                        pipes_scanned += 1
+                    except UserResolutionError as exc:
+                        yield json.dumps({
+                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
+                            "message": str(exc),
+                        }) + "\n"
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("wizard scan failed for pipe %s", pid)
+                        yield json.dumps({
+                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
+                            "message": f"Scan failed: {exc}",
+                        }) + "\n"
+                yield json.dumps({
+                    "type": "all_done", "pipes_scanned": pipes_scanned, "total_plans": total_plans,
+                }) + "\n"
+            except Exception as exc:  # noqa: BLE001
+                log.exception("wizard scan stream failed")
+                yield json.dumps({"type": "error", "message": f"Scan failed: {exc}"}) + "\n"
+
+        resp = Response(_gen(), mimetype="application/x-ndjson")
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
     @app.post("/api/apply")
     def api_apply():
         body = request.get_json(force=True, silent=True) or {}
+
+        # Hard gate: a valid company email is required to mutate anything.
+        # Prefer the signed session identity; fall back to the request body
+        # only in local no-password mode.
+        operator_email = normalize_email(
+            session.get("operator_email") or body.get("operator_email")
+        )
+        if not is_allowed_email(operator_email):
+            return jsonify({
+                "error": "A valid company email is required before applying changes.",
+                "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
+            }), 403
+
         token = body.get("token")
-        entry = _PREVIEW_STORE.pop(token, None) if token else None
+        entry = _PREVIEW_STORE.get(token) if token else None
         if not entry:
             return jsonify({"error": "Preview expired or token unknown. Run Test run again."}), 400
 
-        plans = entry["plans"]
+        all_plans = entry["plans"]
         throttle_ms = entry["throttle_ms"]
         summary = entry["summary"]
+        pipe_id = entry.get("pipe_id", "")
+        pipe_name = entry.get("pipe_name", "")
+        old_user = entry.get("old_user", "")
+        new_user = entry.get("new_user", "")
+
+        # Optional per-card selection: apply only the ticked cards and keep the
+        # rest in the preview store for a later batch.
+        raw_ids = body.get("card_ids")
+        if isinstance(raw_ids, list) and raw_ids:
+            wanted = {str(x) for x in raw_ids}
+            selected = [p for p in all_plans if str(p.card_id) in wanted]
+            remaining = [p for p in all_plans if str(p.card_id) not in wanted]
+        else:
+            selected = list(all_plans)
+            remaining = []
 
         errors: List[str] = []
         cards_changed = 0
         out_plans: List[Dict[str, Any]] = []
-        for plan in plans:
+        for plan in selected:
             results = execute_plan(client, plan, throttle_ms=throttle_ms)
             any_ok = False
             any_err = False
+            err_msgs: List[str] = []
             for action, err in results:
                 if err:
                     any_err = True
                     errors.append(f"{plan.card_url or plan.card_id}: {err}")
+                    err_msgs.append(str(err))
                 else:
                     any_ok = True
+            status = "ok" if any_ok and not any_err else ("partial" if any_ok else "error")
+            d = _plan_to_dict(plan)
+            d["status"] = status
+            out_plans.append(d)
             if any_ok:
                 cards_changed += 1
+            # Audit every applied card (local store + optional Google Sheet).
+            try:
+                record_swap(
+                    store=audit_store,
+                    webhook_url=cfg.audit_webhook_url,
+                    operator_email=operator_email,
+                    source="web",
+                    pipe_id=pipe_id,
+                    pipe_name=pipe_name,
+                    old_user=old_user,
+                    new_user=new_user,
+                    plan_dict=d,
+                    status=status,
+                    error="; ".join(err_msgs),
+                    sheet_sink=audit_sheet_sink,
+                )
+            except Exception:  # noqa: BLE001 - audit must never block apply
+                log.exception("audit logging failed for card %s", plan.card_id)
+
+        # Surface the untouched cards as still-planned so the UI can keep them
+        # selectable for a follow-up Apply.
+        for plan in remaining:
             d = _plan_to_dict(plan)
-            d["status"] = "ok" if any_ok and not any_err else ("partial" if any_ok else "error")
+            d["status"] = "planned"
             out_plans.append(d)
+
+        if remaining:
+            entry["plans"] = remaining
+            entry["created_at"] = time.time()
+        elif token:
+            _PREVIEW_STORE.pop(token, None)
 
         return jsonify({
             **summary,
             "cards_changed": cards_changed,
             "errors": errors,
             "plans": out_plans,
+            "remaining": len(remaining),
         })
 
     return app
@@ -1182,12 +2644,17 @@ def _plan_to_dict(plan) -> Dict[str, Any]:
         "card_url": plan.card_url,
         "title": plan.title,
         "phase_name": plan.phase_name,
+        "client": getattr(plan, "client", "") or "",
         "actions": [
             {
                 "scope": a.scope,
                 "field_id": a.field_id,
+                "field_label": a.field_label,
                 "old_ids": list(a.old_ids),
                 "new_ids": list(a.new_ids),
+                "old_names": list(getattr(a, "old_names", []) or []),
+                "new_names": list(getattr(a, "new_names", []) or []),
+                "mode": getattr(a, "mode", "swap"),
             }
             for a in plan.actions
         ],
@@ -1196,10 +2663,10 @@ def _plan_to_dict(plan) -> Dict[str, Any]:
 
 def main() -> int:
     import argparse
-    parser = argparse.ArgumentParser(prog="swap-assignee-web", description="Local web UI for the Pipefy assignee swap.")
+    parser = argparse.ArgumentParser(prog="swap-assignee-web", description="Web UI for the Pipefy assignee swap (local dev server; use gunicorn when hosting).")
     parser.add_argument("--config", default="config.ini")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1, do not change for non-local use).")
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"), help="Bind host (default 127.0.0.1; set SWAP_WEB_PASSWORD before exposing beyond localhost).")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5000")))
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser.")
     args = parser.parse_args()
 

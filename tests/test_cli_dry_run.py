@@ -44,9 +44,34 @@ def make_router(cards: List[Dict[str, Any]], fields_meta: List[Dict[str, str]]):
                     "phases": [{"id": "P1", "name": "x", "fields": fields_meta}],
                 }
             }
-        if "PipeCards" in query or "cards(pipe_id" in query:
+        if "PipePhasesMeta" in query or ("phases { id name done cards_count }" in query):
+            return {
+                "pipe": {
+                    "id": "999",
+                    "phases": [
+                        {"id": "P1", "name": "Active", "done": False, "cards_count": len(cards)},
+                    ],
+                }
+            }
+        if "PhaseCardsByAssignee" in query or "PhaseCardsPage" in query or "phase(id: $phaseId)" in query:
+            return {
+                "phase": {
+                    "cards": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "edges": [{"node": c} for c in cards],
+                    }
+                }
+            }
+        if "PipeCards" in query or "cards(pipe_id" in query or "cards(\n    pipe_id" in query:
             return {
                 "cards": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "edges": [{"node": c} for c in cards],
+                }
+            }
+        if "FindCardsByField" in query or "findCards(" in query:
+            return {
+                "findCards": {
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                     "edges": [{"node": c} for c in cards],
                 }
@@ -200,6 +225,7 @@ def test_apply_invokes_correct_mutations(patched_client, monkeypatch, capsys):
             "--config", str(patched_client),
             "--all-fields",
             "--apply", "--yes",
+            "--operator-email", "tester@upandupgroup.com",
             "--throttle-ms", "0",
         ],
         router, monkeypatch,
@@ -208,6 +234,61 @@ def test_apply_invokes_correct_mutations(patched_client, monkeypatch, capsys):
     assert any(scope == "card" for scope, _ in state["mutations"])
     payload = [v for s, v in state["mutations"] if s == "card"][0]
     assert payload["assigneeIds"] == [NEW_ID]
+
+
+def test_card_add_only_apply_keeps_old_user(patched_client, monkeypatch, capsys):
+    """With --card-add-only, the card-level mutation keeps the old user and only
+    appends the new one (so Pipefy doesn't re-notify other assignees)."""
+    cards = [load_fixture("card_with_old_user_only.json")]
+    fields_meta = []
+    router, state = make_router(cards, fields_meta)
+
+    rc = _run_cli(
+        [
+            "--pipe-id", "999",
+            "--old-user", "kate.smith@upandup.com",
+            "--new-user", "robyn.seth@upandup.com",
+            "--config", str(patched_client),
+            "--all-fields",
+            "--card-add-only",
+            "--apply", "--yes",
+            "--operator-email", "tester@upandupgroup.com",
+            "--throttle-ms", "0",
+        ],
+        router, monkeypatch,
+    )
+    assert rc == 0
+    card_payloads = [v for s, v in state["mutations"] if s == "card"]
+    assert len(card_payloads) == 1
+    sent = card_payloads[0]["assigneeIds"]
+    assert OLD_ID in sent  # NOT removed by the tool
+    assert NEW_ID in sent  # IS appended
+    out = capsys.readouterr().out
+    assert "ADD-ONLY" in out
+
+
+def test_apply_requires_operator_email(patched_client, monkeypatch, capsys):
+    """--apply without a valid company email must be refused before any mutation."""
+    cards = [load_fixture("card_with_old_user_only.json")]
+    router, state = make_router(cards, [])
+
+    rc = _run_cli(
+        [
+            "--pipe-id", "999",
+            "--old-user", "kate.smith@upandup.com",
+            "--new-user", "robyn.seth@upandup.com",
+            "--config", str(patched_client),
+            "--all-fields",
+            "--apply", "--yes",
+            "--operator-email", "someone@gmail.com",  # not an approved domain
+            "--throttle-ms", "0",
+        ],
+        router, monkeypatch,
+    )
+    assert rc == 2
+    assert state["mutations"] == []
+    err = capsys.readouterr().err
+    assert "company email" in err.lower()
 
 
 def test_old_equals_new_refused(patched_client, monkeypatch, capsys):
@@ -333,15 +414,28 @@ def test_pagination_continues_until_done(patched_client, monkeypatch, capsys):
     cards2 = [c2]
 
     pages = iter([
-        {"cards": {"pageInfo": {"hasNextPage": True, "endCursor": "CUR1"}, "edges": [{"node": c} for c in cards1]}},
-        {"cards": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "edges": [{"node": c} for c in cards2]}},
+        {"phase": {"cards": {"pageInfo": {"hasNextPage": True, "endCursor": "CUR1"}, "edges": [{"node": c} for c in cards1]}}},
+        {"phase": {"cards": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "edges": [{"node": c} for c in cards2]}}},
     ])
 
     base_router, _ = make_router([], [])
 
     def router(query, variables):
-        if "PipeCards" in query or "cards(pipe_id" in query:
+        if "PhaseCardsByAssignee" in query or "PhaseCardsPage" in query or "phase(id: $phaseId)" in query:
             return next(pages)
+        if "PipePhasesMeta" in query:
+            return {
+                "pipe": {
+                    "id": "999",
+                    "phases": [
+                        {"id": "P1", "name": "Active", "done": False, "cards_count": 2},
+                    ],
+                }
+            }
+        if "PipeCards" in query or "cards(pipe_id" in query or "cards(\n    pipe_id" in query:
+            return {"cards": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "edges": []}}
+        if "FindCardsByField" in query or "findCards(" in query:
+            return {"findCards": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "edges": []}}
         return base_router(query, variables)
 
     rc = _run_cli(

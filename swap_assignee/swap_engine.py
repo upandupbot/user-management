@@ -12,7 +12,13 @@ log = logging.getLogger(__name__)
 
 ASSIGNEE_FIELD_TYPES = {"assignee_select", "user", "member"}
 
-DEFAULT_EXCLUDED_PHASES = ("Cancelled", "Completed", "Finance Recon")
+DEFAULT_EXCLUDED_PHASES = ("Cancelled", "Completed", "Finance Recon", "Completed Jobs", "Completed Review Tasks")
+
+# Substrings (case-insensitive) used to locate the "client" of a card among
+# its non-assignee fields. Pipefy pipes label this differently across orgs
+# (Client, Client Name, Brand, Customer, Account…), so we match the most
+# common ones. Assignee-type fields are never treated as the client.
+DEFAULT_CLIENT_FIELD_PATTERNS = ("client", "brand", "customer", "account name", "company")
 
 
 UPDATE_CARD_MUT = """
@@ -106,6 +112,100 @@ def _dedup_preserve(seq: Iterable[str]) -> List[str]:
     return out
 
 
+def _field_display_value(field_node: Dict[str, Any]) -> str:
+    """Best-effort human-readable string for a non-assignee field value.
+
+    Handles connection/database fields (array_value of objects with names),
+    plain strings, and JSON-encoded string values.
+    """
+    def _label(item: Any) -> str:
+        if isinstance(item, dict):
+            for key in ("name", "title", "label", "value"):
+                v = item.get(key)
+                if v:
+                    return str(v).strip()
+            v = item.get("id")
+            return str(v).strip() if v is not None else ""
+        return str(item).strip()
+
+    av = field_node.get("array_value")
+    if isinstance(av, list) and av:
+        parts = [p for p in (_label(it) for it in av) if p]
+        if parts:
+            return ", ".join(parts)
+
+    val = field_node.get("value")
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        parts = [p for p in (_label(it) for it in val) if p]
+        return ", ".join(parts)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return ""
+        if s[:1] in "[{\"":
+            try:
+                decoded = json.loads(s)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, list):
+                parts = [p for p in (_label(it) for it in decoded) if p]
+                return ", ".join(parts)
+            if isinstance(decoded, dict):
+                return _label(decoded)
+            if isinstance(decoded, str):
+                return decoded.strip()
+        return s
+    return str(val).strip()
+
+
+def extract_client(
+    card: Dict[str, Any],
+    *,
+    patterns: Sequence[str] = DEFAULT_CLIENT_FIELD_PATTERNS,
+) -> str:
+    """Return the card's client/brand as a display string, or "" if none found.
+
+    Scans non-assignee fields for one whose label or internal name contains a
+    client-like keyword and returns its display value. Purely numeric values
+    (raw record ids that leak through connection fields) are treated as "no
+    client" so internal ids never surface in the UI.
+    """
+    for fnode in card.get("fields") or []:
+        meta = (fnode or {}).get("field") or {}
+        if meta.get("type") in ASSIGNEE_FIELD_TYPES:
+            continue
+        hay = f"{meta.get('label') or ''} {fnode.get('name') or ''}".lower()
+        if any(p in hay for p in patterns):
+            val = _field_display_value(fnode)
+            if val and not _looks_like_id(val):
+                return val
+    return ""
+
+
+def _looks_like_id(value: str) -> bool:
+    """True when a string is just an id (or comma-separated ids) rather than a name."""
+    parts = [p.strip() for p in str(value).split(",")]
+    parts = [p for p in parts if p]
+    return bool(parts) and all(p.isdigit() for p in parts)
+
+
+def build_card_name_lookup(card: Dict[str, Any]) -> Dict[str, str]:
+    """Map user-id -> display name from a card's assignees and assignee fields."""
+    out: Dict[str, str] = {}
+    for a in card.get("assignees") or []:
+        if isinstance(a, dict) and a.get("id") is not None and a.get("name"):
+            out[str(a["id"])] = str(a["name"])
+    for fnode in card.get("fields") or []:
+        av = (fnode or {}).get("array_value")
+        if isinstance(av, list):
+            for item in av:
+                if isinstance(item, dict) and item.get("id") is not None and item.get("name"):
+                    out[str(item["id"])] = str(item["name"])
+    return out
+
+
 def compute_swap(current_ids: Sequence[str], old_id: str, new_id: str) -> Optional[List[str]]:
     """Return new id list if a swap is needed, else None.
 
@@ -122,12 +222,37 @@ def compute_swap(current_ids: Sequence[str], old_id: str, new_id: str) -> Option
     return new_list
 
 
+def compute_add_only(current_ids: Sequence[str], old_id: str, new_id: str) -> Optional[List[str]]:
+    """Return new id list when we want to *add* new_id without removing old_id.
+
+    Use this for card-level updates where Pipefy's `updateCard` mutation
+    re-broadcasts notifications to every assignee whenever the assignee
+    list changes. By keeping the existing list intact and only appending
+    the new user, Pipefy only fires a notification for the genuinely new
+    assignment — the old user can then be removed manually in the admin
+    panel without spamming everyone again.
+
+    - Only acts when `old_id` is present (matches discovery scope).
+    - Returns None if there is nothing to do (old absent, or new already there).
+    """
+    current = [str(x) for x in current_ids]
+    if old_id not in current:
+        return None
+    if new_id in current:
+        return None
+    return current + [new_id]
+
+
 @dataclass
 class PlannedAction:
     scope: str  # "card" or "field:<id>"
     field_id: Optional[str]
     old_ids: List[str]
     new_ids: List[str]
+    field_label: Optional[str] = None  # human-readable, e.g. "Assigned Team Member"
+    mode: str = "swap"  # "swap" (default) or "add_only" (card-level only, keeps old user)
+    old_names: List[str] = field(default_factory=list)  # before-state display names
+    new_names: List[str] = field(default_factory=list)  # after-state display names
 
 
 @dataclass
@@ -138,6 +263,7 @@ class CardPlan:
     phase_name: str
     actions: List[PlannedAction] = field(default_factory=list)
     skipped_reason: Optional[str] = None
+    client: str = ""  # client/brand display string, when discoverable
 
 
 def plan_card(
@@ -148,6 +274,8 @@ def plan_card(
     excluded_phases: Sequence[str],
     include_card_level: bool,
     field_filter: Optional[Set[str]],
+    card_add_only: bool = False,
+    id_names: Optional[Dict[str, str]] = None,
 ) -> CardPlan:
     phase = ((card.get("current_phase") or {}).get("name")) or ""
     plan = CardPlan(
@@ -155,17 +283,55 @@ def plan_card(
         card_url=card.get("url") or "",
         title=card.get("title") or "",
         phase_name=phase,
+        client=extract_client(card),
     )
     excluded_norm = {normalize_phase(p) for p in excluded_phases}
     if normalize_phase(phase) in excluded_norm:
         plan.skipped_reason = f"excluded phase: {phase}"
         return plan
 
+    # Build an id -> display-name map from the card itself, then layer in any
+    # caller-supplied names (e.g. the resolved old/new users, since the new
+    # user is not yet present on the card). Used to show before/after names.
+    name_map = build_card_name_lookup(card)
+    if id_names:
+        for k, v in id_names.items():
+            if v:
+                name_map[str(k)] = str(v)
+
+    def _names(ids: Sequence[str]) -> List[str]:
+        return [name_map.get(str(i), str(i)) for i in ids]
+
+    # Card-level assignee handling is gated by `include_card_level`. When it
+    # is False we do NOT touch the card-level assignee list at all — not even
+    # to remove the old user. This matters because Pipefy's `updateCard`
+    # mutation replaces the whole assignee list and re-broadcasts a
+    # notification to EVERY assignee on the card (previous + new), regardless
+    # of how small the net change is. A field-only swap must therefore avoid
+    # calling `updateCard` entirely, so the only people notified are those the
+    # field change actually concerns.
+    #
+    # When card-level IS included and `card_add_only` is True we only append
+    # the new user (keeping the old user) so the operator can remove the old
+    # user manually in Pipefy. Note: even add-only still triggers Pipefy's
+    # per-assignee notification on `updateCard`; the only fully spam-free
+    # option is to leave card-level untouched (`include_card_level=False`).
     if include_card_level:
         ids = [str(a.get("id")) for a in (card.get("assignees") or []) if a and a.get("id") is not None]
-        new_ids = compute_swap(ids, old_id, new_id)
-        if new_ids is not None and new_ids != ids:
-            plan.actions.append(PlannedAction("card", None, ids, new_ids))
+        if card_add_only:
+            new_ids = compute_add_only(ids, old_id, new_id)
+            if new_ids is not None and new_ids != ids:
+                plan.actions.append(PlannedAction(
+                    "card", None, ids, new_ids, mode="add_only",
+                    old_names=_names(ids), new_names=_names(new_ids),
+                ))
+        else:
+            new_ids = compute_swap(ids, old_id, new_id)
+            if new_ids is not None and new_ids != ids:
+                plan.actions.append(PlannedAction(
+                    "card", None, ids, new_ids,
+                    old_names=_names(ids), new_names=_names(new_ids),
+                ))
 
     for fnode in card.get("fields") or []:
         meta = (fnode or {}).get("field") or {}
@@ -178,7 +344,11 @@ def plan_card(
         ids = parse_field_user_ids(fnode)
         new_ids = compute_swap(ids, old_id, new_id)
         if new_ids is not None and new_ids != ids:
-            plan.actions.append(PlannedAction(f"field:{fid}", fid, ids, new_ids))
+            label = (meta.get("label") or "").strip() or None
+            plan.actions.append(PlannedAction(
+                f"field:{fid}", fid, ids, new_ids, field_label=label,
+                old_names=_names(ids), new_names=_names(new_ids),
+            ))
 
     return plan
 

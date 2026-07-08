@@ -1,0 +1,15 @@
+# Keep secrets and local-only files out of the image.
+config.ini
+*.json
+!fixtures/*.json
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+.gitignore
+tests/
+fixtures/
+*.csv
+.swap_assignee/

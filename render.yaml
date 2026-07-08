@@ -1,0 +1,25 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+# Deploy: push this repo to GitHub, then "New > Blueprint" in Render.
+# Free plan note: the instance spins down after ~15 min idle; first request
+# after that takes ~30-60 s to wake.
+services:
+  - type: web
+    name: swap-assignee
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # Single worker: preview plans and the log ring live in process memory.
+    startCommand: gunicorn --workers 1 --threads 8 --timeout 600 --bind 0.0.0.0:$PORT 'swap_assignee.web:create_app()'
+    envVars:
+      - key: PIPEFY_API_TOKEN
+        sync: false # set in the Render dashboard
+      - key: SWAP_WEB_PASSWORD
+        sync: false # shared team password for the UI
+      - key: PAPERTRAIL_LOG_TOKEN
+        sync: false # optional
+      - key: SWAP_AUDIT_SHEET_ID
+        sync: false # optional Google Sheets audit mirror
+      - key: SWAP_AUDIT_SERVICE_ACCOUNT_JSON
+        sync: false # optional: paste the whole key-file JSON
+      - key: PYTHON_VERSION
+        value: "3.12"
