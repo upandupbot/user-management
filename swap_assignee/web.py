@@ -601,12 +601,12 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--border);
       border-radius: 8px;
     }
-    .plan-filters #cardSearch {
+    .plan-filters input[type=search] {
       flex: 1 1 240px;
       min-width: 180px;
-      padding: 7px 10px;
+      padding: 8px 16px;
       border: 1px solid var(--border-strong);
-      border-radius: 6px;
+      border-radius: 999px;
       background: var(--surface);
       color: var(--ink);
       font-family: inherit;
@@ -855,6 +855,70 @@ INDEX_HTML = r"""<!doctype html>
     .modal .actions { justify-content: flex-end; margin-top: 0; }
     .modal.modal-wide { max-width: 920px; }
     .modal.modal-wide .actions { margin-top: 18px; align-items: center; }
+
+    /* ---------- scan summary card (step 04 header) ---------- */
+    .scan-card {
+      border: 1px solid var(--border);
+      border-top: 4px solid var(--coral);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 10px 30px rgba(20, 18, 16, 0.06);
+      overflow: hidden;
+      margin-bottom: 24px;
+    }
+    .scan-card .sc-body {
+      display: flex;
+      gap: 22px;
+      align-items: flex-start;
+      padding: 26px 28px 22px;
+    }
+    .scan-card .sc-count {
+      flex: 0 0 auto;
+      width: 64px; height: 64px;
+      border-radius: 18px;
+      background: var(--coral);
+      color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-family: "Inter", sans-serif;
+      font-weight: 800;
+      font-size: 26px;
+      letter-spacing: -0.02em;
+    }
+    .scan-card .sc-head {
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--ink);
+      line-height: 1.3;
+    }
+    .scan-card .sc-head .who { color: var(--coral); }
+    .scan-card .sc-sub { color: var(--muted); font-size: 13.5px; margin-top: 4px; line-height: 1.5; }
+    .scan-card .sc-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .scan-card .sc-chip {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 7px 15px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--coral-soft);
+      color: var(--coral-deep);
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      text-transform: none;
+      cursor: pointer;
+    }
+    .scan-card .sc-chip:hover { background: var(--coral); color: #fff; }
+    .scan-card .sc-chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .scan-card .sc-chip b { font-weight: 800; }
+    .scan-card .sc-foot {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 14px 28px;
+      background: var(--surface-2);
+      border-top: 1px solid var(--border);
+    }
+    .scan-card .sc-foot .note { color: var(--muted); font-size: 13px; }
+    .scan-card .sc-foot button { padding: 10px 22px; }
 
     /* ---------- results grouped by pipe ---------- */
     .pipe-group {
@@ -1439,6 +1503,7 @@ async function runWizardScan() {
   }
   wizGroups.clear();
   _scanError = null;
+  _appliedTotal = 0;
   $('pipeGroups').innerHTML = '';
   const sum = $('scanSummary');
   sum.className = 'alert';
@@ -1519,6 +1584,49 @@ async function runWizardScan() {
   }
 }
 
+// Summary card shown when a scan completes with matches (replaces the
+// plain alert). Flat slipstream coral — count badge, coral name, one chip
+// per pipe (click scrolls to that pipe's group).
+let _appliedTotal = 0;
+
+function renderScanCard(host, totalPlans, withJobs) {
+  const who = wizUsers ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
+  const sub = (withJobs.length === 1 ? 'All within one pipe. ' : `Across ${withJobs.length} pipes. `)
+    + 'Review each match and apply where the fit is right.';
+  host.className = 'scan-card';
+  host.innerHTML = `
+    <div class="sc-body">
+      <div class="sc-count">${totalPlans}</div>
+      <div>
+        <div class="sc-head"><span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}</div>
+        <div class="sc-sub">${escapeHtml(sub)}</div>
+        <div class="sc-chips">
+          ${withJobs.map(g => `
+            <button type="button" class="sc-chip" data-pipe="${escapeAttr(g.id)}">
+              <span class="dot"></span>${escapeHtml(g.name)}&nbsp;<b>${g.plans}</b>
+            </button>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="sc-foot">
+      <span class="note" id="scFootNote">Nothing has been submitted yet.</span>
+      <button type="button" class="danger" id="scReviewBtn">Review matches</button>
+    </div>
+  `;
+  host.querySelectorAll('.sc-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const g = wizGroups.get(chip.dataset.pipe);
+      if (g) g.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+  const rb = host.querySelector('#scReviewBtn');
+  rb.addEventListener('click', () => {
+    const first = withJobs[0] && wizGroups.get(withJobs[0].id);
+    if (first) first.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+
 function handleScanEvent(evt) {
   const g = evt.pipe_id ? wizGroups.get(evt.pipe_id) : null;
   switch (evt.type) {
@@ -1551,14 +1659,11 @@ function handleScanEvent(evt) {
       break;
     case 'all_done': {
       const s = $('scanSummary');
-      s.className = 'alert ok';
       const withJobs = Array.from(wizGroups.values()).filter(x => x.plans > 0);
       if (evt.total_plans) {
-        const who = wizUsers ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
-        s.innerHTML = `<b>${escapeHtml(who)}</b> has <b>${evt.total_plans}</b> job(s) across <b>${withJobs.length}</b> pipe(s): `
-          + withJobs.map(x => `${escapeHtml(x.name)} (${x.plans})`).join(', ')
-          + '. Review and Apply per pipe below.';
+        renderScanCard(s, evt.total_plans, withJobs);
       } else {
+        s.className = 'alert ok';
         s.textContent = 'No jobs found in the selected pipes (outside the excluded phases).';
       }
       break;
@@ -1584,6 +1689,22 @@ function createPipeGroup(evt) {
       <span class="pg-status"></span>
     </div>
     <div class="pg-alert alert error hidden"></div>
+    <div class="plan-filters pg-filters hidden" style="margin: 12px 18px 0;">
+      <input type="search" class="pg-search" placeholder="Search cards…" autocomplete="off">
+      <div class="filter-dd" data-attr="client">
+        <button type="button" class="filter-dd-btn" aria-haspopup="true" aria-expanded="false">
+          Client <span class="dd-badge">All</span> <span class="dd-caret">▾</span>
+        </button>
+        <div class="filter-dd-panel" hidden><div class="dd-list"></div></div>
+      </div>
+      <div class="filter-dd" data-attr="product">
+        <button type="button" class="filter-dd-btn" aria-haspopup="true" aria-expanded="false">
+          Product <span class="dd-badge">All</span> <span class="dd-caret">▾</span>
+        </button>
+        <div class="filter-dd-panel" hidden><div class="dd-list"></div></div>
+      </div>
+      <span class="small pg-filter-count"></span>
+    </div>
     <div class="pg-body hidden">
       <table>
         <thead>
@@ -1621,18 +1742,110 @@ function createPipeGroup(evt) {
     alertBox: el.querySelector('.pg-alert'),
     count: el.querySelector('.pg-count'),
     status: el.querySelector('.pg-status'),
+    filters: el.querySelector('.pg-filters'),
+    filterText: '',
+    hidden: { client: new Set(), product: new Set() },
   };
   g.applyBtn.addEventListener('click', () => askApplyGroup(g));
   el.querySelector('.pg-select-all').addEventListener('change', (e) => {
-    g.tbody.querySelectorAll('.card-pick:not(:disabled)').forEach(b => { b.checked = e.target.checked; });
+    g.tbody.querySelectorAll('tr.plan-row .card-pick:not(:disabled)').forEach(b => {
+      if (b.closest('tr').style.display !== 'none') b.checked = e.target.checked;
+    });
     updateGroupSelection(g);
   });
   g.tbody.addEventListener('change', (e) => {
     if (e.target.classList && e.target.classList.contains('card-pick')) updateGroupSelection(g);
   });
+  // Filter wiring: text search + client/product dropdowns, all scoped to this group.
+  el.querySelector('.pg-search').addEventListener('input', (e) => {
+    g.filterText = (e.target.value || '').toLowerCase();
+    applyGroupFilter(g);
+  });
+  el.querySelectorAll('.filter-dd').forEach(dd => {
+    const btn = dd.querySelector('.filter-dd-btn');
+    const panel = dd.querySelector('.filter-dd-panel');
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const willOpen = panel.hidden;
+      document.querySelectorAll('.filter-dd-panel').forEach(p => { p.hidden = true; });
+      document.querySelectorAll('.filter-dd-btn').forEach(b => b.setAttribute('aria-expanded', 'false'));
+      panel.hidden = !willOpen;
+      btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    });
+  });
   wizGroups.set(evt.pipe_id, g);
   return g;
 }
+
+// ---------- per-group filtering (search + client/product) ----------
+function _groupDistinct(g, attr) {
+  const map = new Map();
+  g.tbody.querySelectorAll('tr.plan-row').forEach(tr => {
+    const v = tr.dataset[attr] || '';
+    map.set(v, (map.get(v) || 0) + 1);
+  });
+  return map;
+}
+
+function refreshGroupFilters(g) {
+  // Only surface the bar when there's something worth filtering.
+  g.filters.classList.toggle('hidden', g.plans < 2);
+  g.el.querySelectorAll('.filter-dd').forEach(dd => {
+    const attr = dd.dataset.attr;
+    const counts = _groupDistinct(g, attr);
+    const hiddenSet = g.hidden[attr];
+    const list = dd.querySelector('.dd-list');
+    const badge = dd.querySelector('.dd-badge');
+    const keys = Array.from(counts.keys()).sort((a, b) => (a || '~').localeCompare(b || '~'));
+    list.innerHTML = '';
+    keys.forEach(k => {
+      const row = document.createElement('label');
+      row.className = 'dd-opt';
+      const label = k || `(no ${attr})`;
+      row.innerHTML = `
+        <input type="checkbox" ${hiddenSet.has(k) ? '' : 'checked'}>
+        <span class="dd-opt-name" title="${escapeAttr(label)}">${escapeHtml(label)}</span>
+        <span class="dd-opt-n">${counts.get(k)}</span>
+      `;
+      row.querySelector('input').addEventListener('change', (e) => {
+        if (e.target.checked) hiddenSet.delete(k); else hiddenSet.add(k);
+        applyGroupFilter(g);
+      });
+      list.appendChild(row);
+    });
+    const active = keys.length - keys.filter(k => hiddenSet.has(k)).length;
+    badge.textContent = active >= keys.length ? 'All' : (active === 0 ? 'None' : `${active}/${keys.length}`);
+    dd.style.display = keys.length > 1 ? '' : 'none';  // hide pointless single-value dropdowns
+  });
+}
+
+function applyGroupFilter(g) {
+  let shown = 0, total = 0;
+  g.tbody.querySelectorAll('tr.plan-row').forEach(tr => {
+    total++;
+    const visible = (!g.filterText || (tr.dataset.search || '').includes(g.filterText))
+      && !g.hidden.client.has(tr.dataset.client || '')
+      && !g.hidden.product.has(tr.dataset.product || '');
+    tr.style.display = visible ? '' : 'none';
+    const detail = tr.nextElementSibling;
+    if (detail && detail.classList.contains('detail-row')) {
+      detail.style.display = (visible && detail.dataset.open === '1') ? '' : 'none';
+    }
+    if (visible) shown++;
+  });
+  g.el.querySelector('.pg-filter-count').textContent =
+    shown < total ? `showing ${shown} of ${total}` : '';
+  refreshGroupFilters(g);
+  updateGroupSelection(g);
+}
+
+// Close any open filter dropdown when clicking elsewhere.
+document.addEventListener('click', (e) => {
+  if (!e.target.closest || !e.target.closest('.filter-dd')) {
+    document.querySelectorAll('.filter-dd-panel').forEach(p => { p.hidden = true; });
+    document.querySelectorAll('.filter-dd-btn').forEach(b => b.setAttribute('aria-expanded', 'false'));
+  }
+});
 
 function updateGroupStatus(g) {
   if (g.done) return;
@@ -1672,6 +1885,7 @@ function finalizePipeGroup(g, evt) {
   }
   g.count.textContent = `${g.plans} job${g.plans === 1 ? '' : 's'}`;
   g.actions.classList.remove('hidden');
+  refreshGroupFilters(g);
   updateGroupSelection(g);
 }
 
@@ -1687,21 +1901,23 @@ function pipeGroupError(evt) {
 
 function groupSelectedIds(g) {
   return Array.from(g.tbody.querySelectorAll('.card-pick:checked:not(:disabled)'))
+    .filter(c => { const tr = c.closest('tr'); return tr && tr.style.display !== 'none'; })
     .map(c => c.dataset.cardId);
 }
 
 function updateGroupSelection(g) {
-  const boxes = Array.from(g.tbody.querySelectorAll('.card-pick:not(:disabled)'));
+  const boxes = Array.from(g.tbody.querySelectorAll('.card-pick:not(:disabled)'))
+    .filter(b => { const tr = b.closest('tr'); return tr && tr.style.display !== 'none'; });
   const checked = boxes.filter(b => b.checked);
   const sa = g.el.querySelector('.pg-select-all');
   if (sa) {
     sa.checked = boxes.length > 0 && checked.length === boxes.length;
     sa.indeterminate = checked.length > 0 && checked.length < boxes.length;
   }
-  if (g.token && boxes.length) {
-    g.count.textContent = checked.length === boxes.length
-      ? `${boxes.length} job${boxes.length === 1 ? '' : 's'}`
-      : `${checked.length} of ${boxes.length} selected`;
+  if (g.token && g.plans) {
+    g.count.textContent = checked.length === g.plans
+      ? `${g.plans} job${g.plans === 1 ? '' : 's'}`
+      : `${checked.length} of ${g.plans} selected`;
   }
   g.applyBtn.disabled = !g.token || checked.length === 0;
 }
@@ -1771,10 +1987,16 @@ function renderGroupApply(g, data) {
     ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
   g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
   g.count.textContent = `${data.cards_changed} changed`;
+  // Keep the summary card's footer honest across multiple per-pipe applies.
+  _appliedTotal += data.cards_changed || 0;
+  const note = document.getElementById('scFootNote');
+  if (note && _appliedTotal > 0) {
+    note.textContent = `${_appliedTotal} card${_appliedTotal === 1 ? '' : 's'} changed so far.`;
+  }
   if (!remaining) {
     g.token = null;
   }
-  updateGroupSelection(g);
+  applyGroupFilter(g);
 }
 
 // Expand / collapse a card's "what changes" detail row (all groups).
@@ -1842,6 +2064,8 @@ function buildPlanRows(p, i, mode, showMeta) {
     ? `<a href="${escapeAttr(p.card_url)}" target="_blank" rel="noopener">${escapeHtml(p.title || '(untitled)')}</a>`
     : escapeHtml(p.title || '(untitled)');
   const client = p.client || '';
+  const product = p.product || '';
+  const subline = [client, product].filter(Boolean).join(' \u00b7 ');
   const pickCell = stillPlanned
     ? `<td style="text-align:center;"><input type="checkbox" class="card-pick" data-card-id="${escapeAttr(p.card_id)}" checked></td>`
     : `<td style="text-align:center;"><input type="checkbox" disabled ${p.status === 'ok' ? 'checked' : ''}></td>`;
@@ -1850,14 +2074,15 @@ function buildPlanRows(p, i, mode, showMeta) {
   main.className = 'plan-row';
   main.dataset.phase = p.phase_name || '';
   main.dataset.client = client;
-  main.dataset.search = `${p.title || ''} ${client}`.toLowerCase();
+  main.dataset.product = product;
+  main.dataset.search = `${p.title || ''} ${client} ${product}`.toLowerCase();
   main.innerHTML = `
     ${pickCell}
     <td class="num">${i}</td>
     <td>
       <button type="button" class="row-exp" aria-expanded="false" title="Show what changes">▸</button>
       ${titleHtml}
-      ${client ? `<div class="card-client">${escapeHtml(client)}</div>` : ''}
+      ${subline ? `<div class="card-client">${escapeHtml(subline)}</div>` : ''}
       ${showMeta ? `<div class="small mono">id ${escapeHtml(p.card_id)}</div>` : ''}
     </td>
     <td>${escapeHtml(p.phase_name || '?')}</td>
@@ -2904,6 +3129,7 @@ def _plan_to_dict(plan) -> Dict[str, Any]:
         "title": plan.title,
         "phase_name": plan.phase_name,
         "client": getattr(plan, "client", "") or "",
+        "product": getattr(plan, "product", "") or "",
         "actions": [
             {
                 "scope": a.scope,

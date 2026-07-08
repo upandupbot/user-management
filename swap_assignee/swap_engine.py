@@ -172,6 +172,23 @@ def extract_client(
     (raw record ids that leak through connection fields) are treated as "no
     client" so internal ids never surface in the UI.
     """
+    return _extract_field_by_patterns(card, patterns)
+
+
+# Substrings (case-insensitive) used to locate the "product" of a card.
+DEFAULT_PRODUCT_FIELD_PATTERNS = ("product",)
+
+
+def extract_product(
+    card: Dict[str, Any],
+    *,
+    patterns: Sequence[str] = DEFAULT_PRODUCT_FIELD_PATTERNS,
+) -> str:
+    """Return the card's product as a display string, or "" if none found."""
+    return _extract_field_by_patterns(card, patterns)
+
+
+def _extract_field_by_patterns(card: Dict[str, Any], patterns: Sequence[str]) -> str:
     for fnode in card.get("fields") or []:
         meta = (fnode or {}).get("field") or {}
         if meta.get("type") in ASSIGNEE_FIELD_TYPES:
@@ -264,6 +281,7 @@ class CardPlan:
     actions: List[PlannedAction] = field(default_factory=list)
     skipped_reason: Optional[str] = None
     client: str = ""  # client/brand display string, when discoverable
+    product: str = ""  # product display string, when discoverable
 
 
 def plan_card(
@@ -284,6 +302,7 @@ def plan_card(
         title=card.get("title") or "",
         phase_name=phase,
         client=extract_client(card),
+        product=extract_product(card),
     )
     excluded_norm = {normalize_phase(p) for p in excluded_phases}
     if normalize_phase(phase) in excluded_norm:
