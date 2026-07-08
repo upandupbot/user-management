@@ -193,7 +193,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <title>slipstream — Assignee Swap</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23FFFFFF'/%3E%3Ctext x='32' y='50' font-family='Bodoni MT,Didot,Georgia,serif' font-size='52' font-weight='800' text-anchor='middle'%3E%3Ctspan fill='%23EE5A45'%3Es%3C/tspan%3E%3Ctspan fill='%23F4A89E'%3Es%3C/tspan%3E%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23FFFFFF'/%3E%3Ctext x='32' y='50' font-family='Bodoni MT,Didot,Georgia,serif' font-size='52' font-weight='800' text-anchor='middle'%3E%3Ctspan fill='%23F2623A'%3Es%3C/tspan%3E%3Ctspan fill='%23F9BEC0'%3Es%3C/tspan%3E%3C/text%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,500;0,700;0,800;0,900;1,500;1,700;1,900&family=Inter:wght@400;500;600;700&display=swap">
@@ -208,17 +208,17 @@ INDEX_HTML = r"""<!doctype html>
       --rule: #E6E2DC;         /* hairline rules — light, airy */
       --border: #E6E2DC;
       --border-strong: #131211;
-      --coral: #F2623A  /* slipstream coral */
+      --coral: #F2623A;        /* slipstream coral */
       --coral-deep: #C8392B;
       --coral-soft: #FBD3CB;
-      --orange: #EE5A45;       /* selection accent */
-      --blush: #F9BEC0  /* slipstream blush pink */
+      --orange: #F2623A;       /* selection accent */
+      --blush: #F9BEC0;        /* slipstream blush pink */
       --ok: #2E2B28;           /* success reads calm ink on blush — no traffic-light green */
       --ok-bg: #FBF0EB;
       --warn: #96652F;         /* warm terracotta-tan */
       --warn-bg: #F7EDDD;
       --danger: #C8392B;       /* deep coral — errors stay in the brand family */
-      --danger-bg: #FBE2DC;
+      --danger-bg: #F2623A;
       --shadow: 0 24px 64px rgba(20, 18, 16, 0.10);
       --radius: 20px;          /* soft, rounded — like their pill menu */
     }
