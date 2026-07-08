@@ -1904,7 +1904,10 @@ async function loadHistory() {
     const data = await r.json();
     const rows = data.records || [];
     const n = renderHistoryInto(rows, $('historyTbody'));
-    $('historyStatus').textContent = `${n} record${n === 1 ? '' : 's'}`;
+    const sync = data.sheet_sync
+      ? 'mirrored to the shared Google Sheet'
+      : 'local to this server only — resets on redeploy';
+    $('historyStatus').textContent = `${n} record${n === 1 ? '' : 's'} · ${sync}`;
   } catch (e) {
     $('historyStatus').textContent = 'load error';
   }
