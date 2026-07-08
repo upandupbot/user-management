@@ -1158,6 +1158,18 @@ function escapeAttr(s) { return escapeHtml(s); }
 const wizGroups = new Map();
 let wizUsers = null;   // response of /api/wizard/users (resolved users + membership)
 
+// Upgrade a busy-status message if a single call drags on — the free-tier
+// server sleeps after ~15 min idle and takes ~30–60s to wake.
+function slowHint(statusId, baseMsg) {
+  const t = setTimeout(() => {
+    const el = $(statusId);
+    if (el && el.textContent === baseMsg) {
+      el.textContent = baseMsg + ' Still working \u2014 the server may be waking up (~30\u201360s).';
+    }
+  }, 8000);
+  return () => clearTimeout(t);
+}
+
 // ---------- step 1: resolve users ----------
 $('usersBtn').addEventListener('click', async () => {
   clearAlerts('usersAlerts');
@@ -1168,7 +1180,9 @@ $('usersBtn').addEventListener('click', async () => {
     $('usersAlerts').appendChild(alertEl('error', 'Both the remove user and the add user are required.'));
     return;
   }
-  setBusy('usersSpin', 'usersStatus', true, 'Resolving users and checking pipe membership…');
+  const baseMsg = 'Resolving users\u2026';
+  setBusy('usersSpin', 'usersStatus', true, baseMsg);
+  const cancelHint = slowHint('usersStatus', baseMsg);
   try {
     const data = await api('/api/wizard/users', {
       old_user: oldUser, new_user: newUser, org_id: $('orgId').value.trim() || null,
@@ -1182,6 +1196,8 @@ $('usersBtn').addEventListener('click', async () => {
   } catch (e) {
     setBusy('usersSpin', 'usersStatus', false, '');
     $('usersAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
+  } finally {
+    cancelHint();
   }
 });
 
@@ -1232,7 +1248,9 @@ $('pipesBtn').addEventListener('click', async () => {
     $('pipesAlerts').appendChild(alertEl('error', 'Tick at least one pipe.'));
     return;
   }
-  setBusy('pipesSpin', 'pipesStatus', true, 'Collecting phases across the selected pipes…');
+  const baseMsg = 'Collecting phases across the selected pipes\u2026';
+  setBusy('pipesSpin', 'pipesStatus', true, baseMsg);
+  const cancelHint = slowHint('pipesStatus', baseMsg);
   try {
     const data = await api('/api/wizard/phases', { pipe_ids: pipeIds });
     setBusy('pipesSpin', 'pipesStatus', false, '');
@@ -1243,6 +1261,8 @@ $('pipesBtn').addEventListener('click', async () => {
   } catch (e) {
     setBusy('pipesSpin', 'pipesStatus', false, '');
     $('pipesAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
+  } finally {
+    cancelHint();
   }
 });
 
@@ -1275,6 +1295,31 @@ let _scanError = null;
 
 $('scanBtn').addEventListener('click', runWizardScan);
 
+// Live progress state for the scan status line.
+const _scanProg = { startedAt: 0, lastEventAt: 0, stage: '', ticker: null };
+const SCAN_STALL_LIMIT_MS = 120000;  // no data for 2 min = give up
+
+function _fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function _scanTick() {
+  const now = Date.now();
+  const idleMs = now - _scanProg.lastEventAt;
+  let msg = `${_scanProg.stage || 'Working'} \u00b7 ${_fmtElapsed(now - _scanProg.startedAt)}`;
+  if (idleMs > 15000) {
+    msg += ' \u00b7 still waiting on Pipefy\u2026';
+  }
+  $('scanStatus').textContent = msg;
+}
+
+function _scanStage(stage) {
+  _scanProg.stage = stage;
+  _scanProg.lastEventAt = Date.now();
+  _scanTick();
+}
+
 async function runWizardScan() {
   clearAlerts('phasesAlerts');
   const pipeIds = getSelectedPipeIds();
@@ -1291,13 +1336,28 @@ async function runWizardScan() {
   sum.textContent = 'Scanning — jobs stream in below as they are found…';
   $('resultsPanel').classList.remove('hidden');
   $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
-  setBusy('scanSpin', 'scanStatus', true, 'Scanning selected pipes…');
+  setBusy('scanSpin', 'scanStatus', true, 'Contacting server…');
   $('scanBtn').disabled = true;
   startLogPolling();
+
+  // Progress ticker + stall watchdog: the elapsed clock reassures the user
+  // during long stretches (cold start, big pipes); if the stream goes fully
+  // silent for 2 minutes we abort instead of spinning forever.
+  _scanProg.startedAt = _scanProg.lastEventAt = Date.now();
+  _scanProg.stage = 'Contacting server (may take ~30\u201360s if it was asleep)';
+  const aborter = new AbortController();
+  _scanProg.ticker = setInterval(() => {
+    _scanTick();
+    if (Date.now() - _scanProg.lastEventAt > SCAN_STALL_LIMIT_MS) {
+      aborter.abort();
+    }
+  }, 1000);
+
   try {
     const resp = await fetch('/api/wizard/scan/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: aborter.signal,
       body: JSON.stringify({
         old_user: $('oldUser').value.trim(),
         new_user: $('newUser').value.trim(),
@@ -1312,12 +1372,14 @@ async function runWizardScan() {
       const data = await resp.json().catch(() => ({}));
       throw new Error(data.error || ('HTTP ' + resp.status));
     }
+    _scanStage('Resolving user');
     const reader = resp.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buf = '';
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      _scanProg.lastEventAt = Date.now();
       buf += decoder.decode(value, { stream: true });
       let nl;
       while ((nl = buf.indexOf('\n')) >= 0) {
@@ -1330,12 +1392,18 @@ async function runWizardScan() {
     buf = buf.trim();
     if (buf) { try { handleScanEvent(JSON.parse(buf)); } catch (_) {} }
     if (_scanError) throw new Error(_scanError);
-    setBusy('scanSpin', 'scanStatus', false, 'Scan complete — review below.');
+    setBusy('scanSpin', 'scanStatus', false,
+      `Scan complete in ${_fmtElapsed(Date.now() - _scanProg.startedAt)} — review below.`);
   } catch (e) {
     setBusy('scanSpin', 'scanStatus', false, '');
     $('scanSummary').className = 'alert error';
-    $('scanSummary').textContent = 'Scan failed: ' + (e.message || e);
+    $('scanSummary').textContent = (e && e.name === 'AbortError')
+      ? `Scan stopped: no response from the server for ${_fmtElapsed(SCAN_STALL_LIMIT_MS)}. `
+        + 'The results below may be incomplete — try again, or scan fewer pipes at once.'
+      : 'Scan failed: ' + (e.message || e);
   } finally {
+    clearInterval(_scanProg.ticker);
+    _scanProg.ticker = null;
     $('scanBtn').disabled = false;
   }
 }
@@ -1345,6 +1413,7 @@ function handleScanEvent(evt) {
   switch (evt.type) {
     case 'pipe_start':
       createPipeGroup(evt);
+      _scanStage(`Scanning ${evt.pipe_name}`);
       break;
     case 'phase_skip':
       if (g) { g.skipped++; updateGroupStatus(g); }
@@ -1357,7 +1426,11 @@ function handleScanEvent(evt) {
       break;
     case 'progress':
     case 'summary':
-      if (g) { g.scanned = evt.cards_scanned ?? g.scanned; updateGroupStatus(g); }
+      if (g) {
+        g.scanned = evt.cards_scanned ?? g.scanned;
+        updateGroupStatus(g);
+        _scanStage(`Scanning ${g.name} \u2014 ${g.scanned} card${g.scanned === 1 ? '' : 's'} checked`);
+      }
       break;
     case 'pipe_done':
       if (g) finalizePipeGroup(g, evt);
