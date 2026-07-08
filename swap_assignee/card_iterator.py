@@ -290,32 +290,37 @@ _PHASE_SEARCH_UNSUPPORTED: set = set()
 
 
 def discover_assignee_fields(client, pipe_id: str) -> Dict[str, Dict[str, str]]:
-    """Return {field_id: {"id":..., "internal_id":..., "label":..., "type":...}} for assignee-bearing fields.
+    """Return {field_id: {"id":..., "internal_id":..., "label":..., "type":..., "phase":...}}
+    for assignee-bearing fields.
 
     Keyed by `id` (the slug, e.g. "team_member_to_work_on_support_issue") because that's what
     per-card payloads use. `internal_id` (numeric) is preserved for reference.
+    `phase` records where the field lives ("Start form" or the phase name).
     """
     assignee_types = {"assignee_select", "user", "member"}
     data = client.execute(PIPE_FIELDS_QUERY, {"pipeId": str(pipe_id)})
     pipe = data.get("pipe") or {}
     out: Dict[str, Dict[str, str]] = {}
 
-    def _add(f: Dict[str, Any]) -> None:
+    def _add(f: Dict[str, Any], phase_name: str) -> None:
         if not f or f.get("type") not in assignee_types:
             return
         key = str(f.get("id"))
+        if key in out:  # keep the first sighting's provenance
+            return
         out[key] = {
             "id": key,
             "internal_id": str(f.get("internal_id") or ""),
             "label": f.get("label") or "",
             "type": f["type"],
+            "phase": phase_name,
         }
 
     for f in pipe.get("start_form_fields") or []:
-        _add(f)
+        _add(f, "Start form")
     for ph in pipe.get("phases") or []:
         for f in (ph or {}).get("fields") or []:
-            _add(f)
+            _add(f, (ph or {}).get("name") or "")
     return out
 
 

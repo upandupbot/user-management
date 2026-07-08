@@ -564,6 +564,16 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--surface);
       padding: 0;
     }
+    .field-list .row-head {
+      padding: 8px 14px;
+      background: var(--surface-2);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
     .field-list .row-item {
       display: flex; align-items: center; gap: 12px;
       padding: 10px 14px;
@@ -1280,7 +1290,7 @@ $('pipesBtn').addEventListener('click', async () => {
     setBusy('pipesSpin', 'pipesStatus', false, '');
     (data.errors || []).forEach(w => $('pipesAlerts').appendChild(alertEl('warn', escapeHtml(w))));
     renderPhasePick(data.phases || []);
-    renderRolePick(data.roles || []);
+    renderRolePick(data.roles_by_pipe || []);
     $('phasesPanel').classList.remove('hidden');
     $('phasesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
@@ -1315,20 +1325,34 @@ function getExcludedPhases() {
     .map(cb => cb.dataset.phase);
 }
 
-function renderRolePick(roles) {
+// Roles grouped by pipe: the same human role (e.g. Reviewer) can exist on
+// several pipes — ticking it under Creative narrows only Creative's scan.
+function renderRolePick(rolesByPipe) {
   const host = $('rolePickList');
   host.innerHTML = '';
-  roles.forEach(r => {
-    const row = document.createElement('label');
-    row.className = 'row-item';
-    row.innerHTML = `
-      <input type="checkbox" data-role="${escapeAttr(r.key)}">
-      <span class="name">${escapeHtml(r.label)}</span>
-      <span class="meta">${r.pipes} pipe${r.pipes === 1 ? '' : 's'} · ${r.fields} field${r.fields === 1 ? '' : 's'}</span>
-    `;
-    host.appendChild(row);
+  let any = false;
+  rolesByPipe.forEach(entry => {
+    if (!entry.roles || !entry.roles.length) return;
+    const head = document.createElement('div');
+    head.className = 'row-head';
+    head.textContent = entry.pipe_name;
+    host.appendChild(head);
+    entry.roles.forEach(r => {
+      any = true;
+      const row = document.createElement('label');
+      row.className = 'row-item';
+      const phases = (r.phases || []).join(', ');
+      const meta = [phases, r.fields > 1 ? `${r.fields} fields` : '']
+        .filter(Boolean).join(' \u00b7 ');
+      row.innerHTML = `
+        <input type="checkbox" data-pipe="${escapeAttr(entry.pipe_id)}" data-role="${escapeAttr(r.key)}">
+        <span class="name">${escapeHtml(r.label)}</span>
+        ${meta ? `<span class="meta" style="display:inline;">${escapeHtml(meta)}</span>` : ''}
+      `;
+      host.appendChild(row);
+    });
   });
-  if (!roles.length) {
+  if (!any) {
     host.innerHTML = '<div class="small" style="padding:10px 14px;">No assignee fields found on the selected pipes.</div>';
   }
   updateRoleCount();
@@ -1339,16 +1363,17 @@ function updateRoleCount() {
   const all = document.querySelectorAll('#rolePickList input[type=checkbox]');
   const on = document.querySelectorAll('#rolePickList input[type=checkbox]:checked');
   $('rolePickCount').textContent = all.length
-    ? (on.length === all.length ? `(all ${all.length} roles)` : `(${on.length} of ${all.length} roles)`)
+    ? (on.length === all.length ? `(all ${all.length} ticked)` : `(${on.length} of ${all.length} ticked)`)
     : '';
 }
 
-// Returns null when every role is ticked (= no narrowing, scan all fields).
-function getSelectedRoles() {
-  const all = Array.from(document.querySelectorAll('#rolePickList input[type=checkbox]'));
-  const on = all.filter(cb => cb.checked);
-  if (!all.length || on.length === all.length) return null;
-  return on.map(cb => cb.dataset.role);
+// {pipe_id: [role keys]} — only ticked roles, per pipe.
+function getSelectedRolesByPipe() {
+  const map = {};
+  document.querySelectorAll('#rolePickList input[type=checkbox]:checked').forEach(cb => {
+    (map[cb.dataset.pipe] = map[cb.dataset.pipe] || []).push(cb.dataset.role);
+  });
+  return map;
 }
 
 // ---------- step 3 -> 4: multi-pipe field-level scan ----------
@@ -1430,7 +1455,7 @@ async function runWizardScan() {
         org_id: $('orgId').value.trim() || null,
         pipe_ids: pipeIds,
         exclude_phases: getExcludedPhases(),
-        roles: getSelectedRoles(),
+        roles_by_pipe: getSelectedRolesByPipe(),
         throttle_ms: parseInt($('throttleMs').value, 10) || 0,
       }),
     });
@@ -1613,9 +1638,9 @@ function finalizePipeGroup(g, evt) {
   g.token = evt.token || null;
   g.status.textContent = '';
   if (evt.no_fields) {
-    g.count.textContent = evt.no_matching_roles ? 'no matching roles' : 'no assignee fields';
+    g.count.textContent = evt.no_matching_roles ? 'no roles ticked' : 'no assignee fields';
     g.empty.textContent = evt.no_matching_roles
-      ? 'None of the selected roles exist on this pipe — nothing searched.'
+      ? 'No roles ticked for this pipe — nothing searched.'
       : 'This pipe has no assignee fields — nothing to swap.';
     g.empty.classList.remove('hidden');
     return;
@@ -2560,7 +2585,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
         default_norm = {_norm(n) for n in DEFAULT_EXCLUDED_PHASES}
         agg: Dict[str, Dict[str, Any]] = {}
-        roles_agg: Dict[str, Dict[str, Any]] = {}
+        roles_by_pipe: List[Dict[str, Any]] = []
         errors: List[str] = []
         names = {p["id"]: p["name"] for p in KNOWN_PIPES}
         for pid in pipe_ids:
@@ -2586,22 +2611,29 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 log.warning("wizard: field discovery failed for %s: %s", pid, exc)
                 errors.append(f"Could not list roles for {names.get(pid, pid)}.")
                 continue
-            seen_in_pipe: set = set()
+            # Dedupe near-identical labels WITHIN this pipe ("Reviewer" +
+            # "Reviewer(s)" -> one entry) but keep pipes separate so the
+            # operator sees exactly which pipe each role belongs to.
+            pipe_roles: Dict[str, Dict[str, Any]] = {}
             for meta in fields.values():
                 label = meta.get("label") or meta.get("id") or ""
                 key = _norm_role_label(label)
                 if not key:
                     continue
-                ent = roles_agg.setdefault(key, {
-                    "key": key, "label": label, "pipes": 0, "fields": 0,
+                ent = pipe_roles.setdefault(key, {
+                    "key": key, "label": label, "fields": 0, "phases": [],
                 })
                 ent["fields"] += 1
-                if key not in seen_in_pipe:
-                    ent["pipes"] += 1
-                    seen_in_pipe.add(key)
+                ph_name = meta.get("phase") or ""
+                if ph_name and ph_name not in ent["phases"]:
+                    ent["phases"].append(ph_name)
+            roles_by_pipe.append({
+                "pipe_id": pid,
+                "pipe_name": names.get(pid, pid),
+                "roles": sorted(pipe_roles.values(), key=lambda e: str(e["label"]).lower()),
+            })
         phases = sorted(agg.values(), key=lambda e: (not e["suggested"], str(e["name"]).lower()))
-        roles = sorted(roles_agg.values(), key=lambda e: str(e["label"]).lower())
-        return jsonify({"phases": phases, "roles": roles, "errors": errors})
+        return jsonify({"phases": phases, "roles_by_pipe": roles_by_pipe, "errors": errors})
 
     @app.post("/api/wizard/scan/stream")
     def api_wizard_scan_stream():
@@ -2619,10 +2651,18 @@ def create_app(config_path: str = "config.ini") -> Flask:
         org_id_override = (body.get("org_id") or "").strip() or None
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
         exclude_phases = list(body.get("exclude_phases") or [])
-        # Optional role narrowing: normalized role keys. Empty/absent = all roles.
-        role_keys = {
+        # Optional role narrowing. Preferred: `roles_by_pipe` {pipe_id: [keys]}
+        # so a role ticked under Creative doesn't widen the Media scan.
+        # Legacy: flat `roles` list applied to every pipe.
+        raw_by_pipe = body.get("roles_by_pipe") or {}
+        roles_by_pipe = {
+            str(pid): {_norm_role_label(r) for r in (keys or []) if r}
+            for pid, keys in raw_by_pipe.items()
+        } if isinstance(raw_by_pipe, dict) else {}
+        global_role_keys = {
             _norm_role_label(r) for r in (body.get("roles") or []) if r
         }
+        roles_narrowed = bool(roles_by_pipe) or bool(global_role_keys)
         throttle_ms = body.get("throttle_ms", 250)
         if not old_input or not new_input or not pipe_ids:
             return jsonify({"error": "old_user, new_user, and pipe_ids are required."}), 400
@@ -2652,11 +2692,12 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         }) + "\n"
                         continue
                     # Role narrowing: keep only fields whose label matches a
-                    # selected role key. Fewer fields = fewer findCards calls.
-                    if role_keys:
+                    # role selected for THIS pipe. Fewer fields = fewer calls.
+                    if roles_narrowed:
+                        keys = roles_by_pipe.get(pid, global_role_keys)
                         fields = {
                             fid: m for fid, m in fields.items()
-                            if _norm_role_label(m.get("label") or fid) in role_keys
+                            if _norm_role_label(m.get("label") or fid) in keys
                         }
                     yield json.dumps({
                         "type": "pipe_start", "pipe_id": pid, "pipe_name": pname,
@@ -2666,7 +2707,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         yield json.dumps({
                             "type": "pipe_done", "pipe_id": pid, "token": None,
                             "plans": 0, "no_fields": True,
-                            "no_matching_roles": bool(role_keys),
+                            "no_matching_roles": roles_narrowed,
                         }) + "\n"
                         pipes_scanned += 1
                         continue
