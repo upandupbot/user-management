@@ -193,7 +193,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <title>slipstream — Assignee Swap</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23EE5A45'/%3E%3Ctext x='32' y='47' font-family='Bodoni MT,Didot,Georgia,serif' font-size='46' font-weight='700' fill='%23FFFFFF' text-anchor='middle'%3Es%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23FFFFFF'/%3E%3Ctext x='32' y='50' font-family='Bodoni MT,Didot,Georgia,serif' font-size='52' font-weight='800' text-anchor='middle'%3E%3Ctspan fill='%23EE5A45'%3Es%3C/tspan%3E%3Ctspan fill='%23F4A89E'%3Es%3C/tspan%3E%3C/text%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,wght@0,500;0,700;0,800;0,900;1,500;1,700;1,900&family=Inter:wght@400;500;600;700&display=swap">
