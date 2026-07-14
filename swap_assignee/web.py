@@ -1335,9 +1335,19 @@ function setWizardOperation(operation) {
   $('roleHelp').textContent = adding
     ? 'Tick the role(s) where the new person should be added. Existing assignees remain in place.'
     : "Tick the role(s) this person holds — e.g. Account Manager. Ticking everything searches every assignee field, which is slower.";
+  $('oldUser').value = '';
+  $('newUser').value = '';
+  clearAlerts('usersAlerts');
+  $('usersStatus').textContent = '';
+  $('pipePickList').innerHTML = '';
+  $('rolePickList').innerHTML = '';
+  $('phasePickList').innerHTML = '';
+  $('pipeGroups').innerHTML = '';
+  $('scanSummary').className = 'alert hidden';
   ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   wizGroups.clear();
   wizUsers = null;
+  $('oldUser').focus();
 }
 
 $('operationSelect').addEventListener('change', (event) => {
