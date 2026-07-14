@@ -371,6 +371,43 @@ INDEX_HTML = r"""<!doctype html>
     /* ---------- Form ---------- */
     .row { display: flex; gap: 18px; flex-wrap: wrap; }
     .row > .col { flex: 1 1 240px; min-width: 0; }
+    .operation-picker {
+      margin-bottom: 24px;
+      max-width: 420px;
+    }
+    .operation-picker label { margin-bottom: 8px; }
+    .operation-select-wrap { position: relative; }
+    .operation-select-wrap::after {
+      content: "↓";
+      position: absolute;
+      right: 18px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--coral);
+      font-size: 16px;
+      font-weight: 800;
+      pointer-events: none;
+    }
+    #operationSelect {
+      appearance: none;
+      padding: 14px 48px 14px 20px;
+      border: 1.5px solid var(--coral);
+      background: var(--coral-soft);
+      color: var(--ink);
+      font-weight: 800;
+      cursor: pointer;
+    }
+    #operationSelect:hover { background: #fff; }
+    #operationSelect:focus-visible {
+      outline: 3px solid var(--coral-soft);
+      outline-offset: 3px;
+    }
+    .operation-description {
+      margin: 8px 4px 0;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.45;
+    }
     label {
       display: block;
       font-size: 10.5px;
@@ -957,6 +994,17 @@ INDEX_HTML = r"""<!doctype html>
     }
     .pipe-group .pg-empty { padding: 14px 18px; color: var(--muted); font-size: 13px; }
     .pipe-group .pg-alert { margin: 12px 18px; }
+
+    @media (max-width: 640px) {
+      header, .hero { padding-left: 20px; padding-right: 20px; }
+      main { padding-left: 20px; padding-right: 20px; }
+      .operation-picker { max-width: none; }
+      .panel-head { grid-template-columns: 64px 1fr; }
+      .panel-head .step { font-size: 54px; }
+      .panel-head .hint { grid-column: 2; text-align: left; max-width: none; }
+      .scan-card .sc-body { padding: 22px 20px; }
+      .scan-card .sc-foot { align-items: flex-start; flex-direction: column; padding: 14px 20px; }
+    }
   </style>
 </head>
 <body>
@@ -1006,16 +1054,28 @@ INDEX_HTML = r"""<!doctype html>
   <section class="panel">
     <div class="panel-head">
       <span class="step">01</span>
-      <h2>Who's being replaced?</h2>
+      <h2 id="step1Title">Who's being replaced?</h2>
       <span class="hint">Email is preferred — names can be ambiguous</span>
+    </div>
+    <div class="operation-picker">
+      <label for="operationSelect">What do you want to do?</label>
+      <div class="operation-select-wrap">
+        <select id="operationSelect" aria-describedby="operationDescription">
+          <option value="replace">Replace assignee</option>
+          <option value="add">Add co-assignee</option>
+        </select>
+      </div>
+      <div id="operationDescription" class="operation-description">
+        Move selected role assignments from one person to another.
+      </div>
     </div>
     <div class="row">
       <div class="col">
-        <label for="oldUser">Remove user</label>
+        <label for="oldUser" id="oldUserLabel">Remove user</label>
         <input id="oldUser" type="text" placeholder="leaving@dydx.digital" autocomplete="off">
       </div>
       <div class="col">
-        <label for="newUser">Add user</label>
+        <label for="newUser" id="newUserLabel">Add user</label>
         <input id="newUser" type="text" placeholder="replacement@dydx.digital" autocomplete="off">
       </div>
     </div>
@@ -1035,7 +1095,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="hint">Tick the pipes you want to scan</span>
     </div>
     <div class="resolved" style="margin-bottom: 18px;">
-      <div class="label">Swap</div>
+      <div class="label" id="resolvedOperationLabel">Swap</div>
       <div id="resolvedUsers" class="swap"></div>
     </div>
     <div class="col" style="max-width: 640px;">
@@ -1064,9 +1124,9 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="row">
       <div class="col" style="flex: 1 1 300px; max-width: 520px;">
-        <label>Roles to swap <span class="small" id="rolePickCount"></span></label>
+        <label id="roleListLabel">Roles to swap <span class="small" id="rolePickCount"></span></label>
         <div id="rolePickList" class="field-list"></div>
-        <div class="small" style="margin-top: 8px; color: var(--muted);">
+        <div class="small" id="roleHelp" style="margin-top: 8px; color: var(--muted);">
           Tick the role(s) this person holds — e.g. Account Manager. Ticking
           everything searches every assignee field, which is slower.
         </div>
@@ -1256,6 +1316,33 @@ function escapeAttr(s) { return escapeHtml(s); }
 // One group per scanned pipe: token + plan rows + apply controls.
 const wizGroups = new Map();
 let wizUsers = null;   // response of /api/wizard/users (resolved users + membership)
+let wizOperation = 'replace';
+
+function setWizardOperation(operation) {
+  wizOperation = operation === 'add' ? 'add' : 'replace';
+  $('operationSelect').value = wizOperation;
+  const adding = wizOperation === 'add';
+  $('operationDescription').textContent = adding
+    ? 'Add someone to matching roles without removing any existing assignees.'
+    : 'Move selected role assignments from one person to another.';
+  $('step1Title').textContent = adding ? 'Add someone alongside an assignee' : "Who's being replaced?";
+  $('oldUserLabel').textContent = adding ? 'Existing assignee' : 'Remove user';
+  $('newUserLabel').textContent = adding ? 'Assignee to add' : 'Add user';
+  $('oldUser').placeholder = adding ? 'existing.assignee@dydx.digital' : 'leaving@dydx.digital';
+  $('newUser').placeholder = adding ? 'new.assignee@dydx.digital' : 'replacement@dydx.digital';
+  $('resolvedOperationLabel').textContent = adding ? 'Add alongside' : 'Swap';
+  $('roleListLabel').childNodes[0].nodeValue = adding ? 'Roles to add ' : 'Roles to swap ';
+  $('roleHelp').textContent = adding
+    ? 'Tick the role(s) where the new person should be added. Existing assignees remain in place.'
+    : "Tick the role(s) this person holds — e.g. Account Manager. Ticking everything searches every assignee field, which is slower.";
+  ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
+  wizGroups.clear();
+  wizUsers = null;
+}
+
+$('operationSelect').addEventListener('change', (event) => {
+  setWizardOperation(event.target.value);
+});
 
 // Upgrade a busy-status message if a single call drags on — the free-tier
 // server sleeps after ~15 min idle and takes ~30–60s to wake.
@@ -1276,7 +1363,9 @@ $('usersBtn').addEventListener('click', async () => {
   const oldUser = $('oldUser').value.trim();
   const newUser = $('newUser').value.trim();
   if (!oldUser || !newUser) {
-    $('usersAlerts').appendChild(alertEl('error', 'Both the remove user and the add user are required.'));
+    $('usersAlerts').appendChild(alertEl('error', wizOperation === 'add'
+      ? 'Enter both the person whose jobs should be found and the person to add.'
+      : 'Both the remove user and the add user are required.'));
     return;
   }
   const baseMsg = 'Resolving users\u2026';
@@ -1284,7 +1373,8 @@ $('usersBtn').addEventListener('click', async () => {
   const cancelHint = slowHint('usersStatus', baseMsg);
   try {
     const data = await api('/api/wizard/users', {
-      old_user: oldUser, new_user: newUser, org_id: $('orgId').value.trim() || null,
+      old_user: oldUser, new_user: newUser, operation: wizOperation,
+      org_id: $('orgId').value.trim() || null,
     });
     wizUsers = data;
     setBusy('usersSpin', 'usersStatus', false, '');
@@ -1302,12 +1392,13 @@ $('usersBtn').addEventListener('click', async () => {
 
 function renderResolvedUsers(data) {
   const oldU = data.old_user, newU = data.new_user;
+  const operation = data.operation || wizOperation;
   $('resolvedUsers').innerHTML = `
     <div class="user">
       <b>${escapeHtml(oldU.name || '(no name)')}</b>
       <span class="email">${escapeHtml(oldU.email)}</span>
     </div>
-    <span class="arrow">→</span>
+    <span class="arrow">${operation === 'add' ? '+' : '→'}</span>
     <div class="user">
       <b>${escapeHtml(newU.name || '(no name)')}</b>
       <span class="email">${escapeHtml(newU.email)}</span>
@@ -1509,8 +1600,14 @@ async function runWizardScan() {
   const sum = $('scanSummary');
   sum.className = 'alert';
   sum.classList.remove('hidden');
-  sum.textContent = 'Scanning — jobs stream in below as they are found…';
+  sum.textContent = wizOperation === 'add'
+    ? 'Scanning for jobs where a co-assignee can be added…'
+    : 'Scanning — jobs stream in below as they are found…';
   $('resultsPanel').classList.remove('hidden');
+  $('resultsTitle').textContent = wizOperation === 'add' ? 'Jobs ready for co-assignment' : 'Their jobs, by pipe';
+  $('resultsHint').textContent = wizOperation === 'add'
+    ? 'Existing assignees remain in place until you review and apply.'
+    : 'Nothing changes in Pipefy until you click Apply on a pipe.';
   $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   setBusy('scanSpin', 'scanStatus', true, 'Contacting server…');
   $('scanBtn').disabled = true;
@@ -1537,6 +1634,7 @@ async function runWizardScan() {
       body: JSON.stringify({
         old_user: $('oldUser').value.trim(),
         new_user: $('newUser').value.trim(),
+        operation: wizOperation,
         org_id: $('orgId').value.trim() || null,
         pipe_ids: pipeIds,
         exclude_phases_by_pipe: getExcludedPhasesByPipe(),
@@ -1592,14 +1690,20 @@ let _appliedTotal = 0;
 
 function renderScanCard(host, totalPlans, withJobs) {
   const who = wizUsers ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
+  const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the new assignee';
   const sub = (withJobs.length === 1 ? 'All within one pipe. ' : `Across ${withJobs.length} pipes. `)
-    + 'Review each match and apply where the fit is right.';
+    + (wizOperation === 'add'
+      ? `Review each match before adding ${target}; client and product filters are optional.`
+      : 'Review each match and apply where the fit is right.');
+  const headline = wizOperation === 'add'
+    ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} job${totalPlans === 1 ? '' : 's'} held by ${escapeHtml(who)}`
+    : `<span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}`;
   host.className = 'scan-card';
   host.innerHTML = `
     <div class="sc-body">
       <div class="sc-count">${totalPlans}</div>
       <div>
-        <div class="sc-head"><span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}</div>
+        <div class="sc-head">${headline}</div>
         <div class="sc-sub">${escapeHtml(sub)}</div>
         <div class="sc-chips">
           ${withJobs.map(g => `
@@ -1665,7 +1769,9 @@ function handleScanEvent(evt) {
         renderScanCard(s, evt.total_plans, withJobs);
       } else {
         s.className = 'alert ok';
-        s.textContent = 'No jobs found in the selected pipes (outside the excluded phases).';
+        s.textContent = wizOperation === 'add'
+          ? 'No matching jobs need this co-assignee (outside the excluded phases).'
+          : 'No jobs found in the selected pipes (outside the excluded phases).';
       }
       break;
     }
@@ -1723,7 +1829,7 @@ function createPipeGroup(evt) {
     </div>
     <div class="pg-empty hidden"></div>
     <div class="pg-actions hidden">
-      <button class="danger pg-apply" disabled>Apply changes…</button>
+      <button class="danger pg-apply" disabled>${wizOperation === 'add' ? 'Add co-assignee…' : 'Apply changes…'}</button>
       <span class="spinner pg-spin"></span>
       <span class="small pg-apply-status"></span>
     </div>
@@ -1874,7 +1980,7 @@ function finalizePipeGroup(g, evt) {
     g.count.textContent = evt.no_matching_roles ? 'no roles ticked' : 'no assignee fields';
     g.empty.textContent = evt.no_matching_roles
       ? 'No roles ticked for this pipe — nothing searched.'
-      : 'This pipe has no assignee fields — nothing to swap.';
+      : `This pipe has no assignee fields — nothing to ${wizOperation === 'add' ? 'add' : 'swap'}.`;
     g.empty.classList.remove('hidden');
     return;
   }
@@ -1931,9 +2037,16 @@ function askApplyGroup(g) {
   if (!g.token) { alert('Run the scan first.'); return; }
   if (!ids.length) { alert('Tick at least one card to change.'); return; }
   _pendingApplyGroup = g;
-  $('confirmText').textContent =
-    `This will modify ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
-    `This action cannot be undone. Are you sure?`;
+  if (wizOperation === 'add') {
+    const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the new assignee';
+    $('confirmText').textContent =
+      `This will add ${target} to the selected role fields on ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
+      'All existing assignees will remain. Are you sure?';
+  } else {
+    $('confirmText').textContent =
+      `This will modify ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
+      'This action cannot be undone. Are you sure?';
+  }
   $('confirmModal').classList.remove('hidden');
 }
 
@@ -1949,7 +2062,7 @@ $('confirmGo').addEventListener('click', async () => {
   if (!g || !g.token) return;
   g.applyBtn.disabled = true;
   g.spin.classList.add('on');
-  g.applyStatus.textContent = 'Applying…';
+  g.applyStatus.textContent = wizOperation === 'add' ? 'Adding co-assignee…' : 'Applying…';
   startLogPolling();
   try {
     const data = await api('/api/apply', {
@@ -1982,17 +2095,21 @@ function renderGroupApply(g, data) {
     g.alertBox.classList.add('hidden');
   }
   const remaining = data.remaining || 0;
+  const verb = data.operation === 'add' ? 'updated with the co-assignee' : 'changed';
   g.applyStatus.innerHTML =
-    `${data.cards_changed} card(s) changed.` +
+    `${data.cards_changed} card(s) ${verb}.` +
     (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '') +
     ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
   g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
-  g.count.textContent = `${data.cards_changed} changed`;
+  g.count.textContent = data.operation === 'add'
+    ? `${data.cards_changed} added`
+    : `${data.cards_changed} changed`;
   // Keep the summary card's footer honest across multiple per-pipe applies.
   _appliedTotal += data.cards_changed || 0;
   const note = document.getElementById('scFootNote');
   if (note && _appliedTotal > 0) {
-    note.textContent = `${_appliedTotal} card${_appliedTotal === 1 ? '' : 's'} changed so far.`;
+    note.textContent = `${_appliedTotal} card${_appliedTotal === 1 ? '' : 's'} `
+      + (data.operation === 'add' ? 'updated with the co-assignee.' : 'changed so far.');
   }
   if (!remaining) {
     g.token = null;
@@ -2026,7 +2143,10 @@ function actionsCellHtml(p, showMeta) {
     const slug = showMeta && a.field_id && a.field_id !== a.field_label
       ? ` <span class="small mono">${escapeHtml(a.field_id)}</span>`
       : '';
-    return `<div>${escapeHtml(label)}${slug}</div>`;
+    const mode = a.mode === 'add_only'
+      ? ' <span class="pill" style="background:var(--coral-soft);color:var(--coral-deep);">add</span>'
+      : '';
+    return `<div>${escapeHtml(label)}${slug}${mode}</div>`;
   }).join('');
 }
 
@@ -2052,11 +2172,12 @@ function detailHtml(p) {
 // Build the main row + its (hidden) detail row for one plan.
 function buildPlanRows(p, i, mode, showMeta) {
   const acts = actionsCellHtml(p, showMeta);
-  let statusHtml = '<span class="badge ok">planned</span>';
+  const addOnly = (p.actions || []).some(a => a.mode === 'add_only');
+  let statusHtml = `<span class="badge ok">${addOnly ? 'to add' : 'planned'}</span>`;
   let stillPlanned = true;
   if (mode === 'apply') {
     stillPlanned = p.status === 'planned';
-    if (p.status === 'ok') statusHtml = '<span class="badge ok">swapped</span>';
+    if (p.status === 'ok') statusHtml = `<span class="badge ok">${addOnly ? 'added' : 'swapped'}</span>`;
     else if (p.status === 'error') statusHtml = '<span class="badge err">error</span>';
     else if (p.status === 'planned') statusHtml = '<span class="badge ok">planned</span>';
     else statusHtml = '<span class="badge warn">' + escapeHtml(p.status || '?') + '</span>';
@@ -2262,7 +2383,8 @@ function renderHistoryInto(rows, tbody) {
   const frag = document.createDocumentFragment();
   rows.forEach(rec => {
     const tr = document.createElement('tr');
-    const scope = rec.scope === 'card' ? 'Card-level' : (rec.field_label || rec.scope || '');
+    const baseScope = rec.scope === 'card' ? 'Card-level' : (rec.field_label || rec.scope || '');
+    const scope = rec.operation === 'add' ? `${baseScope} (add)` : baseScope;
     const change = `${escapeHtml(rec.before || '—')} <span style="color:var(--muted);">→</span> ${escapeHtml(rec.after || '—')}`;
     const cardCell = rec.card_url
       ? `<a href="${escapeHtml(rec.card_url)}" target="_blank" rel="noopener">${escapeHtml(rec.title || rec.card_id || 'card')}</a>`
@@ -2530,6 +2652,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         include_card_level = bool(body.get("include_card_level", True))
         card_add_only = bool(body.get("card_add_only", False))
+        operation = str(body.get("operation") or "replace").strip().lower()
+        if operation not in {"replace", "add"}:
+          raise ValueError(f"Unsupported assignment operation: {operation}")
         field_ids = list(body.get("field_ids") or [])
         exclude_phases = list(body.get("exclude_phases") or DEFAULT_EXCLUDED_PHASES)
 
@@ -2592,6 +2717,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 include_card_level=include_card_level,
                 field_filter=field_filter,
                 card_add_only=card_add_only,
+                operation=operation,
                 id_names={old_u.id: old_u.name, new_u.id: new_u.name},
             )
             if plan.skipped_reason:
@@ -2637,10 +2763,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "pipe_name": pipe_ctx.get("pipe_name") or "",
             "old_user": f"{old_u.name} <{old_u.email}>".strip(),
             "new_user": f"{new_u.name} <{new_u.email}>".strip(),
+            "operation": operation,
         }
 
         yield {"type": "summary", **summary}
-        yield {"type": "done", "token": token}
+        yield {"type": "done", "token": token, "operation": operation}
 
     def _run_preview(body: Dict[str, Any]) -> Dict[str, Any]:
         """Back-compat single-shot preview — drains the event stream."""
@@ -2789,6 +2916,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         body = request.get_json(force=True, silent=True) or {}
         old_input = (body.get("old_user") or "").strip()
         new_input = (body.get("new_user") or "").strip()
+        operation = str(body.get("operation") or "replace").strip().lower()
+        if operation not in {"replace", "add"}:
+            return jsonify({"error": "operation must be 'replace' or 'add'."}), 400
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         if not old_input or not new_input:
             return jsonify({"error": "old_user and new_user are required."}), 400
@@ -2808,6 +2938,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         return jsonify({
             "old_user": {"id": old_u.id, "name": old_u.name, "email": old_u.email},
             "new_user": {"id": new_u.id, "name": new_u.name, "email": new_u.email},
+            "operation": operation,
             "pipes": [{"id": p["id"], "name": p["name"]} for p in KNOWN_PIPES],
         })
 
@@ -2900,6 +3031,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         body = request.get_json(force=True, silent=True) or {}
         old_input = (body.get("old_user") or "").strip()
         new_input = (body.get("new_user") or "").strip()
+        operation = str(body.get("operation") or "replace").strip().lower()
+        if operation not in {"replace", "add"}:
+          return jsonify({"error": "operation must be 'replace' or 'add'."}), 400
         org_id_override = (body.get("org_id") or "").strip() or None
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
         exclude_phases = list(body.get("exclude_phases") or [])
@@ -2977,6 +3111,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         "org_id": org_id_override,
                         "include_card_level": False,   # wizard is field-level only
                         "card_add_only": False,
+                        "operation": operation,
                         "field_ids": list(fields.keys()),
                         "exclude_phases": exclude_by_pipe.get(pid, exclude_phases),
                         "throttle_ms": throttle_ms,
@@ -2991,6 +3126,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                                 yield json.dumps({
                                     "type": "pipe_done", "pipe_id": pid,
                                     "token": evt.get("token"), "plans": plans_n,
+                                    "operation": operation,
                                 }) + "\n"
                             else:
                                 yield json.dumps({**evt, "pipe_id": pid}) + "\n"
@@ -3008,7 +3144,8 @@ def create_app(config_path: str = "config.ini") -> Flask:
                             "message": f"Scan failed: {exc}",
                         }) + "\n"
                 yield json.dumps({
-                    "type": "all_done", "pipes_scanned": pipes_scanned, "total_plans": total_plans,
+                  "type": "all_done", "pipes_scanned": pipes_scanned,
+                  "total_plans": total_plans, "operation": operation,
                 }) + "\n"
             except Exception as exc:  # noqa: BLE001
                 log.exception("wizard scan stream failed")
@@ -3047,6 +3184,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         pipe_name = entry.get("pipe_name", "")
         old_user = entry.get("old_user", "")
         new_user = entry.get("new_user", "")
+        operation = entry.get("operation", "replace")
 
         # Optional per-card selection: apply only the ticked cards and keep the
         # rest in the preview store for a later batch.
@@ -3094,6 +3232,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     plan_dict=d,
                     status=status,
                     error="; ".join(err_msgs),
+                    operation=operation,
                     sheet_sink=audit_sheet_sink,
                 )
             except Exception:  # noqa: BLE001 - audit must never block apply
@@ -3118,6 +3257,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "errors": errors,
             "plans": out_plans,
             "remaining": len(remaining),
+            "operation": operation,
         })
 
     return app

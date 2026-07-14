@@ -104,10 +104,36 @@ def test_build_records_one_per_action():
     assert card_rec["client"] == "Acme"
     assert card_rec["before"] == "Old User"
     assert card_rec["after"] == "New User"
+    assert card_rec["operation"] == "replace"
     field_rec = next(r for r in recs if r["scope"].startswith("field:"))
     assert field_rec["field_label"] == "Creative Specialist"
     # Every record carries a timestamp + status.
     assert all(r["ts"] and r["status"] == "ok" for r in recs)
+
+
+def test_build_records_captures_add_operation():
+    plan = _plan_dict()
+    plan["actions"] = [{
+        "scope": "field:creative",
+        "field_label": "Creative Specialist",
+        "old_names": ["Old User", "Existing User"],
+        "new_names": ["Old User", "Existing User", "New User"],
+        "mode": "add_only",
+    }]
+    recs = build_records(
+        operator_email="alice@upandupgroup.com",
+        source="web",
+        pipe_id="305",
+        pipe_name="Delivery",
+        old_user="Old User <old@x.com>",
+        new_user="New User <new@x.com>",
+        plan_dict=plan,
+        status="ok",
+        operation="add",
+    )
+    assert recs[0]["operation"] == "add"
+    assert recs[0]["before"] == "Old User, Existing User"
+    assert recs[0]["after"] == "Old User, Existing User, New User"
 
 
 def test_build_records_no_actions_still_logs_summary():

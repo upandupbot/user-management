@@ -303,6 +303,38 @@ def test_card_add_only_does_not_affect_field_level():
     assert NEW in a.new_ids
 
 
+def test_add_operation_field_keeps_existing_assignees():
+    card = load_fixture("card_with_field_assignee.json")
+    plan = _plan(card, include_card_level=False, operation="add")
+    assert len(plan.actions) == 1
+    action = plan.actions[0]
+    assert action.scope == "field:creative_specialist"
+    assert action.mode == "add_only"
+    assert action.old_ids == [OLD, "300999"]
+    assert action.new_ids == [OLD, "300999", NEW]
+
+
+def test_add_operation_field_is_noop_when_new_user_already_assigned():
+    card = load_fixture("card_with_field_assignee.json")
+    card["fields"][0]["value"] = f'["{OLD}", "{NEW}"]'
+    card["fields"][0]["array_value"] = [
+        {"id": OLD, "name": "Kate Smith"},
+        {"id": NEW, "name": "New User"},
+    ]
+    plan = _plan(card, include_card_level=False, operation="add")
+    assert plan.actions == []
+
+
+def test_plan_rejects_unknown_operation():
+    card = load_fixture("card_with_field_assignee.json")
+    try:
+        _plan(card, operation="merge")
+    except ValueError as exc:
+        assert "Unsupported assignment operation" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
 def test_card_add_only_apply_sends_appended_list():
     """The mutation payload preserves the old user and adds the new one."""
     card = {

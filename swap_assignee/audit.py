@@ -72,6 +72,7 @@ AUDIT_COLUMNS = (
     "after",
     "status",
     "error",
+    "operation",
 )
 
 
@@ -122,6 +123,7 @@ def build_records(
     plan_dict: Dict[str, Any],
     status: str,
     error: str = "",
+    operation: str = "replace",
 ) -> List[Dict[str, Any]]:
     """One audit record per planned action on a card (card-level + each field)."""
     ts = _now_iso()
@@ -142,6 +144,7 @@ def build_records(
         "new_user": new_user or "",
         "status": status,
         "error": error or "",
+        "operation": operation,
     }
     out: List[Dict[str, Any]] = []
     for a in plan_dict.get("actions") or []:
@@ -274,6 +277,7 @@ def record_swap(
     plan_dict: Dict[str, Any],
     status: str,
     error: str = "",
+    operation: str = "replace",
     sheet_sink: Any = None,
 ) -> List[Dict[str, Any]]:
     """Build records for one applied card, persist locally, mirror to webhook/sheet."""
@@ -287,6 +291,7 @@ def record_swap(
         plan_dict=plan_dict,
         status=status,
         error=error,
+        operation=operation,
     )
     try:
         store.append(records)

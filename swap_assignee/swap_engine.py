@@ -293,8 +293,11 @@ def plan_card(
     include_card_level: bool,
     field_filter: Optional[Set[str]],
     card_add_only: bool = False,
+    operation: str = "replace",
     id_names: Optional[Dict[str, str]] = None,
 ) -> CardPlan:
+    if operation not in {"replace", "add"}:
+        raise ValueError(f"Unsupported assignment operation: {operation}")
     phase = ((card.get("current_phase") or {}).get("name")) or ""
     plan = CardPlan(
         card_id=str(card.get("id")),
@@ -337,7 +340,7 @@ def plan_card(
     # option is to leave card-level untouched (`include_card_level=False`).
     if include_card_level:
         ids = [str(a.get("id")) for a in (card.get("assignees") or []) if a and a.get("id") is not None]
-        if card_add_only:
+        if operation == "add" or card_add_only:
             new_ids = compute_add_only(ids, old_id, new_id)
             if new_ids is not None and new_ids != ids:
                 plan.actions.append(PlannedAction(
@@ -361,11 +364,12 @@ def plan_card(
         if field_filter is not None and fid not in field_filter:
             continue
         ids = parse_field_user_ids(fnode)
-        new_ids = compute_swap(ids, old_id, new_id)
+        new_ids = compute_add_only(ids, old_id, new_id) if operation == "add" else compute_swap(ids, old_id, new_id)
         if new_ids is not None and new_ids != ids:
             label = (meta.get("label") or "").strip() or None
             plan.actions.append(PlannedAction(
                 f"field:{fid}", fid, ids, new_ids, field_label=label,
+                mode="add_only" if operation == "add" else "swap",
                 old_names=_names(ids), new_names=_names(new_ids),
             ))
 

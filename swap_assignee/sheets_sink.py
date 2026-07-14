@@ -78,7 +78,8 @@ class GoogleSheetSink:
             .get(spreadsheetId=self.sheet_id, range=f"{self.tab}!A1:1")
             .execute()
         )
-        if not header.get("values"):
+        current_header = (header.get("values") or [[]])[0]
+        if list(current_header) != list(AUDIT_COLUMNS):
             self._svc.spreadsheets().values().update(
                 spreadsheetId=self.sheet_id,
                 range=f"{self.tab}!A1",
