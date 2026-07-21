@@ -239,6 +239,20 @@ def compute_swap(current_ids: Sequence[str], old_id: str, new_id: str) -> Option
     return new_list
 
 
+def compute_remove(current_ids: Sequence[str], user_id: str) -> Optional[List[str]]:
+    """Return the id list without `user_id`, or None when they're absent.
+
+    Pipefy has no "remove one assignee" mutation — both updateCard and
+    updateCardField SET the whole list — so removal is always
+    "current list minus one id", computed from a fresh card read.
+    """
+    current = [str(x) for x in current_ids]
+    uid = str(user_id)
+    if uid not in current:
+        return None
+    return [x for x in current if x != uid]
+
+
 def compute_add_only(current_ids: Sequence[str], old_id: str, new_id: str) -> Optional[List[str]]:
     """Return new id list when we want to *add* new_id without removing old_id.
 
@@ -370,6 +384,65 @@ def plan_card(
             plan.actions.append(PlannedAction(
                 f"field:{fid}", fid, ids, new_ids, field_label=label,
                 mode="add_only" if operation == "add" else "swap",
+                old_names=_names(ids), new_names=_names(new_ids),
+            ))
+
+    return plan
+
+
+def plan_remove_card(
+    card: Dict[str, Any],
+    *,
+    user_id: str,
+    field_ids: Optional[Set[str]] = None,
+    include_card_level: bool = False,
+    id_names: Optional[Dict[str, str]] = None,
+) -> CardPlan:
+    """Plan removal of one user from a card's recorded scopes only.
+
+    Used by the cover-undo flow: `field_ids` / `include_card_level` come from
+    the stored cover rows, so we never touch a field the tool didn't add the
+    user to. Cards/fields where the user is already gone yield no actions
+    (idempotent — safe to re-run).
+    """
+    plan = CardPlan(
+        card_id=str(card.get("id")),
+        card_url=card.get("url") or "",
+        title=card.get("title") or "",
+        phase_name=((card.get("current_phase") or {}).get("name")) or "",
+        client=extract_client(card),
+        product=extract_product(card),
+    )
+    name_map = build_card_name_lookup(card)
+    if id_names:
+        for k, v in id_names.items():
+            if v:
+                name_map[str(k)] = str(v)
+
+    def _names(ids: Sequence[str]) -> List[str]:
+        return [name_map.get(str(i), str(i)) for i in ids]
+
+    if include_card_level:
+        ids = [str(a.get("id")) for a in (card.get("assignees") or []) if a and a.get("id") is not None]
+        new_ids = compute_remove(ids, user_id)
+        if new_ids is not None:
+            plan.actions.append(PlannedAction(
+                "card", None, ids, new_ids, mode="remove",
+                old_names=_names(ids), new_names=_names(new_ids),
+            ))
+
+    wanted = {str(f) for f in (field_ids or set())}
+    for fnode in card.get("fields") or []:
+        meta = (fnode or {}).get("field") or {}
+        fid = str(meta.get("id")) if meta.get("id") is not None else None
+        if not fid or meta.get("type") not in ASSIGNEE_FIELD_TYPES or fid not in wanted:
+            continue
+        ids = parse_field_user_ids(fnode)
+        new_ids = compute_remove(ids, user_id)
+        if new_ids is not None:
+            label = (meta.get("label") or "").strip() or None
+            plan.actions.append(PlannedAction(
+                f"field:{fid}", fid, ids, new_ids, field_label=label, mode="remove",
                 old_names=_names(ids), new_names=_names(new_ids),
             ))
 

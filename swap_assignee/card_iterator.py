@@ -35,6 +35,31 @@ query PipeCards($pipeId: ID!, $cursor: String) {
 }
 """
 
+SINGLE_CARD_QUERY = """
+query SingleCard($id: ID!) {
+  card(id: $id) {
+    id
+    title
+    url
+    current_phase { id name }
+    assignees { id name email }
+    fields {
+      name
+      value
+      array_value
+      field { id label type }
+    }
+  }
+}
+"""
+
+
+def fetch_card(client, card_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch one card in the same shape iter_cards yields, or None if gone."""
+    data = client.execute(SINGLE_CARD_QUERY, {"id": str(card_id)})
+    return (data or {}).get("card") or None
+
+
 # Server-side filter: only cards where `assignee_id` is on the card-level
 # assignees. Massively faster than scanning the whole pipe.
 #

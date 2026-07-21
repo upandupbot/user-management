@@ -39,6 +39,7 @@ except ImportError as exc:  # pragma: no cover
 from .card_iterator import (
     discover_assignee_fields,
     fetch_active_phases,
+    fetch_card,
     iter_cards,
     iter_cards_fast_union,
     probe_card_level_assignee,
@@ -48,7 +49,7 @@ from .cli import _resolve_users  # reuse exactly the CLI's resolution flow
 from .config import load_config, mask_secret
 from .papertrail_logger import attach_papertrail
 from .pipefy_client import PipefyClient
-from .swap_engine import DEFAULT_EXCLUDED_PHASES, execute_plan, plan_card
+from .swap_engine import DEFAULT_EXCLUDED_PHASES, execute_plan, plan_card, plan_remove_card
 from .user_resolver import (
     UserResolutionError,
     fetch_org_users,
@@ -63,6 +64,7 @@ from .audit import (
     record_swap,
 )
 from .sheets_sink import build_sheet_sink
+from .cover_store import build_cover_store
 
 
 log = logging.getLogger("swap_assignee.web")
@@ -1158,6 +1160,15 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pipeGroups"></div>
   </section>
 
+  <!-- Active covers (undoable co-assignee adds) -->
+  <section id="coversPanel" class="panel hidden">
+    <div class="panel-head">
+      <h2>Active covers</h2>
+      <span class="hint">Co-assignees added for leave &mdash; end the cover when the person returns</span>
+    </div>
+    <div id="coversList"></div>
+  </section>
+
   <!-- History panel -->
   <details class="dev" id="historyPanel">
     <summary>
@@ -1239,6 +1250,23 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal">
     <h3>Apply changes?</h3>
     <p id="confirmText"></p>
+    <div id="coverForm" class="hidden" style="margin: 14px 0 6px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px;">
+      <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin: 0;">
+        <input type="checkbox" id="coverSaveCb" style="width: auto;">
+        <span>Save this cover so it can be undone later</span>
+      </label>
+      <div id="coverFields" class="hidden" style="margin-top: 12px;">
+        <label for="coverName">Cover name</label>
+        <input id="coverName" type="text" placeholder="Sam covering Alice — 24 Jul to 4 Aug" autocomplete="off">
+        <div class="row" style="margin-top: 10px;">
+          <div class="col"><label for="coverStart">Leave starts</label><input id="coverStart" type="date"></div>
+          <div class="col"><label for="coverEnd">Returns</label><input id="coverEnd" type="date"></div>
+        </div>
+        <div class="small" style="margin-top: 8px; color: var(--muted);">
+          Stored in the shared audit Sheet. Anyone can end the cover later from “Active covers”.
+        </div>
+      </div>
+    </div>
     <div class="actions">
       <button id="confirmCancel" class="ghost">Cancel</button>
       <button id="confirmGo" class="danger">Yes, apply</button>
@@ -1272,6 +1300,41 @@ INDEX_HTML = r"""<!doctype html>
     <div class="actions">
       <span class="small" id="recentStatus" style="margin-right: auto; color: var(--muted);"></span>
       <button id="recentClose" class="ghost">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- End-cover modal -->
+<div id="coverModal" class="modal-backdrop hidden">
+  <div class="modal modal-wide">
+    <h3 id="coverModalTitle">End cover</h3>
+    <p class="small" id="coverModalMeta" style="margin: 0 0 14px; color: var(--muted);"></p>
+    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+      <input id="coverSearch" type="text" placeholder="Filter cards…" autocomplete="off" style="max-width: 220px;">
+      <select id="coverPipeFilter"></select>
+      <select id="coverClientFilter"></select>
+      <span class="small" id="coverFilterCount" style="color: var(--muted);"></span>
+    </div>
+    <div style="max-height: 48vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 34px; text-align: center;"><input type="checkbox" id="coverSelectAll" checked title="Select / deselect all"></th>
+            <th>Card</th>
+            <th style="width: 160px;">Pipe</th>
+            <th style="width: 140px;">Client</th>
+            <th>Added to</th>
+            <th style="width: 120px;">Status</th>
+          </tr>
+        </thead>
+        <tbody id="coverTbody"></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <span class="small" id="coverStatus" style="margin-right: auto; color: var(--muted);"></span>
+      <button id="coverClose" class="ghost">Close</button>
+      <button id="coverRemoveBtn" class="danger">Remove co-assignee…</button>
+      <span id="coverSpin" class="spinner"></span>
     </div>
   </div>
 </div>
@@ -1347,6 +1410,12 @@ function setWizardOperation(operation) {
   ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   wizGroups.clear();
   wizUsers = null;
+  wizCoverBatchId = null;
+  $('coverSaveCb').checked = false;
+  $('coverFields').classList.add('hidden');
+  $('coverName').value = '';
+  $('coverStart').value = '';
+  $('coverEnd').value = '';
   $('oldUser').focus();
 }
 
@@ -1387,6 +1456,8 @@ $('usersBtn').addEventListener('click', async () => {
       org_id: $('orgId').value.trim() || null,
     });
     wizUsers = data;
+    wizCoverBatchId = null;      // new user pair = new cover batch
+    $('coverName').value = '';   // re-prefill from the new names on confirm
     setBusy('usersSpin', 'usersStatus', false, '');
     renderResolvedUsers(data);
     renderPipePick(data);
@@ -2057,6 +2128,15 @@ function askApplyGroup(g) {
       `This will modify ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
       'This action cannot be undone. Are you sure?';
   }
+  // Opt-in cover memory (add operation only, and only when the server has a
+  // Sheet to store it in). Values persist across per-pipe applies so one
+  // wizard run makes one named cover.
+  const showCover = wizOperation === 'add' && coversEnabled;
+  $('coverForm').classList.toggle('hidden', !showCover);
+  if (showCover && !$('coverName').value.trim() && wizUsers) {
+    const nu = wizUsers.new_user, ou = wizUsers.old_user;
+    $('coverName').value = `${nu.name || nu.email} covering ${ou.name || ou.email}`;
+  }
   $('confirmModal').classList.remove('hidden');
 }
 
@@ -2075,10 +2155,19 @@ $('confirmGo').addEventListener('click', async () => {
   g.applyStatus.textContent = wizOperation === 'add' ? 'Adding co-assignee…' : 'Applying…';
   startLogPolling();
   try {
+    const cover = (wizOperation === 'add' && coversEnabled && $('coverSaveCb').checked) ? {
+      save: true,
+      batch_id: (wizCoverBatchId = wizCoverBatchId || newBatchId()),
+      name: $('coverName').value.trim(),
+      start_date: $('coverStart').value || '',
+      end_date: $('coverEnd').value || '',
+    } : null;
     const data = await api('/api/apply', {
       token: g.token, card_ids: groupSelectedIds(g), operator_email: operatorEmail,
+      cover,
     });
     renderGroupApply(g, data);
+    if (data.cover_saved) loadCovers();
   } catch (e) {
     g.applyStatus.textContent = '';
     g.alertBox.textContent = 'Apply failed: ' + (e.message || e);
@@ -2108,6 +2197,7 @@ function renderGroupApply(g, data) {
   const verb = data.operation === 'add' ? 'updated with the co-assignee' : 'changed';
   g.applyStatus.innerHTML =
     `${data.cards_changed} card(s) ${verb}.` +
+    (data.cover_saved ? ' Cover saved — undo any time from “Active covers”.' : '') +
     (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '') +
     ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
   g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
@@ -2305,6 +2395,7 @@ function showGate() {
 function unlockApp(email) {
   operatorEmail = email;
   $('gateBackdrop').classList.add('hidden');
+  loadCovers();
   $('oldUser').focus();
 }
 
@@ -2441,6 +2532,246 @@ $('historyPanel').addEventListener('toggle', () => {
   if ($('historyPanel').open) loadHistory();
 });
 
+// ---------- covers (undo a co-assignee add) ----------
+let coversEnabled = false;   // true when the server has a Sheet to store covers in
+let wizCoverBatchId = null;  // one batch per wizard run, shared across per-pipe applies
+let _coverBatch = null;      // batch currently open in the end-cover modal
+let _coverCards = [];        // grouped per card: {card_id, title, ..., roles: []}
+let _coverBusy = false;
+
+function newBatchId() {
+  const a = new Uint8Array(9);
+  crypto.getRandomValues(a);
+  return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Toggle the name/date fields with the "save this cover" checkbox.
+$('coverSaveCb').addEventListener('change', () => {
+  $('coverFields').classList.toggle('hidden', !$('coverSaveCb').checked);
+});
+
+async function loadCovers() {
+  try {
+    const r = await fetch('/api/covers');
+    if (!r.ok) return;
+    const data = await r.json();
+    coversEnabled = !!data.enabled;
+    renderCovers(data.covers || []);
+  } catch (e) { /* panel simply stays hidden */ }
+}
+
+function coverDatesLabel(b) {
+  if (b.start_date && b.end_date) return `${b.start_date} \u2192 ${b.end_date}`;
+  return b.end_date ? `until ${b.end_date}` : (b.start_date ? `from ${b.start_date}` : '');
+}
+
+function renderCovers(covers) {
+  const host = $('coversList');
+  host.innerHTML = '';
+  const active = covers.filter(c => (c.status || 'active') === 'active');
+  $('coversPanel').classList.toggle('hidden', active.length === 0);
+  if (!active.length) return;
+  const today = new Date().toISOString().slice(0, 10);
+  active.forEach(c => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:14px;padding:14px 4px;border-bottom:1px solid var(--border);flex-wrap:wrap;';
+    const overdue = c.end_date && c.end_date <= today;
+    const meta = [
+      `${c.cards_active} card${c.cards_active === 1 ? '' : 's'}`,
+      c.pipe_names && c.pipe_names.length ? c.pipe_names.join(', ') : '',
+      coverDatesLabel(c),
+      c.created_by ? `by ${c.created_by}` : '',
+    ].filter(Boolean).join(' \u00b7 ');
+    row.innerHTML = `
+      <div style="flex:1 1 260px;min-width:200px;">
+        <b>${escapeHtml(c.name || 'Unnamed cover')}</b>
+        ${overdue ? ' <span class="badge warn">leave ended \u2014 ready to remove</span>' : ''}
+        <div class="small" style="color:var(--muted);margin-top:2px;">${escapeHtml(meta)}</div>
+      </div>
+      <button class="danger" style="padding:8px 18px;font-size:13px;">End cover\u2026</button>
+    `;
+    row.querySelector('button').addEventListener('click', () => openCoverModal(c));
+    host.appendChild(row);
+  });
+}
+
+function groupCoverRows(rows) {
+  const map = new Map();
+  rows.forEach(r => {
+    const key = String(r.card_id);
+    const e = map.get(key) || {
+      card_id: key, card_url: r.card_url, title: r.title,
+      pipe_name: r.pipe_name, client: r.client, roles: [],
+    };
+    const role = r.scope === 'card' ? 'Card-level' : (r.field_label || r.field_id || r.scope);
+    if (role && !e.roles.includes(role)) e.roles.push(role);
+    map.set(key, e);
+  });
+  return Array.from(map.values());
+}
+
+async function openCoverModal(batch) {
+  _coverBatch = batch;
+  _coverCards = [];
+  const who = batch.cover_user_name || batch.cover_user_email || 'the co-assignee';
+  $('coverModalTitle').textContent = batch.name || 'End cover';
+  $('coverModalMeta').textContent =
+    `Removes ${who} from the cards below \u2014 only the roles this tool added them to. ` +
+    'Untick anything they should stay on.';
+  $('coverStatus').textContent = '';
+  $('coverSearch').value = '';
+  $('coverRemoveBtn').disabled = true;
+  $('coverTbody').innerHTML = '<tr><td colspan="6" class="small" style="padding:14px;">Loading\u2026</td></tr>';
+  $('coverModal').classList.remove('hidden');
+  try {
+    const data = await api('/api/covers/cards', { batch_id: batch.batch_id });
+    _coverCards = groupCoverRows(data.cards || []);
+    buildCoverFilters();
+    renderCoverRows();
+    $('coverRemoveBtn').disabled = _coverCards.length === 0;
+    if (!_coverCards.length) {
+      $('coverTbody').innerHTML = '<tr><td colspan="6" class="small" style="padding:14px;">No active cards left on this cover.</td></tr>';
+    }
+  } catch (e) {
+    $('coverTbody').innerHTML = `<tr><td colspan="6" class="small" style="padding:14px;">${escapeHtml(e.message || 'Could not load the cover.')}</td></tr>`;
+  }
+}
+
+function _fillCoverSelect(sel, values, allLabel) {
+  sel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = '';
+  all.textContent = allLabel;
+  sel.appendChild(all);
+  values.forEach(v => {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = v || '(none)';
+    sel.appendChild(o);
+  });
+  sel.style.display = values.length > 1 ? '' : 'none';
+}
+
+function buildCoverFilters() {
+  const pipes = Array.from(new Set(_coverCards.map(c => c.pipe_name || ''))).sort();
+  const clients = Array.from(new Set(_coverCards.map(c => c.client || ''))).sort();
+  _fillCoverSelect($('coverPipeFilter'), pipes, 'All pipes');
+  _fillCoverSelect($('coverClientFilter'), clients, 'All clients');
+}
+
+function coverRowVisible(c) {
+  const q = ($('coverSearch').value || '').toLowerCase();
+  const pipe = $('coverPipeFilter').value;
+  const client = $('coverClientFilter').value;
+  if (pipe !== '' && (c.pipe_name || '') !== pipe) return false;
+  if (client !== '' && (c.client || '') !== client) return false;
+  if (q && !(`${c.title} ${c.client} ${c.pipe_name} ${c.roles.join(' ')}`.toLowerCase().includes(q))) return false;
+  return true;
+}
+
+function renderCoverRows() {
+  const tbody = $('coverTbody');
+  tbody.innerHTML = '';
+  let shown = 0;
+  _coverCards.forEach(c => {
+    const visible = coverRowVisible(c);
+    const tr = document.createElement('tr');
+    tr.dataset.cardId = c.card_id;
+    tr.style.display = visible ? '' : 'none';
+    if (visible) shown++;
+    const cardCell = c.card_url
+      ? `<a href="${escapeAttr(c.card_url)}" target="_blank" rel="noopener">${escapeHtml(c.title || c.card_id)}</a>`
+      : escapeHtml(c.title || c.card_id);
+    tr.innerHTML = `
+      <td style="text-align:center;"><input type="checkbox" class="cover-pick" checked></td>
+      <td>${cardCell}</td>
+      <td class="small">${escapeHtml(c.pipe_name || '')}</td>
+      <td class="small">${escapeHtml(c.client || '')}</td>
+      <td class="small">${escapeHtml(c.roles.join(', '))}</td>
+      <td class="cover-state small">\u2014</td>
+    `;
+    tbody.appendChild(tr);
+  });
+  $('coverFilterCount').textContent = shown < _coverCards.length ? `showing ${shown} of ${_coverCards.length}` : '';
+  updateCoverSelection();
+}
+
+function coverSelectedIds() {
+  return Array.from($('coverTbody').querySelectorAll('tr'))
+    .filter(tr => tr.style.display !== 'none')
+    .filter(tr => { const cb = tr.querySelector('.cover-pick'); return cb && cb.checked && !cb.disabled; })
+    .map(tr => tr.dataset.cardId);
+}
+
+function updateCoverSelection() {
+  const n = coverSelectedIds().length;
+  $('coverRemoveBtn').disabled = _coverBusy || n === 0;
+  $('coverRemoveBtn').textContent = n ? `Remove from ${n} card${n === 1 ? '' : 's'}\u2026` : 'Remove co-assignee\u2026';
+}
+
+$('coverSearch').addEventListener('input', renderCoverRows);
+$('coverPipeFilter').addEventListener('change', renderCoverRows);
+$('coverClientFilter').addEventListener('change', renderCoverRows);
+$('coverSelectAll').addEventListener('change', (e) => {
+  $('coverTbody').querySelectorAll('tr').forEach(tr => {
+    if (tr.style.display === 'none') return;
+    const cb = tr.querySelector('.cover-pick');
+    if (cb && !cb.disabled) cb.checked = e.target.checked;
+  });
+  updateCoverSelection();
+});
+$('coverTbody').addEventListener('change', (e) => {
+  if (e.target.classList && e.target.classList.contains('cover-pick')) updateCoverSelection();
+});
+
+$('coverRemoveBtn').addEventListener('click', async () => {
+  if (!_coverBatch || _coverBusy) return;
+  const ids = coverSelectedIds();
+  if (!ids.length) return;
+  const who = _coverBatch.cover_user_name || _coverBatch.cover_user_email || 'the co-assignee';
+  if (!window.confirm(`Remove ${who} from ${ids.length} card${ids.length === 1 ? '' : 's'}? Only the roles this tool added them to are touched.`)) return;
+  _coverBusy = true;
+  $('coverRemoveBtn').disabled = true;
+  $('coverSpin').classList.add('on');
+  $('coverStatus').textContent = 'Removing\u2026 one card at a time.';
+  try {
+    const data = await api('/api/covers/remove', {
+      batch_id: _coverBatch.batch_id, card_ids: ids, operator_email: operatorEmail,
+    });
+    const byId = new Map((data.results || []).map(r => [String(r.card_id), r]));
+    $('coverTbody').querySelectorAll('tr').forEach(tr => {
+      const res = byId.get(tr.dataset.cardId);
+      if (!res) return;
+      const cell = tr.querySelector('.cover-state');
+      const cb = tr.querySelector('.cover-pick');
+      const okish = res.status === 'ok' || res.status === 'already_removed' || res.status === 'gone';
+      if (cell) {
+        const label = res.status === 'ok' ? 'removed'
+          : res.status === 'already_removed' ? 'already removed'
+          : res.status === 'gone' ? 'card deleted'
+          : res.status;
+        cell.innerHTML = `<span class="badge ${okish ? 'ok' : 'err'}">${escapeHtml(label)}</span>`;
+      }
+      if (cb && okish) { cb.checked = false; cb.disabled = true; }
+    });
+    const bits = [`${data.removed} removed`];
+    if (data.skipped) bits.push(`${data.skipped} already gone`);
+    if ((data.errors || []).length) bits.push(`${data.errors.length} error(s)`);
+    $('coverStatus').textContent = bits.join(' \u00b7 ') + (data.batch_ended ? ' \u2014 cover ended.' : '');
+    loadCovers();
+  } catch (e) {
+    $('coverStatus').textContent = 'Remove failed: ' + (e.message || e);
+  } finally {
+    _coverBusy = false;
+    $('coverSpin').classList.remove('on');
+    updateCoverSelection();
+  }
+});
+
+function closeCoverModal() { $('coverModal').classList.add('hidden'); _coverBatch = null; }
+$('coverClose').addEventListener('click', closeCoverModal);
+$('coverModal').addEventListener('click', (e) => { if (e.target === $('coverModal')) closeCoverModal(); });
+
 initGate();
 </script>
 </body>
@@ -2501,6 +2832,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
         cfg.audit_service_account_file,
         service_account_json=cfg.audit_service_account_json,
     )
+    cover_store = build_cover_store(
+        cfg.audit_sheet_id,
+        cfg.audit_service_account_file,
+        service_account_json=cfg.audit_service_account_json,
+    )
 
     @app.before_request
     def _require_session():
@@ -2534,6 +2870,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "token_mask": mask_secret(cfg.pipefy_api_token),
             "default_excluded_phases": list(DEFAULT_EXCLUDED_PHASES),
             "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
+            "covers_enabled": cover_store is not None,
         })
 
     @app.post("/api/auth")
@@ -2773,6 +3110,10 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "pipe_name": pipe_ctx.get("pipe_name") or "",
             "old_user": f"{old_u.name} <{old_u.email}>".strip(),
             "new_user": f"{new_u.name} <{new_u.email}>".strip(),
+            "old_user_id": old_u.id,
+            "new_user_id": new_u.id,
+            "new_user_name": new_u.name or "",
+            "new_user_email": new_u.email or "",
             "operation": operation,
         }
 
@@ -3210,6 +3551,15 @@ def create_app(config_path: str = "config.ini") -> Flask:
         errors: List[str] = []
         cards_changed = 0
         out_plans: List[Dict[str, Any]] = []
+        # Opt-in cover memory: when adding a co-assignee the operator can ask
+        # us to remember exactly which cards/fields were touched so the add
+        # can be undone later (see /api/covers/*). Collected per successful
+        # action, written once after the loop — always best-effort.
+        cover_req = body.get("cover") if isinstance(body.get("cover"), dict) else None
+        save_cover = bool(
+            cover_req and cover_req.get("save") and operation == "add" and cover_store is not None
+        )
+        cover_rows: List[Dict[str, Any]] = []
         for plan in selected:
             results = execute_plan(client, plan, throttle_ms=throttle_ms)
             any_ok = False
@@ -3222,6 +3572,19 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     err_msgs.append(str(err))
                 else:
                     any_ok = True
+                    if save_cover:
+                        cover_rows.append({
+                            "pipe_id": pipe_id,
+                            "pipe_name": pipe_name,
+                            "card_id": plan.card_id,
+                            "card_url": plan.card_url,
+                            "title": plan.title,
+                            "client": getattr(plan, "client", "") or "",
+                            "product": getattr(plan, "product", "") or "",
+                            "scope": action.scope,
+                            "field_id": action.field_id or "",
+                            "field_label": action.field_label or "",
+                        })
             status = "ok" if any_ok and not any_err else ("partial" if any_ok else "error")
             d = _plan_to_dict(plan)
             d["status"] = status
@@ -3255,6 +3618,28 @@ def create_app(config_path: str = "config.ini") -> Flask:
             d["status"] = "planned"
             out_plans.append(d)
 
+        cover_saved = 0
+        if cover_rows and cover_req is not None and cover_store is not None:
+            try:
+                batch_id = str(cover_req.get("batch_id") or "").strip() or secrets.token_urlsafe(8)
+                cover_saved = cover_store.record(
+                    {
+                        "batch_id": batch_id,
+                        "name": str(cover_req.get("name") or "").strip()
+                        or f"{entry.get('new_user_name') or new_user} covering {old_user}",
+                        "leaver": old_user,
+                        "cover_user_id": entry.get("new_user_id") or "",
+                        "cover_user_name": entry.get("new_user_name") or "",
+                        "cover_user_email": entry.get("new_user_email") or "",
+                        "start_date": str(cover_req.get("start_date") or "").strip(),
+                        "end_date": str(cover_req.get("end_date") or "").strip(),
+                        "created_by": operator_email,
+                    },
+                    cover_rows,
+                )
+            except Exception:  # noqa: BLE001 - cover memory must never block apply
+                log.exception("cover store write failed (apply succeeded)")
+
         if remaining:
             entry["plans"] = remaining
             entry["created_at"] = time.time()
@@ -3268,6 +3653,180 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "plans": out_plans,
             "remaining": len(remaining),
             "operation": operation,
+            "cover_saved": cover_saved,
+        })
+
+    # ---------- cover batches (undo a co-assignee add) ----------
+
+    @app.get("/api/covers")
+    def api_covers():
+        if cover_store is None:
+            return jsonify({"covers": [], "enabled": False})
+        try:
+            return jsonify({"covers": cover_store.list_batches(), "enabled": True})
+        except Exception as exc:  # noqa: BLE001 - sheet unreachable
+            log.exception("cover list failed")
+            return jsonify({"error": f"Could not read covers: {exc}"}), 500
+
+    @app.post("/api/covers/cards")
+    def api_cover_cards():
+        if cover_store is None:
+            return jsonify({"error": "Cover storage is not configured."}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        batch_id = str(body.get("batch_id") or "").strip()
+        if not batch_id:
+            return jsonify({"error": "batch_id is required."}), 400
+        try:
+            return jsonify({"cards": cover_store.list_cards(batch_id)})
+        except Exception as exc:  # noqa: BLE001
+            log.exception("cover cards failed")
+            return jsonify({"error": f"Could not read cover cards: {exc}"}), 500
+
+    @app.post("/api/covers/remove")
+    def api_cover_remove():
+        """Undo a cover: remove the co-assignee from the selected stored cards.
+
+        Per card: one fresh read (Pipefy mutations SET the whole assignee
+        list, so we must compute `current minus user`), then one write per
+        recorded scope where the user is still present. Cards where they're
+        already gone are marked removed without any mutation — the whole
+        flow is idempotent and safe to re-run.
+        """
+        if cover_store is None:
+            return jsonify({"error": "Cover storage is not configured."}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        operator_email = normalize_email(
+            session.get("operator_email") or body.get("operator_email")
+        )
+        if not is_allowed_email(operator_email):
+            return jsonify({
+                "error": "A valid company email is required before applying changes.",
+                "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
+            }), 403
+        batch_id = str(body.get("batch_id") or "").strip()
+        if not batch_id:
+            return jsonify({"error": "batch_id is required."}), 400
+        try:
+            throttle_ms = int(body.get("throttle_ms", 250))
+        except (TypeError, ValueError):
+            throttle_ms = 250
+
+        try:
+            rows = cover_store.list_cards(batch_id)
+            batches = [b for b in cover_store.list_batches(status=None) if b["batch_id"] == batch_id]
+        except Exception as exc:  # noqa: BLE001
+            log.exception("cover read failed")
+            return jsonify({"error": f"Could not read the cover from the Sheet: {exc}"}), 500
+        if not batches:
+            return jsonify({"error": "Cover not found. It may already be ended."}), 404
+        batch = batches[0]
+        user_id = str(batch.get("cover_user_id") or "")
+        if not user_id:
+            return jsonify({"error": "This cover has no stored user id; remove manually in Pipefy."}), 400
+        user_label = f"{batch.get('cover_user_name') or ''} <{batch.get('cover_user_email') or ''}>".strip()
+
+        raw_ids = body.get("card_ids")
+        if isinstance(raw_ids, list) and raw_ids:
+            wanted = {str(x) for x in raw_ids}
+            rows = [r for r in rows if str(r.get("card_id")) in wanted]
+        if not rows:
+            return jsonify({"error": "No matching active cards in this cover."}), 400
+
+        # Group the stored rows by card: each card gets ONE read + the
+        # removal scopes recorded for it.
+        by_card: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            by_card.setdefault(str(r.get("card_id")), []).append(r)
+
+        results: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        removed = 0
+        skipped = 0
+        done_ids: set = set()
+        for card_id, card_rows in by_card.items():
+            field_ids = {r["field_id"] for r in card_rows if r.get("field_id")}
+            include_card_level = any((r.get("scope") or "") == "card" for r in card_rows)
+            base = {
+                "card_id": card_id,
+                "card_url": card_rows[0].get("card_url") or "",
+                "title": card_rows[0].get("title") or "",
+                "pipe_name": card_rows[0].get("pipe_name") or "",
+            }
+            try:
+                card = fetch_card(client, card_id)
+            except Exception as exc:  # noqa: BLE001 - network/API
+                errors.append(f"{base['card_url'] or card_id}: {exc}")
+                results.append({**base, "status": "error", "detail": str(exc)})
+                continue
+            if card is None:
+                # Card deleted — nothing left to undo; clear the record.
+                done_ids.add(card_id)
+                skipped += 1
+                results.append({**base, "status": "gone", "detail": "Card no longer exists."})
+                continue
+            plan = plan_remove_card(
+                card,
+                user_id=user_id,
+                field_ids=field_ids,
+                include_card_level=include_card_level,
+                id_names={user_id: batch.get("cover_user_name") or ""},
+            )
+            if not plan.actions:
+                done_ids.add(card_id)
+                skipped += 1
+                results.append({**base, "status": "already_removed",
+                                "detail": "User no longer on the recorded fields."})
+                continue
+            exec_results = execute_plan(client, plan, throttle_ms=throttle_ms)
+            err_msgs = [str(err) for _, err in exec_results if err]
+            any_ok = any(err is None for _, err in exec_results)
+            status = "ok" if any_ok and not err_msgs else ("partial" if any_ok else "error")
+            if any_ok and not err_msgs:
+                done_ids.add(card_id)
+                removed += 1
+            else:
+                errors.extend(f"{base['card_url'] or card_id}: {m}" for m in err_msgs)
+            d = _plan_to_dict(plan)
+            results.append({**base, "status": status, "detail": "; ".join(err_msgs),
+                            "actions": d["actions"]})
+            # Audit the removal like any other apply.
+            try:
+                record_swap(
+                    store=audit_store,
+                    webhook_url=cfg.audit_webhook_url,
+                    operator_email=operator_email,
+                    source="web",
+                    pipe_id=card_rows[0].get("pipe_id") or "",
+                    pipe_name=base["pipe_name"],
+                    old_user=user_label,
+                    new_user="",
+                    plan_dict=d,
+                    status=status,
+                    error="; ".join(err_msgs),
+                    operation="remove",
+                    sheet_sink=audit_sheet_sink,
+                )
+            except Exception:  # noqa: BLE001 - audit must never block
+                log.exception("audit logging failed for cover removal %s", card_id)
+
+        batch_ended = False
+        if done_ids:
+            try:
+                batch_ended = cover_store.mark_cards_removed(batch_id, done_ids)
+            except Exception:  # noqa: BLE001 - Pipefy is already updated
+                log.exception("cover store update failed after removal")
+                errors.append(
+                    "Pipefy was updated, but the cover records could not be marked "
+                    "removed in the Sheet — re-running is safe (already-removed "
+                    "cards are skipped)."
+                )
+
+        return jsonify({
+            "removed": removed,
+            "skipped": skipped,
+            "errors": errors,
+            "results": results,
+            "batch_ended": batch_ended,
         })
 
     return app

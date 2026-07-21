@@ -41,6 +41,42 @@ log = logging.getLogger("swap_assignee.audit.sheets")
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
+def load_sheet_credentials(
+    service_account_file: Optional[str],
+    service_account_json: Optional[str] = None,
+):
+    """Build service-account credentials for the Sheets API, or None.
+
+    Shared by the audit sink and the cover store. Never raises — returns
+    None when the Google libraries are missing, the key file doesn't exist,
+    or the key content is invalid.
+    """
+    if not (service_account_file or service_account_json):
+        return None
+    try:
+        from google.oauth2.service_account import Credentials  # lazy import
+    except ImportError:
+        log.warning(
+            "Google API libraries not installed; Google Sheets features are disabled. "
+            "Run: pip install -r requirements.txt"
+        )
+        return None
+    try:
+        if service_account_json:
+            import json
+
+            info = json.loads(service_account_json)
+            return Credentials.from_service_account_info(info, scopes=_SCOPES)
+        path = Path(service_account_file).expanduser()
+        if not path.exists():
+            log.warning("Audit service_account_file not found: %s", path)
+            return None
+        return Credentials.from_service_account_file(str(path), scopes=_SCOPES)
+    except Exception as exc:  # noqa: BLE001 - never block on credential init
+        log.warning("Could not load Google service-account credentials: %s", exc)
+        return None
+
+
 def _cell(value: Any) -> Any:
     """Coerce a record value into something the Sheets API accepts."""
     if value is None:
@@ -125,26 +161,10 @@ def build_sheet_sink(
     """
     if not sheet_id or not (service_account_file or service_account_json):
         return None
-    try:
-        from google.oauth2.service_account import Credentials  # lazy import
-    except ImportError:
-        log.warning(
-            "Google API libraries not installed; the Sheets audit sink is disabled. "
-            "Run: pip install -r requirements.txt"
-        )
+    creds = load_sheet_credentials(service_account_file, service_account_json)
+    if creds is None:
         return None
     try:
-        if service_account_json:
-            import json
-
-            info = json.loads(service_account_json)
-            creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
-        else:
-            path = Path(service_account_file).expanduser()
-            if not path.exists():
-                log.warning("Audit service_account_file not found: %s", path)
-                return None
-            creds = Credentials.from_service_account_file(str(path), scopes=_SCOPES)
         return GoogleSheetSink(sheet_id, creds, tab=tab)
     except Exception as exc:  # noqa: BLE001 - never block on sink init
         log.warning("Could not initialise Google Sheets audit sink: %s", exc)
