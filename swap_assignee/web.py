@@ -1174,6 +1174,7 @@ INDEX_HTML = r"""<!doctype html>
   <!-- Saved changes (undoable co-assignee adds) -->
   <section id="coversPanel" class="panel hidden">
     <div class="panel-head">
+      <span class="step" aria-hidden="true"></span>
       <h2>Saved changes</h2>
       <span class="hint">Co-assignees added by this tool &mdash; undo them here when they're no longer needed</span>
     </div>
@@ -1293,7 +1294,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal modal-wide">
     <h3>Recent applies</h3>
     <p class="small" style="margin: 0 0 14px; color: var(--muted);">
-      Last 30 days from this machine's local audit log.
+      Last 30 days.
       <span id="recentSyncNote"></span>
     </p>
     <div id="recentBody" style="max-height: 52vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
@@ -2477,9 +2478,10 @@ async function loadHistory() {
     const data = await r.json();
     const rows = data.records || [];
     const n = renderHistoryInto(rows, $('historyTbody'));
-    const sync = data.sheet_sync
-      ? 'mirrored to the shared Google Sheet'
-      : 'local to this server only — resets on redeploy';
+    const sync = data.source === 'sheet'
+      ? 'shared team history'
+      : (data.sheet_sync ? 'local view — shared history unavailable right now'
+                         : 'local to this server only — resets on redeploy');
     $('historyStatus').textContent = `${n} record${n === 1 ? '' : 's'} · ${sync}`;
   } catch (e) {
     $('historyStatus').textContent = 'load error';
@@ -2527,9 +2529,9 @@ async function openRecentModal() {
     const rows = data.records || [];
     const n = renderHistoryInto(rows, $('recentTbody'));
     $('recentStatus').textContent = `${n} record${n === 1 ? '' : 's'} · last 30 days`;
-    $('recentSyncNote').textContent = data.sheet_sync
-      ? 'Also mirrored to the shared Google Sheet.'
-      : 'Local only — set [Audit] webhook_url to also mirror to a shared Sheet.';
+    $('recentSyncNote').textContent = data.source === 'sheet'
+      ? 'Shared team history — includes applies made by everyone.'
+      : 'Local history for this server only.';
   } catch (e) {
     $('recentStatus').textContent = 'load error';
   }
@@ -2914,10 +2916,23 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
     @app.get("/api/history")
     def api_history():
-        rows = audit_store.recent(limit=300, days=30)
+        """Recent applies. Prefer the shared Google Sheet (everyone's applies,
+        survives redeploys); fall back to the local JSONL store when the
+        Sheet is unconfigured or unreachable."""
+        rows: List[Dict[str, Any]] = []
+        source = "local"
+        if audit_sheet_sink is not None:
+            try:
+                rows = audit_sheet_sink.recent(limit=300, days=30)
+                source = "sheet"
+            except Exception as exc:  # noqa: BLE001 - Sheet down; local still works
+                log.warning("history: Sheet read failed, falling back to local: %s", exc)
+        if source == "local":
+            rows = audit_store.recent(limit=300, days=30)
         return jsonify({
             "records": rows,
             "count": len(rows),
+            "source": source,
             "sheet_sync": bool(cfg.audit_webhook_url) or audit_sheet_sink is not None,
         })
 

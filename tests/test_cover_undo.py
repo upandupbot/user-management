@@ -275,3 +275,39 @@ def test_cover_remove_requires_company_email(monkeypatch):
     c = _web_client(monkeypatch, store)
     r = c.post("/api/covers/remove", json={"batch_id": "b1", "operator_email": "x@gmail.com"})
     assert r.status_code == 403
+
+
+# ---------- shared history (read back from the Sheet) ----------
+
+class FakeHistorySink:
+    def __init__(self, rows=None, boom=False):
+        self.rows = rows or []
+        self.boom = boom
+
+    def recent(self, *, limit=300, days=30):
+        if self.boom:
+            raise RuntimeError("sheets down")
+        return list(self.rows)
+
+
+def test_history_prefers_shared_sheet(monkeypatch):
+    rows = [{"ts": "2026-07-20T10:00:00Z", "operator_email": "other@upandupgroup.com",
+             "card_id": "C9", "status": "ok"}]
+    store = MemStore()
+    c = _web_client(monkeypatch, store)
+    # Rebuild with a sheet sink that has team rows.
+    monkeypatch.setattr(web, "build_sheet_sink", lambda *a, **kw: FakeHistorySink(rows))
+    c = web.create_app().test_client()
+    data = c.get("/api/history").get_json()
+    assert data["source"] == "sheet"
+    assert data["records"][0]["operator_email"] == "other@upandupgroup.com"
+
+
+def test_history_falls_back_to_local_when_sheet_unreachable(monkeypatch):
+    store = MemStore()
+    c = _web_client(monkeypatch, store)
+    monkeypatch.setattr(web, "build_sheet_sink", lambda *a, **kw: FakeHistorySink(boom=True))
+    c = web.create_app().test_client()
+    data = c.get("/api/history").get_json()
+    assert data["source"] == "local"
+    assert data["sheet_sync"] is True

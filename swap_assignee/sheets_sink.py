@@ -30,6 +30,7 @@ JSONL store.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -84,6 +85,14 @@ def _cell(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _ts_epoch(ts: Any) -> float:
+    """Best-effort ISO-8601 -> epoch seconds; unparseable rows are kept (inf)."""
+    try:
+        return datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:  # noqa: BLE001 - hand-edited or legacy rows
+        return float("inf")
 
 
 class GoogleSheetSink:
@@ -141,6 +150,32 @@ class GoogleSheetSink:
             body={"values": rows},
         ).execute()
         return True
+
+    def recent(self, *, limit: int = 300, days: int = 30) -> List[Dict[str, Any]]:
+        """Read back the newest audit rows (newest first) from the shared tab.
+
+        This is what makes History a *team* view on hosted deploys: the local
+        JSONL store resets on redeploy and only ever has one machine's applies,
+        while the Sheet has everyone's.
+        """
+        self._ensure()
+        last_col = chr(ord("A") + len(AUDIT_COLUMNS) - 1)
+        resp = (
+            self._svc.spreadsheets()
+            .values()
+            .get(spreadsheetId=self.sheet_id, range=f"{self.tab}!A2:{last_col}")
+            .execute()
+        )
+        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+        out: List[Dict[str, Any]] = []
+        for raw in resp.get("values") or []:
+            rec = {col: (raw[i] if i < len(raw) else "") for i, col in enumerate(AUDIT_COLUMNS)}
+            if _ts_epoch(rec.get("ts")) >= cutoff:
+                out.append(rec)
+        out.reverse()  # sheet appends chronologically -> newest first
+        if limit and limit > 0:
+            out = out[:limit]
+        return out
 
 
 def build_sheet_sink(
