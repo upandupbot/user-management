@@ -727,6 +727,15 @@ INDEX_HTML = r"""<!doctype html>
       padding: 2px 10px; border-radius: 999px;
       text-transform: uppercase; letter-spacing: 0.14em;
     }
+    /* Small operation chip used in the results "Change" column (e.g. co-assign). */
+    .op-pill {
+      display: inline-block;
+      font-size: 9px; font-weight: 700;
+      padding: 2px 9px; border-radius: 999px;
+      margin-left: 8px; vertical-align: 1px;
+      text-transform: uppercase; letter-spacing: 0.12em;
+      white-space: nowrap;
+    }
     .field-list .meta {
       display: none;
       color: var(--muted);
@@ -877,10 +886,12 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 28px;
-      padding: 36px 38px;
-      max-width: 480px;
+      padding: 40px 44px;
+      max-width: 600px;
       width: 92%;
       box-shadow: var(--shadow);
+      max-height: 90vh;
+      overflow-y: auto;
     }
     .modal h3 {
       margin: 0 0 14px;
@@ -1250,19 +1261,21 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal">
     <h3>Apply changes?</h3>
     <p id="confirmText"></p>
-    <div id="coverForm" class="hidden" style="margin: 14px 0 6px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px;">
-      <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin: 0;">
+    <div id="coverForm" class="hidden" style="margin: 22px 0 10px; padding: 22px 24px; border: 1px solid var(--border); border-radius: 16px;">
+      <label style="display: flex; align-items: center; gap: 12px; cursor: pointer; margin: 0;">
         <input type="checkbox" id="coverSaveCb" style="width: auto;">
         <span>Save this change so it can be undone later</span>
       </label>
-      <div id="coverFields" class="hidden" style="margin-top: 12px;">
-        <label for="coverName">Name it, so it's easy to find later</label>
-        <input id="coverName" type="text" placeholder="Simphiwe added alongside Katekani" autocomplete="off">
-        <div style="margin-top: 10px;">
+      <div id="coverFields" class="hidden">
+        <div style="margin-top: 20px;">
+          <label for="coverName">Name it, so it's easy to find later</label>
+          <input id="coverName" type="text" placeholder="Simphiwe added alongside Katekani" autocomplete="off">
+        </div>
+        <div style="margin-top: 20px;">
           <label for="coverEnd">Do you already know when you'll want to undo this? <span style="text-transform:none;font-weight:400;">(optional)</span></label>
           <input id="coverEnd" type="date" style="max-width: 220px;">
         </div>
-        <div class="small" style="margin-top: 8px; color: var(--muted);">
+        <div class="small" style="margin-top: 18px; color: var(--muted); line-height: 1.6;">
           Nothing happens automatically — you'll find this under “Saved changes” on the
           home page, where you (or anyone on the team) can undo it whenever it's time.
         </div>
@@ -2234,7 +2247,7 @@ function actionsCellHtml(p, showMeta) {
   return (p.actions || []).map(a => {
     if (a.scope === 'card') {
       if (a.mode === 'add_only') {
-        return '<div>Card assignees <span class="pill" style="background:var(--warn-bg);color:var(--warn);">add-only</span></div>';
+        return '<div>Card assignees <span class="op-pill" style="background:var(--warn-bg);color:var(--warn);">add-only</span></div>';
       }
       return '<div>Card assignees</div>';
     }
@@ -2243,9 +2256,9 @@ function actionsCellHtml(p, showMeta) {
       ? ` <span class="small mono">${escapeHtml(a.field_id)}</span>`
       : '';
     const mode = a.mode === 'add_only'
-      ? ' <span class="pill" style="background:var(--coral-soft);color:var(--coral-deep);">add</span>'
+      ? ' <span class="op-pill" style="background:var(--coral-soft);color:var(--coral-deep);">co-assign</span>'
       : '';
-    return `<div>${escapeHtml(label)}${slug}${mode}</div>`;
+    return `<div style="margin:2px 0;">${escapeHtml(label)}${slug}${mode}</div>`;
   }).join('');
 }
 
@@ -2572,7 +2585,7 @@ function renderCovers(covers) {
   const today = new Date().toISOString().slice(0, 10);
   active.forEach(c => {
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:14px;padding:14px 4px;border-bottom:1px solid var(--border);flex-wrap:wrap;';
+    row.style.cssText = 'display:flex;align-items:center;gap:24px;padding:20px 4px;border-bottom:1px solid var(--border);flex-wrap:wrap;';
     const overdue = c.end_date && c.end_date <= today;
     const meta = [
       `${c.cards_active} card${c.cards_active === 1 ? '' : 's'}`,
@@ -2581,12 +2594,12 @@ function renderCovers(covers) {
       c.created_by ? `by ${c.created_by}` : '',
     ].filter(Boolean).join(' \u00b7 ');
     row.innerHTML = `
-      <div style="flex:1 1 260px;min-width:200px;">
+      <div style="flex:0 1 auto;min-width:200px;">
         <b>${escapeHtml(c.name || 'Unnamed change')}</b>
         ${overdue ? ' <span class="badge warn">planned undo date reached</span>' : ''}
-        <div class="small" style="color:var(--muted);margin-top:2px;">${escapeHtml(meta)}</div>
       </div>
-      <button class="danger" style="padding:8px 18px;font-size:13px;">Undo\u2026</button>
+      <div class="small" style="flex:1 1 auto;text-align:right;color:var(--muted);">${escapeHtml(meta)}</div>
+      <button class="danger" style="padding:8px 22px;font-size:13px;flex:0 0 auto;">Undo</button>
     `;
     row.querySelector('button').addEventListener('click', () => openCoverModal(c));
     host.appendChild(row);
