@@ -461,6 +461,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     button.primary:hover { background: var(--coral); color: #fff; border-color: var(--coral); }
     button.ghost { background: transparent; border-color: var(--ink); }
+    /* Explicit hover: the transparent background above ties with button:hover
+       on specificity and wins on source order, leaving white text on a white
+       background. */
+    button.ghost:hover { background: var(--ink); color: var(--bg); }
     button.danger {
       background: var(--coral);
       color: #fff;
@@ -1348,7 +1352,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="actions">
       <span class="small" id="coverStatus" style="margin-right: auto; color: var(--muted);"></span>
       <button id="coverClose" class="ghost">Close</button>
-      <button id="coverRemoveBtn" class="danger">Remove co-assignee…</button>
+      <button id="coverRemoveBtn" class="danger">Remove co-assignee</button>
       <span id="coverSpin" class="spinner"></span>
     </div>
   </div>
@@ -2719,7 +2723,7 @@ function coverSelectedIds() {
 function updateCoverSelection() {
   const n = coverSelectedIds().length;
   $('coverRemoveBtn').disabled = _coverBusy || n === 0;
-  $('coverRemoveBtn').textContent = n ? `Remove from ${n} card${n === 1 ? '' : 's'}\u2026` : 'Remove co-assignee\u2026';
+  $('coverRemoveBtn').textContent = n ? `Remove from ${n} card${n === 1 ? '' : 's'}` : 'Remove co-assignee';
 }
 
 $('coverSearch').addEventListener('input', renderCoverRows);
