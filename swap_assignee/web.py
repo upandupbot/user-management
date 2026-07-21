@@ -1160,11 +1160,11 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pipeGroups"></div>
   </section>
 
-  <!-- Active covers (undoable co-assignee adds) -->
+  <!-- Saved changes (undoable co-assignee adds) -->
   <section id="coversPanel" class="panel hidden">
     <div class="panel-head">
-      <h2>Active covers</h2>
-      <span class="hint">Co-assignees added for leave &mdash; end the cover when the person returns</span>
+      <h2>Saved changes</h2>
+      <span class="hint">Co-assignees added by this tool &mdash; undo them here when they're no longer needed</span>
     </div>
     <div id="coversList"></div>
   </section>
@@ -1253,17 +1253,18 @@ INDEX_HTML = r"""<!doctype html>
     <div id="coverForm" class="hidden" style="margin: 14px 0 6px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px;">
       <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin: 0;">
         <input type="checkbox" id="coverSaveCb" style="width: auto;">
-        <span>Save this cover so it can be undone later</span>
+        <span>Save this change so it can be undone later</span>
       </label>
       <div id="coverFields" class="hidden" style="margin-top: 12px;">
-        <label for="coverName">Cover name</label>
-        <input id="coverName" type="text" placeholder="Sam covering Alice — 24 Jul to 4 Aug" autocomplete="off">
-        <div class="row" style="margin-top: 10px;">
-          <div class="col"><label for="coverStart">Leave starts</label><input id="coverStart" type="date"></div>
-          <div class="col"><label for="coverEnd">Returns</label><input id="coverEnd" type="date"></div>
+        <label for="coverName">Name it, so it's easy to find later</label>
+        <input id="coverName" type="text" placeholder="Simphiwe added alongside Katekani" autocomplete="off">
+        <div style="margin-top: 10px;">
+          <label for="coverEnd">Do you already know when you'll want to undo this? <span style="text-transform:none;font-weight:400;">(optional)</span></label>
+          <input id="coverEnd" type="date" style="max-width: 220px;">
         </div>
         <div class="small" style="margin-top: 8px; color: var(--muted);">
-          Stored in the shared audit Sheet. Anyone can end the cover later from “Active covers”.
+          Nothing happens automatically — you'll find this under “Saved changes” on the
+          home page, where you (or anyone on the team) can undo it whenever it's time.
         </div>
       </div>
     </div>
@@ -1304,10 +1305,10 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
-<!-- End-cover modal -->
+<!-- Undo-change modal -->
 <div id="coverModal" class="modal-backdrop hidden">
   <div class="modal modal-wide">
-    <h3 id="coverModalTitle">End cover</h3>
+    <h3 id="coverModalTitle">Undo change</h3>
     <p class="small" id="coverModalMeta" style="margin: 0 0 14px; color: var(--muted);"></p>
     <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
       <input id="coverSearch" type="text" placeholder="Filter cards…" autocomplete="off" style="max-width: 220px;">
@@ -1414,7 +1415,6 @@ function setWizardOperation(operation) {
   $('coverSaveCb').checked = false;
   $('coverFields').classList.add('hidden');
   $('coverName').value = '';
-  $('coverStart').value = '';
   $('coverEnd').value = '';
   $('oldUser').focus();
 }
@@ -2135,7 +2135,7 @@ function askApplyGroup(g) {
   $('coverForm').classList.toggle('hidden', !showCover);
   if (showCover && !$('coverName').value.trim() && wizUsers) {
     const nu = wizUsers.new_user, ou = wizUsers.old_user;
-    $('coverName').value = `${nu.name || nu.email} covering ${ou.name || ou.email}`;
+    $('coverName').value = `${nu.name || nu.email} added alongside ${ou.name || ou.email}`;
   }
   $('confirmModal').classList.remove('hidden');
 }
@@ -2159,7 +2159,6 @@ $('confirmGo').addEventListener('click', async () => {
       save: true,
       batch_id: (wizCoverBatchId = wizCoverBatchId || newBatchId()),
       name: $('coverName').value.trim(),
-      start_date: $('coverStart').value || '',
       end_date: $('coverEnd').value || '',
     } : null;
     const data = await api('/api/apply', {
@@ -2197,7 +2196,7 @@ function renderGroupApply(g, data) {
   const verb = data.operation === 'add' ? 'updated with the co-assignee' : 'changed';
   g.applyStatus.innerHTML =
     `${data.cards_changed} card(s) ${verb}.` +
-    (data.cover_saved ? ' Cover saved — undo any time from “Active covers”.' : '') +
+    (data.cover_saved ? ' Saved — undo any time from “Saved changes” on the home page.' : '') +
     (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '') +
     ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
   g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
@@ -2561,8 +2560,7 @@ async function loadCovers() {
 }
 
 function coverDatesLabel(b) {
-  if (b.start_date && b.end_date) return `${b.start_date} \u2192 ${b.end_date}`;
-  return b.end_date ? `until ${b.end_date}` : (b.start_date ? `from ${b.start_date}` : '');
+  return b.end_date ? `undo planned for ${b.end_date}` : '';
 }
 
 function renderCovers(covers) {
@@ -2584,11 +2582,11 @@ function renderCovers(covers) {
     ].filter(Boolean).join(' \u00b7 ');
     row.innerHTML = `
       <div style="flex:1 1 260px;min-width:200px;">
-        <b>${escapeHtml(c.name || 'Unnamed cover')}</b>
-        ${overdue ? ' <span class="badge warn">leave ended \u2014 ready to remove</span>' : ''}
+        <b>${escapeHtml(c.name || 'Unnamed change')}</b>
+        ${overdue ? ' <span class="badge warn">planned undo date reached</span>' : ''}
         <div class="small" style="color:var(--muted);margin-top:2px;">${escapeHtml(meta)}</div>
       </div>
-      <button class="danger" style="padding:8px 18px;font-size:13px;">End cover\u2026</button>
+      <button class="danger" style="padding:8px 18px;font-size:13px;">Undo\u2026</button>
     `;
     row.querySelector('button').addEventListener('click', () => openCoverModal(c));
     host.appendChild(row);
@@ -2614,7 +2612,7 @@ async function openCoverModal(batch) {
   _coverBatch = batch;
   _coverCards = [];
   const who = batch.cover_user_name || batch.cover_user_email || 'the co-assignee';
-  $('coverModalTitle').textContent = batch.name || 'End cover';
+  $('coverModalTitle').textContent = batch.name || 'Undo change';
   $('coverModalMeta').textContent =
     `Removes ${who} from the cards below \u2014 only the roles this tool added them to. ` +
     'Untick anything they should stay on.';
@@ -2757,7 +2755,7 @@ $('coverRemoveBtn').addEventListener('click', async () => {
     const bits = [`${data.removed} removed`];
     if (data.skipped) bits.push(`${data.skipped} already gone`);
     if ((data.errors || []).length) bits.push(`${data.errors.length} error(s)`);
-    $('coverStatus').textContent = bits.join(' \u00b7 ') + (data.batch_ended ? ' \u2014 cover ended.' : '');
+    $('coverStatus').textContent = bits.join(' \u00b7 ') + (data.batch_ended ? ' \u2014 fully undone; removed from Saved changes.' : '');
     loadCovers();
   } catch (e) {
     $('coverStatus').textContent = 'Remove failed: ' + (e.message || e);
