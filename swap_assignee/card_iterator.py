@@ -14,7 +14,7 @@ def _norm_phase(s: Optional[str]) -> str:
 
 PIPE_CARDS_QUERY = """
 query PipeCards($pipeId: ID!, $cursor: String) {
-  cards(pipe_id: $pipeId, first: 20, after: $cursor) {
+  cards(pipe_id: $pipeId, first: 50, after: $cursor) {
     pageInfo { hasNextPage endCursor }
     edges {
       node {
@@ -75,6 +75,32 @@ query PipeCardsByAssignee($pipeId: ID!, $cursor: String, $assigneeId: ID!) {
     after: $cursor
     search: { assignee_ids: [$assigneeId] }
   ) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        title
+        url
+        current_phase { id name }
+        assignees { id name email }
+        fields {
+          name
+          value
+          array_value
+          field { id label type }
+        }
+      }
+    }
+  }
+}
+"""
+
+# Server-side title filter: the API only returns cards whose title matches
+# the text — no full download. Powers the assign mode's fast path; matching
+# on the Client field still needs a full scan.
+PIPE_CARDS_BY_TITLE_QUERY = """
+query PipeCardsByTitle($pipeId: ID!, $cursor: String, $title: String!) {
+  cards(pipe_id: $pipeId, first: 50, after: $cursor, search: { title: $title }) {
     pageInfo { hasNextPage endCursor }
     edges {
       node {
@@ -158,7 +184,7 @@ query FindCardsByField($pipeId: ID!, $cursor: String, $fieldId: String!, $fieldV
 PHASE_CARDS_PAGE_QUERY = """
 query PhaseCards($phaseId: ID!, $cursor: String) {
   phase(id: $phaseId) {
-    cards(first: 20, after: $cursor) {
+    cards(first: 50, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       edges {
         node {
@@ -444,6 +470,49 @@ def iter_cards(
             cursor = page2.get("endCursor") if page2.get("hasNextPage") else None
     if skipped_phase_names:
         log.info("Skipped %d excluded phase(s) entirely: %s", len(skipped_phase_names), ", ".join(skipped_phase_names))
+
+
+def iter_cards_by_title(
+    client,
+    pipe_id: str,
+    title: str,
+    *,
+    exclude_phases: Optional[Iterable[str]] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Server-side title search: yields only cards whose title matches `title`.
+
+    Raises on API/schema errors — callers should fall back to a full
+    `iter_cards` scan with client-side matching.
+    """
+    excluded: Set[str] = {_norm_phase(p) for p in (exclude_phases or []) if p}
+    yielded_ids: Set[str] = set()
+    cursor = None
+    while True:
+        data = client.execute(
+            PIPE_CARDS_BY_TITLE_QUERY,
+            {"pipeId": str(pipe_id), "cursor": cursor, "title": str(title)},
+        )
+        conn = data.get("cards") or {}
+        for edge in conn.get("edges") or []:
+            node = (edge or {}).get("node")
+            if not node:
+                continue
+            cid = str(node.get("id") or "")
+            if cid and cid in yielded_ids:
+                continue
+            if excluded:
+                ph_name = _norm_phase((node.get("current_phase") or {}).get("name"))
+                if ph_name in excluded:
+                    continue
+            if cid:
+                yielded_ids.add(cid)
+            yield node
+        page = conn.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return
+        cursor = page.get("endCursor")
+        if not cursor:
+            return
 
 
 def iter_cards_assigned_to(

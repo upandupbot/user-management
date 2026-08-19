@@ -132,6 +132,13 @@ def _assign_client(monkeypatch, cards):
         },
     )
     monkeypatch.setattr(web, "iter_cards", lambda *args, **kwargs: iter(cards))
+    # Simulate Pipefy's server-side title search over the same card list.
+    monkeypatch.setattr(
+        web, "iter_cards_by_title",
+        lambda client, pipe_id, title, **kwargs: iter(
+            [c for c in cards if title.lower() in (c.get("title") or "").lower()]
+        ),
+    )
     return web.create_app().test_client()
 
 
@@ -173,6 +180,55 @@ def test_assign_scan_stream_requires_inputs(monkeypatch):
     client = _assign_client(monkeypatch, [])
     resp = client.post("/api/assign/scan/stream", json={"user": "x@dydx.digital"})
     assert resp.status_code == 400
+
+
+def _scan_body(**extra):
+    return {
+        "user": "robyn@dydx.digital", "match_text": "acme", "pipe_ids": ["1"],
+        "roles_by_pipe": {"1": ["creative specialist"]},
+        "exclude_phases_by_pipe": {"1": []}, **extra,
+    }
+
+
+def _plans_from(resp):
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines()]
+    return [e["plan"] for e in events if e["type"] == "plan"]
+
+
+def test_assign_client_field_match_requires_flag(monkeypatch):
+    # Title doesn't mention the client; only the Client field does.
+    card = _card(title="Q3 banners", fields=[
+        {"name": "client", "value": "Acme Corp", "array_value": None,
+         "field": {"id": "client", "label": "Client", "type": "short_text"}},
+        _role_field([]),
+    ])
+    client = _assign_client(monkeypatch, [card])
+    # Default fast path (title only): no plan.
+    assert _plans_from(client.post("/api/assign/scan/stream", json=_scan_body())) == []
+    # Opt-in full scan matches the Client field.
+    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body(match_client_field=True)))
+    assert len(plans) == 1
+    assert plans[0]["card_id"] == "C1"
+
+
+def test_assign_no_duplicate_plans_when_both_paths_run(monkeypatch):
+    # Title match found by the fast path must not re-plan in the full scan.
+    card = _card(title="Acme — Q3 banners", fields=[_role_field([("300999", "Existing")])])
+    client = _assign_client(monkeypatch, [card])
+    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body(match_client_field=True)))
+    assert len(plans) == 1
+
+
+def test_assign_title_search_failure_falls_back_to_full_scan(monkeypatch):
+    card = _card(title="Acme — Q3 banners", fields=[_role_field([])])
+    client = _assign_client(monkeypatch, [card])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("title search unsupported")
+
+    monkeypatch.setattr(web, "iter_cards_by_title", _boom)
+    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body()))
+    assert len(plans) == 1
 
 
 def test_apply_cancel_leaves_plans_planned(monkeypatch):

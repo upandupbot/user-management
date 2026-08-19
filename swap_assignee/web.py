@@ -41,6 +41,7 @@ from .card_iterator import (
     fetch_active_phases,
     fetch_card,
     iter_cards,
+    iter_cards_by_title,
     iter_cards_fast_union,
     probe_card_level_assignee,
     probe_field_value,
@@ -1106,7 +1107,11 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="col hidden" id="clientTextCol">
         <label for="clientText">Client name</label>
-        <input id="clientText" type="text" placeholder="e.g. Acme — matched against card titles and Client fields" autocomplete="off">
+        <input id="clientText" type="text" placeholder="e.g. Acme — matched against card titles" autocomplete="off">
+        <label class="check" style="margin-top: 8px;">
+          <input id="matchClientCb" type="checkbox">
+          <span>Also match the Client field (slower — scans every card)</span>
+        </label>
       </div>
       <div class="col">
         <label for="newUser" id="newUserLabel">Add user</label>
@@ -1460,6 +1465,7 @@ function setWizardOperation(operation) {
   $('oldUser').value = '';
   $('newUser').value = '';
   $('clientText').value = '';
+  $('matchClientCb').checked = false;
   clearAlerts('usersAlerts');
   $('usersStatus').textContent = '';
   $('pipePickList').innerHTML = '';
@@ -1524,6 +1530,7 @@ $('usersBtn').addEventListener('click', async () => {
       data = {
         operation: 'assign', old_user: null, new_user: resp.user,
         pipes: resp.pipes, match_text: clientText,
+        match_client: $('matchClientCb').checked,
       };
     } else {
       data = await api('/api/wizard/users', {
@@ -1556,7 +1563,7 @@ function renderResolvedUsers(data) {
     $('resolvedUsers').innerHTML = `
       <div class="user">
         <b>Cards mentioning \u201c${escapeHtml(data.match_text || '')}\u201d</b>
-        <span class="email">title or Client field</span>
+        <span class="email">${data.match_client ? 'title or Client field' : 'card titles'}</span>
       </div>
       <span class="arrow">+</span>
       <div class="user">
@@ -1818,6 +1825,7 @@ async function runWizardScan() {
     const payload = isAssign ? {
       user: $('newUser').value.trim(),
       match_text: (wizUsers && wizUsers.match_text) || $('clientText').value.trim(),
+      match_client_field: $('matchClientCb').checked,
       org_id: $('orgId').value.trim() || null,
       pipe_ids: pipeIds,
       exclude_phases_by_pipe: getExcludedPhasesByPipe(),
@@ -3736,6 +3744,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         body = request.get_json(force=True, silent=True) or {}
         user_input = (body.get("user") or "").strip()
         match_text = (body.get("match_text") or "").strip()
+        match_client_field = bool(body.get("match_client_field", False))
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
         exclude_phases = list(body.get("exclude_phases") or [])
@@ -3799,43 +3808,72 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     except Exception as exc:  # noqa: BLE001
                         log.warning("assign: phase meta probe failed for %s: %s", pid, exc)
                     plans: List[Any] = []
+                    seen_ids: set = set()
                     cards_scanned = 0
-                    cards_matched = 0
                     cards_in_excluded = 0
                     cards_already = 0
-                    try:
-                        for card in iter_cards(client, pid, exclude_phases=excl):
-                            cards_scanned += 1
-                            if card_matches_text(card, match_text):
-                                plan = plan_assign_card(
-                                    card,
-                                    new_id=user.id,
-                                    field_ids=set(fields.keys()),
-                                    excluded_phases=excl,
-                                    id_names={user.id: user.name},
-                                    field_meta=fields,
-                                )
-                                if plan.skipped_reason:
-                                    cards_in_excluded += 1
-                                elif not plan.actions:
-                                    cards_already += 1
-                                else:
-                                    cards_matched += 1
-                                    plans.append(plan)
-                                    yield json.dumps({"type": "plan", "pipe_id": pid, "plan": _plan_to_dict(plan)}) + "\n"
-                            if cards_scanned <= 50 or cards_scanned % 25 == 0:
-                                yield json.dumps({
-                                    "type": "progress", "pipe_id": pid,
-                                    "cards_scanned": cards_scanned, "plans": len(plans),
-                                    "in_excluded": cards_in_excluded, "already_swapped": cards_already,
-                                }) + "\n"
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("assign scan failed for pipe %s", pid)
-                        yield json.dumps({
-                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
-                            "message": f"Scan failed: {exc}",
+
+                    def _plan_events(card):
+                        """Plan one matched card; returns NDJSON lines to emit."""
+                        nonlocal cards_in_excluded, cards_already
+                        plan = plan_assign_card(
+                            card,
+                            new_id=user.id,
+                            field_ids=set(fields.keys()),
+                            excluded_phases=excl,
+                            id_names={user.id: user.name},
+                            field_meta=fields,
+                        )
+                        if plan.skipped_reason:
+                            cards_in_excluded += 1
+                            return []
+                        if not plan.actions:
+                            cards_already += 1
+                            return []
+                        plans.append(plan)
+                        return [json.dumps({"type": "plan", "pipe_id": pid, "plan": _plan_to_dict(plan)}) + "\n"]
+
+                    def _progress():
+                        return json.dumps({
+                            "type": "progress", "pipe_id": pid,
+                            "cards_scanned": cards_scanned, "plans": len(plans),
+                            "in_excluded": cards_in_excluded, "already_swapped": cards_already,
                         }) + "\n"
-                        continue
+
+                    # Fast path: server-side title search only downloads hits.
+                    title_search_ok = True
+                    try:
+                        for card in iter_cards_by_title(client, pid, match_text, exclude_phases=excl):
+                            cards_scanned += 1
+                            cid = str(card.get("id") or "")
+                            if cid:
+                                seen_ids.add(cid)
+                            for line in _plan_events(card):
+                                yield line
+                            yield _progress()
+                    except Exception as exc:  # noqa: BLE001
+                        title_search_ok = False
+                        log.warning("assign: server-side title search failed for %s (%s); using full scan", pid, exc)
+
+                    # Slow path: full scan. Only for opt-in Client-field matching,
+                    # or as the fallback when the title search errored.
+                    if match_client_field or not title_search_ok:
+                        try:
+                            for card in iter_cards(client, pid, exclude_phases=excl):
+                                cards_scanned += 1
+                                cid = str(card.get("id") or "")
+                                if (not cid or cid not in seen_ids) and card_matches_text(card, match_text):
+                                    for line in _plan_events(card):
+                                        yield line
+                                if cards_scanned <= 50 or cards_scanned % 25 == 0:
+                                    yield _progress()
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception("assign scan failed for pipe %s", pid)
+                            yield json.dumps({
+                                "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
+                                "message": f"Scan failed: {exc}",
+                            }) + "\n"
+                            continue
                     summary = {
                         "cards_scanned": cards_scanned,
                         "cards_in_excluded": cards_in_excluded,
