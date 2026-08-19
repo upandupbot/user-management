@@ -49,7 +49,14 @@ from .cli import _resolve_users  # reuse exactly the CLI's resolution flow
 from .config import load_config, mask_secret
 from .papertrail_logger import attach_papertrail
 from .pipefy_client import PipefyClient
-from .swap_engine import DEFAULT_EXCLUDED_PHASES, execute_plan, plan_card, plan_remove_card
+from .swap_engine import (
+    DEFAULT_EXCLUDED_PHASES,
+    card_matches_text,
+    execute_plan,
+    plan_assign_card,
+    plan_card,
+    plan_remove_card,
+)
 from .user_resolver import (
     UserResolutionError,
     fetch_org_users,
@@ -1080,6 +1087,7 @@ INDEX_HTML = r"""<!doctype html>
         <select id="operationSelect" aria-describedby="operationDescription">
           <option value="replace">Replace assignee</option>
           <option value="add">Add co-assignee</option>
+          <option value="assign">Add to a client's cards</option>
         </select>
       </div>
       <div id="operationDescription" class="operation-description">
@@ -1087,9 +1095,13 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="row">
-      <div class="col">
+      <div class="col" id="oldUserCol">
         <label for="oldUser" id="oldUserLabel">Remove user</label>
         <input id="oldUser" type="text" placeholder="leaving@dydx.digital" autocomplete="off">
+      </div>
+      <div class="col hidden" id="clientTextCol">
+        <label for="clientText">Client name</label>
+        <input id="clientText" type="text" placeholder="e.g. Acme — matched against card titles and Client fields" autocomplete="off">
       </div>
       <div class="col">
         <label for="newUser" id="newUserLabel">Add user</label>
@@ -1401,24 +1413,34 @@ let wizUsers = null;   // response of /api/wizard/users (resolved users + member
 let wizOperation = 'replace';
 
 function setWizardOperation(operation) {
-  wizOperation = operation === 'add' ? 'add' : 'replace';
+  wizOperation = operation === 'add' ? 'add' : (operation === 'assign' ? 'assign' : 'replace');
   $('operationSelect').value = wizOperation;
   const adding = wizOperation === 'add';
-  $('operationDescription').textContent = adding
-    ? 'Add someone to matching roles without removing any existing assignees.'
-    : 'Move selected role assignments from one person to another.';
-  $('step1Title').textContent = adding ? 'Add someone alongside an assignee' : "Who's being replaced?";
+  const assigning = wizOperation === 'assign';
+  $('oldUserCol').classList.toggle('hidden', assigning);
+  $('clientTextCol').classList.toggle('hidden', !assigning);
+  $('operationDescription').textContent = assigning
+    ? 'Find every card whose title or Client field mentions a client, and add someone to a role on those cards.'
+    : (adding
+      ? 'Add someone to matching roles without removing any existing assignees.'
+      : 'Move selected role assignments from one person to another.');
+  $('step1Title').textContent = assigning ? "Whose client, and who's joining?"
+    : (adding ? 'Add someone alongside an assignee' : "Who's being replaced?");
   $('oldUserLabel').textContent = adding ? 'Existing assignee' : 'Remove user';
-  $('newUserLabel').textContent = adding ? 'Assignee to add' : 'Add user';
+  $('newUserLabel').textContent = assigning ? 'Person to add' : (adding ? 'Assignee to add' : 'Add user');
   $('oldUser').placeholder = adding ? 'existing.assignee@dydx.digital' : 'leaving@dydx.digital';
-  $('newUser').placeholder = adding ? 'new.assignee@dydx.digital' : 'replacement@dydx.digital';
-  $('resolvedOperationLabel').textContent = adding ? 'Add alongside' : 'Swap';
-  $('roleListLabel').childNodes[0].nodeValue = adding ? 'Roles to add ' : 'Roles to swap ';
-  $('roleHelp').textContent = adding
-    ? 'Tick the role(s) where the new person should be added. Existing assignees remain in place.'
-    : "Tick the role(s) this person holds — e.g. Account Manager. Ticking everything searches every assignee field, which is slower.";
+  $('newUser').placeholder = assigning ? 'person.to.add@dydx.digital'
+    : (adding ? 'new.assignee@dydx.digital' : 'replacement@dydx.digital');
+  $('resolvedOperationLabel').textContent = assigning ? 'Add to client cards' : (adding ? 'Add alongside' : 'Swap');
+  $('roleListLabel').childNodes[0].nodeValue = (adding || assigning) ? 'Roles to add ' : 'Roles to swap ';
+  $('roleHelp').textContent = assigning
+    ? 'Tick the role(s) the person should be added to on every matching card.'
+    : (adding
+      ? 'Tick the role(s) where the new person should be added. Existing assignees remain in place.'
+      : "Tick the role(s) this person holds — e.g. Account Manager. Ticking everything searches every assignee field, which is slower.");
   $('oldUser').value = '';
   $('newUser').value = '';
+  $('clientText').value = '';
   clearAlerts('usersAlerts');
   $('usersStatus').textContent = '';
   $('pipePickList').innerHTML = '';
@@ -1434,7 +1456,7 @@ function setWizardOperation(operation) {
   $('coverFields').classList.add('hidden');
   $('coverName').value = '';
   $('coverEnd').value = '';
-  $('oldUser').focus();
+  (assigning ? $('clientText') : $('oldUser')).focus();
 }
 
 $('operationSelect').addEventListener('change', (event) => {
@@ -1459,20 +1481,37 @@ $('usersBtn').addEventListener('click', async () => {
   ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   const oldUser = $('oldUser').value.trim();
   const newUser = $('newUser').value.trim();
-  if (!oldUser || !newUser) {
+  const clientText = $('clientText').value.trim();
+  if (wizOperation === 'assign') {
+    if (!clientText || !newUser) {
+      $('usersAlerts').appendChild(alertEl('error', 'Enter both the client name to match and the person to add.'));
+      return;
+    }
+  } else if (!oldUser || !newUser) {
     $('usersAlerts').appendChild(alertEl('error', wizOperation === 'add'
       ? 'Enter both the person whose jobs should be found and the person to add.'
       : 'Both the remove user and the add user are required.'));
     return;
   }
-  const baseMsg = 'Resolving users\u2026';
+  const baseMsg = wizOperation === 'assign' ? 'Resolving user\u2026' : 'Resolving users\u2026';
   setBusy('usersSpin', 'usersStatus', true, baseMsg);
   const cancelHint = slowHint('usersStatus', baseMsg);
   try {
-    const data = await api('/api/wizard/users', {
-      old_user: oldUser, new_user: newUser, operation: wizOperation,
-      org_id: $('orgId').value.trim() || null,
-    });
+    let data;
+    if (wizOperation === 'assign') {
+      const resp = await api('/api/assign/users', {
+        user: newUser, org_id: $('orgId').value.trim() || null,
+      });
+      data = {
+        operation: 'assign', old_user: null, new_user: resp.user,
+        pipes: resp.pipes, match_text: clientText,
+      };
+    } else {
+      data = await api('/api/wizard/users', {
+        old_user: oldUser, new_user: newUser, operation: wizOperation,
+        org_id: $('orgId').value.trim() || null,
+      });
+    }
     wizUsers = data;
     wizCoverBatchId = null;      // new user pair = new cover batch
     $('coverName').value = '';   // re-prefill from the new names on confirm
@@ -1492,6 +1531,20 @@ $('usersBtn').addEventListener('click', async () => {
 function renderResolvedUsers(data) {
   const oldU = data.old_user, newU = data.new_user;
   const operation = data.operation || wizOperation;
+  if (operation === 'assign') {
+    $('resolvedUsers').innerHTML = `
+      <div class="user">
+        <b>Cards mentioning \u201c${escapeHtml(data.match_text || '')}\u201d</b>
+        <span class="email">title or Client field</span>
+      </div>
+      <span class="arrow">+</span>
+      <div class="user">
+        <b>${escapeHtml(newU.name || '(no name)')}</b>
+        <span class="email">${escapeHtml(newU.email)}</span>
+      </div>
+    `;
+    return;
+  }
   $('resolvedUsers').innerHTML = `
     <div class="user">
       <b>${escapeHtml(oldU.name || '(no name)')}</b>
@@ -1699,14 +1752,17 @@ async function runWizardScan() {
   const sum = $('scanSummary');
   sum.className = 'alert';
   sum.classList.remove('hidden');
-  sum.textContent = wizOperation === 'add'
-    ? 'Scanning for jobs where a co-assignee can be added…'
-    : 'Scanning — jobs stream in below as they are found…';
+  sum.textContent = wizOperation === 'assign'
+    ? 'Scanning for cards that mention the client…'
+    : (wizOperation === 'add'
+      ? 'Scanning for jobs where a co-assignee can be added…'
+      : 'Scanning — jobs stream in below as they are found…');
   $('resultsPanel').classList.remove('hidden');
-  $('resultsTitle').textContent = wizOperation === 'add' ? 'Jobs ready for co-assignment' : 'Their jobs, by pipe';
-  $('resultsHint').textContent = wizOperation === 'add'
-    ? 'Existing assignees remain in place until you review and apply.'
-    : 'Nothing changes in Pipefy until you click Apply on a pipe.';
+  $('resultsTitle').textContent = wizOperation === 'assign' ? 'Matching cards, by pipe'
+    : (wizOperation === 'add' ? 'Jobs ready for co-assignment' : 'Their jobs, by pipe');
+  $('resultsHint').textContent = wizOperation === 'replace'
+    ? 'Nothing changes in Pipefy until you click Apply on a pipe.'
+    : 'Existing assignees remain in place until you review and apply.';
   $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   setBusy('scanSpin', 'scanStatus', true, 'Contacting server…');
   $('scanBtn').disabled = true;
@@ -1726,20 +1782,31 @@ async function runWizardScan() {
   }, 1000);
 
   try {
-    const resp = await fetch('/api/wizard/scan/stream', {
+    const isAssign = wizOperation === 'assign';
+    const endpoint = isAssign ? '/api/assign/scan/stream' : '/api/wizard/scan/stream';
+    const payload = isAssign ? {
+      user: $('newUser').value.trim(),
+      match_text: (wizUsers && wizUsers.match_text) || $('clientText').value.trim(),
+      org_id: $('orgId').value.trim() || null,
+      pipe_ids: pipeIds,
+      exclude_phases_by_pipe: getExcludedPhasesByPipe(),
+      roles_by_pipe: getSelectedRolesByPipe(),
+      throttle_ms: parseInt($('throttleMs').value, 10) || 0,
+    } : {
+      old_user: $('oldUser').value.trim(),
+      new_user: $('newUser').value.trim(),
+      operation: wizOperation,
+      org_id: $('orgId').value.trim() || null,
+      pipe_ids: pipeIds,
+      exclude_phases_by_pipe: getExcludedPhasesByPipe(),
+      roles_by_pipe: getSelectedRolesByPipe(),
+      throttle_ms: parseInt($('throttleMs').value, 10) || 0,
+    };
+    const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: aborter.signal,
-      body: JSON.stringify({
-        old_user: $('oldUser').value.trim(),
-        new_user: $('newUser').value.trim(),
-        operation: wizOperation,
-        org_id: $('orgId').value.trim() || null,
-        pipe_ids: pipeIds,
-        exclude_phases_by_pipe: getExcludedPhasesByPipe(),
-        roles_by_pipe: getSelectedRolesByPipe(),
-        throttle_ms: parseInt($('throttleMs').value, 10) || 0,
-      }),
+      body: JSON.stringify(payload),
     });
     if (resp.status === 401) { showGate(); return; }
     if (!resp.ok || !resp.body) {
@@ -1788,15 +1855,20 @@ async function runWizardScan() {
 let _appliedTotal = 0;
 
 function renderScanCard(host, totalPlans, withJobs) {
-  const who = wizUsers ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
+  const who = (wizUsers && wizUsers.old_user) ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
   const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the new assignee';
+  const matchText = (wizUsers && wizUsers.match_text) || '';
   const sub = (withJobs.length === 1 ? 'All within one pipe. ' : `Across ${withJobs.length} pipes. `)
-    + (wizOperation === 'add'
-      ? `Review each match before adding ${target}; client and product filters are optional.`
-      : 'Review each match and apply where the fit is right.');
-  const headline = wizOperation === 'add'
-    ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} job${totalPlans === 1 ? '' : 's'} held by ${escapeHtml(who)}`
-    : `<span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}`;
+    + (wizOperation === 'assign'
+      ? `Review each match before adding ${target} to the selected role(s).`
+      : (wizOperation === 'add'
+        ? `Review each match before adding ${target}; client and product filters are optional.`
+        : 'Review each match and apply where the fit is right.'));
+  const headline = wizOperation === 'assign'
+    ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} card${totalPlans === 1 ? '' : 's'} mentioning \u201c${escapeHtml(matchText)}\u201d`
+    : (wizOperation === 'add'
+      ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} job${totalPlans === 1 ? '' : 's'} held by ${escapeHtml(who)}`
+      : `<span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}`);
   host.className = 'scan-card';
   host.innerHTML = `
     <div class="sc-body">
@@ -1868,9 +1940,11 @@ function handleScanEvent(evt) {
         renderScanCard(s, evt.total_plans, withJobs);
       } else {
         s.className = 'alert ok';
-        s.textContent = wizOperation === 'add'
-          ? 'No matching jobs need this co-assignee (outside the excluded phases).'
-          : 'No jobs found in the selected pipes (outside the excluded phases).';
+        s.textContent = wizOperation === 'assign'
+          ? 'No matching cards need this person added (outside the excluded phases).'
+          : (wizOperation === 'add'
+            ? 'No matching jobs need this co-assignee (outside the excluded phases).'
+            : 'No jobs found in the selected pipes (outside the excluded phases).');
       }
       break;
     }
@@ -1928,7 +2002,7 @@ function createPipeGroup(evt) {
     </div>
     <div class="pg-empty hidden"></div>
     <div class="pg-actions hidden">
-      <button class="danger pg-apply" disabled>${wizOperation === 'add' ? 'Add co-assignee…' : 'Apply changes…'}</button>
+      <button class="danger pg-apply" disabled>${wizOperation === 'replace' ? 'Apply changes…' : 'Add co-assignee…'}</button>
       <span class="spinner pg-spin"></span>
       <span class="small pg-apply-status"></span>
     </div>
@@ -2079,13 +2153,15 @@ function finalizePipeGroup(g, evt) {
     g.count.textContent = evt.no_matching_roles ? 'no roles ticked' : 'no assignee fields';
     g.empty.textContent = evt.no_matching_roles
       ? 'No roles ticked for this pipe — nothing searched.'
-      : `This pipe has no assignee fields — nothing to ${wizOperation === 'add' ? 'add' : 'swap'}.`;
+      : `This pipe has no assignee fields — nothing to ${wizOperation === 'replace' ? 'swap' : 'add'}.`;
     g.empty.classList.remove('hidden');
     return;
   }
   if (!g.plans) {
-    g.count.textContent = 'no jobs';
-    g.empty.textContent = 'No jobs found for this user (outside the excluded phases).';
+    g.count.textContent = wizOperation === 'assign' ? 'no matches' : 'no jobs';
+    g.empty.textContent = wizOperation === 'assign'
+      ? 'No cards mentioning the client need this person added (outside the excluded phases).'
+      : 'No jobs found for this user (outside the excluded phases).';
     g.empty.classList.remove('hidden');
     return;
   }
@@ -2136,7 +2212,13 @@ function askApplyGroup(g) {
   if (!g.token) { alert('Run the scan first.'); return; }
   if (!ids.length) { alert('Tick at least one card to change.'); return; }
   _pendingApplyGroup = g;
-  if (wizOperation === 'add') {
+  if (wizOperation === 'assign') {
+    const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the person';
+    const matchText = (wizUsers && wizUsers.match_text) || 'the client';
+    $('confirmText').textContent =
+      `This will add ${target} to the selected role fields on ${ids.length} card${ids.length === 1 ? '' : 's'} mentioning \u201c${matchText}\u201d in \u201c${g.name}\u201d. ` +
+      'All existing assignees will remain. Are you sure?';
+  } else if (wizOperation === 'add') {
     const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the new assignee';
     $('confirmText').textContent =
       `This will add ${target} to the selected role fields on ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
@@ -2149,11 +2231,13 @@ function askApplyGroup(g) {
   // Opt-in cover memory (add operation only, and only when the server has a
   // Sheet to store it in). Values persist across per-pipe applies so one
   // wizard run makes one named cover.
-  const showCover = wizOperation === 'add' && coversEnabled;
+  const showCover = (wizOperation === 'add' || wizOperation === 'assign') && coversEnabled;
   $('coverForm').classList.toggle('hidden', !showCover);
   if (showCover && !$('coverName').value.trim() && wizUsers) {
     const nu = wizUsers.new_user, ou = wizUsers.old_user;
-    $('coverName').value = `${nu.name || nu.email} added alongside ${ou.name || ou.email}`;
+    $('coverName').value = wizOperation === 'assign'
+      ? `${nu.name || nu.email} added to \u201c${wizUsers.match_text || ''}\u201d cards`
+      : `${nu.name || nu.email} added alongside ${ou.name || ou.email}`;
   }
   $('confirmModal').classList.remove('hidden');
 }
@@ -2170,10 +2254,10 @@ $('confirmGo').addEventListener('click', async () => {
   if (!g || !g.token) return;
   g.applyBtn.disabled = true;
   g.spin.classList.add('on');
-  g.applyStatus.textContent = wizOperation === 'add' ? 'Adding co-assignee…' : 'Applying…';
+  g.applyStatus.textContent = wizOperation === 'replace' ? 'Applying…' : 'Adding co-assignee…';
   startLogPolling();
   try {
-    const cover = (wizOperation === 'add' && coversEnabled && $('coverSaveCb').checked) ? {
+    const cover = ((wizOperation === 'add' || wizOperation === 'assign') && coversEnabled && $('coverSaveCb').checked) ? {
       save: true,
       batch_id: (wizCoverBatchId = wizCoverBatchId || newBatchId()),
       name: $('coverName').value.trim(),
@@ -3530,6 +3614,186 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 }) + "\n"
             except Exception as exc:  # noqa: BLE001
                 log.exception("wizard scan stream failed")
+                yield json.dumps({"type": "error", "message": f"Scan failed: {exc}"}) + "\n"
+
+        resp = Response(_gen(), mimetype="application/x-ndjson")
+        resp.headers["Cache-Control"] = "no-cache, no-transform"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
+    # ---------- client-match assign mode ----------
+
+    @app.post("/api/assign/users")
+    def api_assign_users():
+        """Assign mode step 1: resolve the single person to add, org-wide."""
+        body = request.get_json(force=True, silent=True) or {}
+        user_input = (body.get("user") or "").strip()
+        org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
+        if not user_input:
+            return jsonify({"error": "user is required."}), 400
+        try:
+            user = _discover_resolve_user(client, KNOWN_PIPES, user_input, org_id_override)
+        except UserResolutionError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - network / API failure
+            log.exception("assign users failed")
+            return jsonify({"error": f"Pipefy API error: {exc}"}), 500
+        return jsonify({
+            "user": {"id": user.id, "name": user.name, "email": user.email},
+            "pipes": [{"id": p["id"], "name": p["name"]} for p in KNOWN_PIPES],
+        })
+
+    @app.post("/api/assign/scan/stream")
+    def api_assign_scan_stream():
+        """Assign mode scan (NDJSON stream): full-scan the selected pipes and
+        match cards whose title OR client field contains `match_text`
+        (case-insensitive). Matched cards get a plan adding the user to the
+        selected role fields. Events mirror the wizard scan, so the existing
+        /api/apply endpoint works per pipe unchanged (operation="add", covers
+        supported).
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        user_input = (body.get("user") or "").strip()
+        match_text = (body.get("match_text") or "").strip()
+        org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
+        pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        exclude_phases = list(body.get("exclude_phases") or [])
+        raw_excl = body.get("exclude_phases_by_pipe") or {}
+        exclude_by_pipe = {
+            str(pid): [str(n) for n in (names_ or []) if n]
+            for pid, names_ in raw_excl.items()
+        } if isinstance(raw_excl, dict) else {}
+        raw_by_pipe = body.get("roles_by_pipe") or {}
+        roles_by_pipe = {
+            str(pid): {_norm_role_label(r) for r in (keys or []) if r}
+            for pid, keys in raw_by_pipe.items()
+        } if isinstance(raw_by_pipe, dict) else {}
+        throttle_ms = body.get("throttle_ms", 250)
+        if not user_input or not match_text or not pipe_ids:
+            return jsonify({"error": "user, match_text, and pipe_ids are required."}), 400
+        names = {p["id"]: p["name"] for p in KNOWN_PIPES}
+
+        def _gen():
+            try:
+                try:
+                    user = _discover_resolve_user(client, KNOWN_PIPES, user_input, org_id_override)
+                except UserResolutionError as exc:
+                    yield json.dumps({"type": "error", "message": str(exc), "kind": "resolution"}) + "\n"
+                    return
+                total_plans = 0
+                pipes_scanned = 0
+                for pid in pipe_ids:
+                    pname = names.get(pid, pid)
+                    try:
+                        fields = discover_assignee_fields(client, pid)
+                    except Exception as exc:  # noqa: BLE001
+                        yield json.dumps({
+                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
+                            "message": f"Could not discover fields: {exc}",
+                        }) + "\n"
+                        continue
+                    keys = roles_by_pipe.get(pid) or set()
+                    fields = {
+                        fid: m for fid, m in fields.items()
+                        if _norm_role_label(m.get("label") or fid) in keys
+                    }
+                    yield json.dumps({
+                        "type": "pipe_start", "pipe_id": pid, "pipe_name": pname,
+                        "fields": len(fields),
+                    }) + "\n"
+                    if not fields:
+                        yield json.dumps({
+                            "type": "pipe_done", "pipe_id": pid, "token": None,
+                            "plans": 0, "no_fields": True, "no_matching_roles": True,
+                        }) + "\n"
+                        pipes_scanned += 1
+                        continue
+                    excl = exclude_by_pipe.get(pid) or exclude_phases or list(DEFAULT_EXCLUDED_PHASES)
+                    try:
+                        phases_info = fetch_active_phases(client, pid, exclude_phases=excl)
+                        for ph in phases_info["skipped"]:
+                            yield json.dumps({"type": "phase_skip", "pipe_id": pid, "phase": ph["name"], "cards_count": ph["cards_count"], "done": ph["done"]}) + "\n"
+                        for ph in phases_info["active"]:
+                            yield json.dumps({"type": "phase_scan_start", "pipe_id": pid, "phase": ph["name"], "cards_count": ph["cards_count"]}) + "\n"
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("assign: phase meta probe failed for %s: %s", pid, exc)
+                    plans: List[Any] = []
+                    cards_scanned = 0
+                    cards_matched = 0
+                    cards_in_excluded = 0
+                    cards_already = 0
+                    try:
+                        for card in iter_cards(client, pid, exclude_phases=excl):
+                            cards_scanned += 1
+                            if card_matches_text(card, match_text):
+                                plan = plan_assign_card(
+                                    card,
+                                    new_id=user.id,
+                                    field_ids=set(fields.keys()),
+                                    excluded_phases=excl,
+                                    id_names={user.id: user.name},
+                                    field_meta=fields,
+                                )
+                                if plan.skipped_reason:
+                                    cards_in_excluded += 1
+                                elif not plan.actions:
+                                    cards_already += 1
+                                else:
+                                    cards_matched += 1
+                                    plans.append(plan)
+                                    yield json.dumps({"type": "plan", "pipe_id": pid, "plan": _plan_to_dict(plan)}) + "\n"
+                            if cards_scanned <= 50 or cards_scanned % 25 == 0:
+                                yield json.dumps({
+                                    "type": "progress", "pipe_id": pid,
+                                    "cards_scanned": cards_scanned, "plans": len(plans),
+                                    "in_excluded": cards_in_excluded, "already_swapped": cards_already,
+                                }) + "\n"
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("assign scan failed for pipe %s", pid)
+                        yield json.dumps({
+                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
+                            "message": f"Scan failed: {exc}",
+                        }) + "\n"
+                        continue
+                    summary = {
+                        "cards_scanned": cards_scanned,
+                        "cards_in_excluded": cards_in_excluded,
+                        "cards_already_swapped": cards_already,
+                        "card_level_changes": 0,
+                        "field_level_changes": sum(len(p.actions) for p in plans),
+                    }
+                    token = None
+                    if plans:
+                        token = secrets.token_urlsafe(16)
+                        _gc_preview_store()
+                        _PREVIEW_STORE[token] = {
+                            "created_at": time.time(),
+                            "plans": plans,
+                            "throttle_ms": int(throttle_ms or 250),
+                            "summary": summary,
+                            "pipe_id": pid,
+                            "pipe_name": pname,
+                            "old_user": f'client match \u201c{match_text}\u201d',
+                            "new_user": f"{user.name} <{user.email}>".strip(),
+                            "old_user_id": "",
+                            "new_user_id": user.id,
+                            "new_user_name": user.name or "",
+                            "new_user_email": user.email or "",
+                            "operation": "add",
+                        }
+                    yield json.dumps({"type": "summary", "pipe_id": pid, **summary}) + "\n"
+                    yield json.dumps({
+                        "type": "pipe_done", "pipe_id": pid, "token": token,
+                        "plans": len(plans), "operation": "add",
+                    }) + "\n"
+                    total_plans += len(plans)
+                    pipes_scanned += 1
+                yield json.dumps({
+                    "type": "all_done", "pipes_scanned": pipes_scanned,
+                    "total_plans": total_plans, "operation": "add",
+                }) + "\n"
+            except Exception as exc:  # noqa: BLE001
+                log.exception("assign scan stream failed")
                 yield json.dumps({"type": "error", "message": f"Scan failed: {exc}"}) + "\n"
 
         resp = Response(_gen(), mimetype="application/x-ndjson")

@@ -253,6 +253,17 @@ def compute_remove(current_ids: Sequence[str], user_id: str) -> Optional[List[st
     return [x for x in current if x != uid]
 
 
+def card_matches_text(card: Dict[str, Any], text: str) -> bool:
+    """True when `text` appears (case-insensitive) in the card title or its client field."""
+    needle = " ".join((text or "").strip().lower().split())
+    if not needle:
+        return False
+    title = (card.get("title") or "").lower()
+    if needle in title:
+        return True
+    return needle in extract_client(card).lower()
+
+
 def compute_add_only(current_ids: Sequence[str], old_id: str, new_id: str) -> Optional[List[str]]:
     """Return new id list when we want to *add* new_id without removing old_id.
 
@@ -444,6 +455,81 @@ def plan_remove_card(
             plan.actions.append(PlannedAction(
                 f"field:{fid}", fid, ids, new_ids, field_label=label, mode="remove",
                 old_names=_names(ids), new_names=_names(new_ids),
+            ))
+
+    return plan
+
+
+def plan_assign_card(
+    card: Dict[str, Any],
+    *,
+    new_id: str,
+    field_ids: Set[str],
+    excluded_phases: Sequence[str] = (),
+    id_names: Optional[Dict[str, str]] = None,
+    field_meta: Optional[Dict[str, Dict[str, str]]] = None,
+) -> CardPlan:
+    """Plan adding one user to specific assignee fields, no old user required.
+
+    Used by the client-match assign flow: the card was selected by title/client
+    text, so we simply append `new_id` to each target field where they're not
+    already present. Card-level assignees are never touched (avoids Pipefy's
+    updateCard notification storm). Idempotent — already-assigned fields yield
+    no action.
+
+    Empty fields are often omitted from the card payload entirely; when
+    `field_meta` ({field_id: {"label":...}}) is supplied, wanted fields missing
+    from the card are still planned as [] -> [new_id].
+    """
+    phase = ((card.get("current_phase") or {}).get("name")) or ""
+    plan = CardPlan(
+        card_id=str(card.get("id")),
+        card_url=card.get("url") or "",
+        title=card.get("title") or "",
+        phase_name=phase,
+        client=extract_client(card),
+        product=extract_product(card),
+    )
+    excluded_norm = {normalize_phase(p) for p in excluded_phases}
+    if normalize_phase(phase) in excluded_norm:
+        plan.skipped_reason = f"excluded phase: {phase}"
+        return plan
+
+    name_map = build_card_name_lookup(card)
+    if id_names:
+        for k, v in id_names.items():
+            if v:
+                name_map[str(k)] = str(v)
+
+    def _names(ids: Sequence[str]) -> List[str]:
+        return [name_map.get(str(i), str(i)) for i in ids]
+
+    wanted = {str(f) for f in (field_ids or set())}
+    uid = str(new_id)
+    seen: Set[str] = set()
+    for fnode in card.get("fields") or []:
+        meta = (fnode or {}).get("field") or {}
+        fid = str(meta.get("id")) if meta.get("id") is not None else None
+        if not fid or meta.get("type") not in ASSIGNEE_FIELD_TYPES or fid not in wanted:
+            continue
+        seen.add(fid)
+        ids = parse_field_user_ids(fnode)
+        if uid in ids:
+            continue
+        new_ids = ids + [uid]
+        label = (meta.get("label") or "").strip() or None
+        plan.actions.append(PlannedAction(
+            f"field:{fid}", fid, ids, new_ids, field_label=label, mode="add_only",
+            old_names=_names(ids), new_names=_names(new_ids),
+        ))
+
+    if field_meta:
+        for fid in sorted(wanted - seen):
+            meta = field_meta.get(fid) or {}
+            label = (meta.get("label") or "").strip() or None
+            plan.actions.append(PlannedAction(
+                f"field:{fid}", fid, [], [uid], field_label=label, mode="add_only",
+                old_names=[], new_names=_names([uid]),
             ))
 
     return plan

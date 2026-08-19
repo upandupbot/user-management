@@ -1,0 +1,175 @@
+"""Tests for the client-match assign mode (plan_assign_card + card_matches_text)."""
+import json
+
+import swap_assignee.web as web
+from swap_assignee.swap_engine import card_matches_text, plan_assign_card
+from swap_assignee.user_resolver import User
+
+
+NEW = "300222"
+
+
+def _card(title="Acme — Q3 banners", phase="Doing", fields=None):
+    return {
+        "id": "C1", "title": title, "url": "https://example.test/C1",
+        "current_phase": {"id": "p", "name": phase},
+        "assignees": [{"id": "300111", "name": "Kate"}],
+        "fields": fields if fields is not None else [],
+    }
+
+
+def _role_field(ids_names, fid="creative_specialist", label="Creative Specialist"):
+    return {
+        "name": fid,
+        "value": json.dumps([i for i, _ in ids_names]),
+        "array_value": [{"id": i, "name": n} for i, n in ids_names],
+        "field": {"id": fid, "label": label, "type": "assignee_select"},
+    }
+
+
+# ---------- card_matches_text ----------
+
+def test_matches_title_case_insensitive():
+    assert card_matches_text(_card(title="ACME rebrand"), "acme")
+    assert card_matches_text(_card(title="Something for Acme Corp"), "ACME")
+
+
+def test_matches_client_field():
+    card = _card(title="Q3 banners", fields=[
+        {"name": "client", "value": "Acme Corp", "array_value": None,
+         "field": {"id": "client", "label": "Client", "type": "short_text"}},
+    ])
+    assert card_matches_text(card, "acme")
+
+
+def test_no_match_and_empty_text():
+    assert not card_matches_text(_card(title="Globex refresh"), "acme")
+    assert not card_matches_text(_card(), "")
+    assert not card_matches_text(_card(), "   ")
+
+
+# ---------- plan_assign_card ----------
+
+def test_assign_appends_to_role_field_keeping_existing():
+    card = _card(fields=[_role_field([("300999", "Existing")])])
+    plan = plan_assign_card(card, new_id=NEW, field_ids={"creative_specialist"})
+    assert len(plan.actions) == 1
+    a = plan.actions[0]
+    assert a.scope == "field:creative_specialist"
+    assert a.mode == "add_only"
+    assert a.old_ids == ["300999"]
+    assert a.new_ids == ["300999", NEW]
+
+
+def test_assign_idempotent_when_already_present():
+    card = _card(fields=[_role_field([(NEW, "Robyn")])])
+    plan = plan_assign_card(card, new_id=NEW, field_ids={"creative_specialist"})
+    assert plan.actions == []
+
+
+def test_assign_never_touches_card_level():
+    card = _card(fields=[_role_field([])])
+    plan = plan_assign_card(card, new_id=NEW, field_ids={"creative_specialist"})
+    assert not any(a.scope == "card" for a in plan.actions)
+
+
+def test_assign_plans_empty_field_missing_from_card_via_meta():
+    # Pipefy omits empty fields from the card payload; field_meta fills the gap.
+    card = _card(fields=[])
+    meta = {"creative_specialist": {"id": "creative_specialist", "label": "Creative Specialist"}}
+    plan = plan_assign_card(
+        card, new_id=NEW, field_ids={"creative_specialist"}, field_meta=meta,
+        id_names={NEW: "Robyn"},
+    )
+    assert len(plan.actions) == 1
+    a = plan.actions[0]
+    assert a.old_ids == []
+    assert a.new_ids == [NEW]
+    assert a.field_label == "Creative Specialist"
+    assert a.new_names == ["Robyn"]
+
+
+def test_assign_skips_excluded_phase():
+    card = _card(phase="Completed", fields=[_role_field([])])
+    plan = plan_assign_card(
+        card, new_id=NEW, field_ids={"creative_specialist"},
+        excluded_phases=["Completed"],
+        field_meta={"creative_specialist": {"label": "Creative Specialist"}},
+    )
+    assert plan.skipped_reason
+    assert plan.actions == []
+
+
+def test_assign_ignores_unselected_fields():
+    card = _card(fields=[_role_field([("300999", "Existing")], fid="other_role", label="Other")])
+    plan = plan_assign_card(card, new_id=NEW, field_ids={"creative_specialist"})
+    assert plan.actions == []
+
+
+# ---------- web endpoint ----------
+
+def _assign_client(monkeypatch, cards):
+    user = User(id=NEW, name="Robyn", email="robyn@dydx.digital")
+    monkeypatch.setattr(web, "KNOWN_PIPES", [{"id": "1", "name": "Creative"}])
+    monkeypatch.setattr(
+        web, "_discover_resolve_user",
+        lambda client, pipes, user_input, org_id: user,
+    )
+    monkeypatch.setattr(
+        web, "discover_assignee_fields",
+        lambda client, pipe_id: {
+            "creative_specialist": {
+                "id": "creative_specialist", "label": "Creative Specialist",
+                "type": "assignee_select", "phase": "Doing",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        web, "fetch_active_phases",
+        lambda client, pipe_id, **kwargs: {
+            "active": [{"id": "p", "name": "Doing", "done": False, "cards_count": len(cards)}],
+            "skipped": [],
+        },
+    )
+    monkeypatch.setattr(web, "iter_cards", lambda *args, **kwargs: iter(cards))
+    return web.create_app().test_client()
+
+
+def test_assign_users_endpoint(monkeypatch):
+    client = _assign_client(monkeypatch, [])
+    resp = client.post("/api/assign/users", json={"user": "robyn@dydx.digital"})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["user"]["id"] == NEW
+    assert data["pipes"] == [{"id": "1", "name": "Creative"}]
+
+
+def test_assign_scan_stream_matches_title_and_client_only(monkeypatch):
+    matching = _card(title="Acme — Q3 banners", fields=[_role_field([("300999", "Existing")])])
+    non_matching = dict(_card(title="Globex refresh", fields=[]), id="C2")
+    client = _assign_client(monkeypatch, [matching, non_matching])
+    resp = client.post("/api/assign/scan/stream", json={
+        "user": "robyn@dydx.digital",
+        "match_text": "acme",
+        "pipe_ids": ["1"],
+        "roles_by_pipe": {"1": ["creative specialist"]},
+        "exclude_phases_by_pipe": {"1": []},
+    })
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines()]
+    plans = [e["plan"] for e in events if e["type"] == "plan"]
+    assert len(plans) == 1
+    assert plans[0]["card_id"] == "C1"
+    action = plans[0]["actions"][0]
+    assert action["mode"] == "add_only"
+    assert action["old_ids"] == ["300999"]
+    assert action["new_ids"] == ["300999", NEW]
+    done = next(e for e in events if e["type"] == "pipe_done")
+    assert done["operation"] == "add"
+    assert done["plans"] == 1
+    assert done["token"]
+
+
+def test_assign_scan_stream_requires_inputs(monkeypatch):
+    client = _assign_client(monkeypatch, [])
+    resp = client.post("/api/assign/scan/stream", json={"user": "x@dydx.digital"})
+    assert resp.status_code == 400
