@@ -23,6 +23,7 @@ query PipeCards($pipeId: ID!, $cursor: String) {
         url
         current_phase { id name }
         assignees { id name email }
+        labels { id name }
         fields {
           name
           value
@@ -43,6 +44,7 @@ query SingleCard($id: ID!) {
     url
     current_phase { id name }
     assignees { id name email }
+    labels { id name }
     fields {
       name
       value
@@ -83,6 +85,7 @@ query PipeCardsByAssignee($pipeId: ID!, $cursor: String, $assigneeId: ID!) {
         url
         current_phase { id name }
         assignees { id name email }
+        labels { id name }
         fields {
           name
           value
@@ -109,6 +112,7 @@ query PipeCardsByTitle($pipeId: ID!, $cursor: String, $title: String!) {
         url
         current_phase { id name }
         assignees { id name email }
+        labels { id name }
         fields {
           name
           value
@@ -136,6 +140,7 @@ query PipePhases($pipeId: ID!) {
             url
             current_phase { id name }
             assignees { id name email }
+            labels { id name }
             fields {
               name
               value
@@ -169,6 +174,7 @@ query FindCardsByField($pipeId: ID!, $cursor: String, $fieldId: String!, $fieldV
         url
         current_phase { id name }
         assignees { id name email }
+        labels { id name }
         fields {
           name
           value
@@ -193,6 +199,7 @@ query PhaseCards($phaseId: ID!, $cursor: String) {
           url
           current_phase { id name }
           assignees { id name email }
+          labels { id name }
           fields {
             name
             value
@@ -247,6 +254,7 @@ query PhaseCardsByAssignee($phaseId: ID!, $cursor: String, $assigneeId: ID!) {
           url
           current_phase { id name }
           assignees { id name email }
+          labels { id name }
           fields {
             name
             value

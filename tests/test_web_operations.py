@@ -107,3 +107,41 @@ def test_wizard_add_stream_preserves_existing_assignees(monkeypatch):
     assert action["old_ids"] == ["300111", "300999"]
     assert action["new_ids"] == ["300111", "300999", "300222"]
     assert done["operation"] == "add"
+
+
+def test_wizard_scan_excludes_review_task_cards(monkeypatch):
+    client = _client(monkeypatch)
+    review_card = {
+        "id": "C9",
+        "title": "Review this",
+        "url": "",
+        "current_phase": {"id": "p", "name": "Doing"},
+        "assignees": [],
+        "fields": [
+            {
+                "name": "creative_specialist",
+                "value": '["300111"]',
+                "array_value": [{"id": "300111", "name": "Kate"}],
+                "field": {"id": "creative_specialist", "label": "Creative Specialist", "type": "assignee_select"},
+            },
+            {
+                "name": "Online review status",
+                "value": '["Review Task"]',
+                "array_value": ["316297298"],
+                "field": {"id": "ziflow_status", "label": "Online review status", "type": "label_select"},
+            },
+        ],
+    }
+    monkeypatch.setattr(web, "iter_cards_fast_union", lambda *args, **kwargs: iter([review_card]))
+    response = client.post("/api/wizard/scan/stream", json={
+        "operation": "replace",
+        "old_user": "kate@dydx.digital",
+        "new_user": "robyn@dydx.digital",
+        "pipe_ids": ["1"],
+        "roles_by_pipe": {"1": ["creative specialist"]},
+        "exclude_phases_by_pipe": {"1": []},
+    })
+    events = [json.loads(line) for line in response.get_data(as_text=True).splitlines()]
+    assert not [e for e in events if e["type"] == "plan"]
+    summary = next(e for e in events if e["type"] == "summary")
+    assert summary["cards_in_excluded"] == 1

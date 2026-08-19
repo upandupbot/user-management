@@ -2,7 +2,7 @@
 import json
 
 import swap_assignee.web as web
-from swap_assignee.swap_engine import card_matches_text, plan_assign_card
+from swap_assignee.swap_engine import card_matches_text, is_review_task_card, plan_assign_card
 from swap_assignee.user_resolver import User
 
 
@@ -195,28 +195,15 @@ def _plans_from(resp):
     return [e["plan"] for e in events if e["type"] == "plan"]
 
 
-def test_assign_client_field_match_requires_flag(monkeypatch):
-    # Title doesn't mention the client; only the Client field does.
+def test_assign_client_field_no_longer_matches(monkeypatch):
+    # Title-only matching: a client name only in the Client field is not found.
     card = _card(title="Q3 banners", fields=[
         {"name": "client", "value": "Acme Corp", "array_value": None,
          "field": {"id": "client", "label": "Client", "type": "short_text"}},
         _role_field([]),
     ])
     client = _assign_client(monkeypatch, [card])
-    # Default fast path (title only): no plan.
     assert _plans_from(client.post("/api/assign/scan/stream", json=_scan_body())) == []
-    # Opt-in full scan matches the Client field.
-    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body(match_client_field=True)))
-    assert len(plans) == 1
-    assert plans[0]["card_id"] == "C1"
-
-
-def test_assign_no_duplicate_plans_when_both_paths_run(monkeypatch):
-    # Title match found by the fast path must not re-plan in the full scan.
-    card = _card(title="Acme — Q3 banners", fields=[_role_field([("300999", "Existing")])])
-    client = _assign_client(monkeypatch, [card])
-    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body(match_client_field=True)))
-    assert len(plans) == 1
 
 
 def test_assign_title_search_failure_falls_back_to_full_scan(monkeypatch):
@@ -229,6 +216,38 @@ def test_assign_title_search_failure_falls_back_to_full_scan(monkeypatch):
     monkeypatch.setattr(web, "iter_cards_by_title", _boom)
     plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body()))
     assert len(plans) == 1
+
+
+# ---------- review-task exclusion ----------
+
+def _review_status_field(value='["Review Task"]'):
+    # Shape observed in prod: value is a JSON-encoded list, array_value holds label ids.
+    return {
+        "name": "Online review status", "value": value, "array_value": ["316297298"],
+        "field": {"id": "ziflow_status", "label": "Online review status", "type": "label_select"},
+    }
+
+
+def test_is_review_task_card_via_online_review_field():
+    assert is_review_task_card(_card(fields=[_review_status_field()]))
+    assert not is_review_task_card(_card(fields=[_review_status_field('["Approved"]')]))
+    assert not is_review_task_card(_card(fields=[]))
+
+
+def test_is_review_task_card_via_card_label():
+    card = _card()
+    card["labels"] = [{"id": "1", "name": "Review Task"}]
+    assert is_review_task_card(card)
+    card["labels"] = [{"id": "1", "name": "Urgent"}]
+    assert not is_review_task_card(card)
+
+
+def test_assign_scan_excludes_review_task_cards(monkeypatch):
+    review = _card(title="Acme — review", fields=[_role_field([]), _review_status_field()])
+    real = dict(_card(title="Acme — Q3 banners", fields=[_role_field([])]), id="C2")
+    client = _assign_client(monkeypatch, [review, real])
+    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body()))
+    assert [p["card_id"] for p in plans] == ["C2"]
 
 
 def test_apply_cancel_leaves_plans_planned(monkeypatch):

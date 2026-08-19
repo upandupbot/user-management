@@ -52,8 +52,8 @@ from .papertrail_logger import attach_papertrail
 from .pipefy_client import PipefyClient
 from .swap_engine import (
     DEFAULT_EXCLUDED_PHASES,
-    card_matches_text,
     execute_plan,
+    is_review_task_card,
     plan_assign_card,
     plan_card,
     plan_remove_card,
@@ -1108,10 +1108,6 @@ INDEX_HTML = r"""<!doctype html>
       <div class="col hidden" id="clientTextCol">
         <label for="clientText">Client name</label>
         <input id="clientText" type="text" placeholder="e.g. Acme — matched against card titles" autocomplete="off">
-        <label class="check" style="margin-top: 8px;">
-          <input id="matchClientCb" type="checkbox">
-          <span>Also match the Client field (slower — scans every card)</span>
-        </label>
       </div>
       <div class="col">
         <label for="newUser" id="newUserLabel">Add user</label>
@@ -1444,7 +1440,7 @@ function setWizardOperation(operation) {
   $('oldUserCol').classList.toggle('hidden', assigning);
   $('clientTextCol').classList.toggle('hidden', !assigning);
   $('operationDescription').textContent = assigning
-    ? 'Find every card whose title or Client field mentions a client, and add someone to a role on those cards.'
+    ? 'Find every card whose title mentions a client, and add someone to a role on those cards.'
     : (adding
       ? 'Add someone to matching roles without removing any existing assignees.'
       : 'Move selected role assignments from one person to another.');
@@ -1465,7 +1461,6 @@ function setWizardOperation(operation) {
   $('oldUser').value = '';
   $('newUser').value = '';
   $('clientText').value = '';
-  $('matchClientCb').checked = false;
   clearAlerts('usersAlerts');
   $('usersStatus').textContent = '';
   $('pipePickList').innerHTML = '';
@@ -1530,7 +1525,6 @@ $('usersBtn').addEventListener('click', async () => {
       data = {
         operation: 'assign', old_user: null, new_user: resp.user,
         pipes: resp.pipes, match_text: clientText,
-        match_client: $('matchClientCb').checked,
       };
     } else {
       data = await api('/api/wizard/users', {
@@ -1563,7 +1557,7 @@ function renderResolvedUsers(data) {
     $('resolvedUsers').innerHTML = `
       <div class="user">
         <b>Cards mentioning \u201c${escapeHtml(data.match_text || '')}\u201d</b>
-        <span class="email">${data.match_client ? 'title or Client field' : 'card titles'}</span>
+        <span class="email">card titles</span>
       </div>
       <span class="arrow">+</span>
       <div class="user">
@@ -1825,7 +1819,6 @@ async function runWizardScan() {
     const payload = isAssign ? {
       user: $('newUser').value.trim(),
       match_text: (wizUsers && wizUsers.match_text) || $('clientText').value.trim(),
-      match_client_field: $('matchClientCb').checked,
       org_id: $('orgId').value.trim() || null,
       pipe_ids: pipeIds,
       exclude_phases_by_pipe: getExcludedPhasesByPipe(),
@@ -3259,18 +3252,24 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
         for card in card_source:
             cards_scanned += 1
-            plan = plan_card(
-                card,
-                old_id=old_u.id,
-                new_id=new_u.id,
-                excluded_phases=exclude_phases,
-                include_card_level=include_card_level,
-                field_filter=field_filter,
-                card_add_only=card_add_only,
-                operation=operation,
-                id_names={old_u.id: old_u.name, new_u.id: new_u.name},
-            )
-            if plan.skipped_reason:
+            if is_review_task_card(card):
+                cards_in_excluded += 1
+                plan = None
+            else:
+                plan = plan_card(
+                    card,
+                    old_id=old_u.id,
+                    new_id=new_u.id,
+                    excluded_phases=exclude_phases,
+                    include_card_level=include_card_level,
+                    field_filter=field_filter,
+                    card_add_only=card_add_only,
+                    operation=operation,
+                    id_names={old_u.id: old_u.name, new_u.id: new_u.name},
+                )
+            if plan is None:
+                pass
+            elif plan.skipped_reason:
                 cards_in_excluded += 1
             elif not plan.actions:
                 cards_already_swapped += 1
@@ -3744,7 +3743,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
         body = request.get_json(force=True, silent=True) or {}
         user_input = (body.get("user") or "").strip()
         match_text = (body.get("match_text") or "").strip()
-        match_client_field = bool(body.get("match_client_field", False))
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
         exclude_phases = list(body.get("exclude_phases") or [])
@@ -3848,23 +3846,30 @@ def create_app(config_path: str = "config.ini") -> Flask:
                             cid = str(card.get("id") or "")
                             if cid:
                                 seen_ids.add(cid)
-                            for line in _plan_events(card):
-                                yield line
+                            if is_review_task_card(card):
+                                cards_in_excluded += 1
+                            else:
+                                for line in _plan_events(card):
+                                    yield line
                             yield _progress()
                     except Exception as exc:  # noqa: BLE001
                         title_search_ok = False
                         log.warning("assign: server-side title search failed for %s (%s); using full scan", pid, exc)
 
-                    # Slow path: full scan. Only for opt-in Client-field matching,
-                    # or as the fallback when the title search errored.
-                    if match_client_field or not title_search_ok:
+                    # Fallback: full scan with client-side title matching, only
+                    # when the server-side title search errored.
+                    if not title_search_ok:
                         try:
                             for card in iter_cards(client, pid, exclude_phases=excl):
                                 cards_scanned += 1
                                 cid = str(card.get("id") or "")
-                                if (not cid or cid not in seen_ids) and card_matches_text(card, match_text):
-                                    for line in _plan_events(card):
-                                        yield line
+                                if (not cid or cid not in seen_ids) \
+                                        and match_text.lower() in (card.get("title") or "").lower():
+                                    if is_review_task_card(card):
+                                        cards_in_excluded += 1
+                                    else:
+                                        for line in _plan_events(card):
+                                            yield line
                                 if cards_scanned <= 50 or cards_scanned % 25 == 0:
                                     yield _progress()
                         except Exception as exc:  # noqa: BLE001
