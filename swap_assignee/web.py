@@ -117,6 +117,11 @@ def _install_log_capture() -> None:
 _PREVIEW_STORE: Dict[str, Dict[str, Any]] = {}
 _PREVIEW_TTL_SECONDS = 30 * 60  # 30 minutes
 
+# Cancellation flags for in-flight applies, keyed by client-generated apply_id.
+# Checked between cards; requires the single-worker deployment (threads share it).
+_APPLY_CANCEL: set = set()
+_APPLY_CANCEL_LOCK = threading.Lock()
+
 
 # Curated list of pipes shown in the "Pipe" dropdown and probed by the
 # "Find pipes" discovery scan. Add new entries here (or use the
@@ -1170,6 +1175,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="actions">
       <button id="scanBtn" class="primary">Find their jobs</button>
+      <button id="scanCancelBtn" class="ghost hidden">Cancel scan</button>
       <span id="scanSpin" class="spinner"></span>
       <span id="scanStatus" class="small"></span>
     </div>
@@ -1406,6 +1412,19 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
+// Small "Retry" affordance appended to an error alert/summary — re-runs the
+// failed step with the details still in the form (free-tier 502s usually
+// succeed on a second attempt).
+function appendRetryBtn(host, label, fn) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'ghost';
+  b.style.cssText = 'margin-left:10px;padding:4px 12px;font-size:12px;vertical-align:middle;';
+  b.textContent = label;
+  b.addEventListener('click', fn);
+  host.appendChild(b);
+}
+
 // ---------- wizard state ----------
 // One group per scanned pipe: token + plan rows + apply controls.
 const wizGroups = new Map();
@@ -1522,7 +1541,9 @@ $('usersBtn').addEventListener('click', async () => {
     $('pipesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     setBusy('usersSpin', 'usersStatus', false, '');
-    $('usersAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
+    const al = alertEl('error', escapeHtml(e.message));
+    appendRetryBtn(al, 'Retry', () => $('usersBtn').click());
+    $('usersAlerts').appendChild(al);
   } finally {
     cancelHint();
   }
@@ -1603,7 +1624,9 @@ $('pipesBtn').addEventListener('click', async () => {
     $('phasesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     setBusy('pipesSpin', 'pipesStatus', false, '');
-    $('pipesAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
+    const al = alertEl('error', escapeHtml(e.message));
+    appendRetryBtn(al, 'Retry', () => $('pipesBtn').click());
+    $('pipesAlerts').appendChild(al);
   } finally {
     cancelHint();
   }
@@ -1705,8 +1728,13 @@ function getSelectedRolesByPipe() {
 
 // ---------- step 3 -> 4: multi-pipe field-level scan ----------
 let _scanError = null;
+let _scanAborter = null;
+let _scanCancelled = false;
 
 $('scanBtn').addEventListener('click', runWizardScan);
+$('scanCancelBtn').addEventListener('click', () => {
+  if (_scanAborter) { _scanCancelled = true; _scanAborter.abort(); }
+});
 
 // Live progress state for the scan status line.
 const _scanProg = { startedAt: 0, lastEventAt: 0, stage: '', ticker: null };
@@ -1766,6 +1794,8 @@ async function runWizardScan() {
   $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   setBusy('scanSpin', 'scanStatus', true, 'Contacting server…');
   $('scanBtn').disabled = true;
+  _scanCancelled = false;
+  $('scanCancelBtn').classList.remove('hidden');
   startLogPolling();
 
   // Progress ticker + stall watchdog: the elapsed clock reassures the user
@@ -1774,6 +1804,7 @@ async function runWizardScan() {
   _scanProg.startedAt = _scanProg.lastEventAt = Date.now();
   _scanProg.stage = 'Contacting server (may take ~30\u201360s if it was asleep)';
   const aborter = new AbortController();
+  _scanAborter = aborter;
   _scanProg.ticker = setInterval(() => {
     _scanTick();
     if (Date.now() - _scanProg.lastEventAt > SCAN_STALL_LIMIT_MS) {
@@ -1837,14 +1868,24 @@ async function runWizardScan() {
       `Scan complete in ${_fmtElapsed(Date.now() - _scanProg.startedAt)} — review below.`);
   } catch (e) {
     setBusy('scanSpin', 'scanStatus', false, '');
-    $('scanSummary').className = 'alert error';
-    $('scanSummary').textContent = (e && e.name === 'AbortError')
-      ? `Scan stopped: no response from the server for ${_fmtElapsed(SCAN_STALL_LIMIT_MS)}. `
-        + 'The results below may be incomplete — try again, or scan fewer pipes at once.'
-      : 'Scan failed: ' + (e.message || e);
+    const s = $('scanSummary');
+    if (_scanCancelled) {
+      s.className = 'alert warn';
+      s.textContent = 'Scan cancelled — any results above are partial. ';
+      appendRetryBtn(s, 'Rescan', runWizardScan);
+    } else {
+      s.className = 'alert error';
+      s.textContent = ((e && e.name === 'AbortError')
+        ? `Scan stopped: no response from the server for ${_fmtElapsed(SCAN_STALL_LIMIT_MS)}. `
+          + 'The results below may be incomplete — try again, or scan fewer pipes at once. '
+        : 'Scan failed: ' + (e.message || e) + ' ');
+      appendRetryBtn(s, 'Retry scan', runWizardScan);
+    }
   } finally {
     clearInterval(_scanProg.ticker);
     _scanProg.ticker = null;
+    _scanAborter = null;
+    $('scanCancelBtn').classList.add('hidden');
     $('scanBtn').disabled = false;
   }
 }
@@ -2003,6 +2044,7 @@ function createPipeGroup(evt) {
     <div class="pg-empty hidden"></div>
     <div class="pg-actions hidden">
       <button class="danger pg-apply" disabled>${wizOperation === 'replace' ? 'Apply changes…' : 'Add co-assignee…'}</button>
+      <button class="ghost pg-cancel hidden">Cancel</button>
       <span class="spinner pg-spin"></span>
       <span class="small pg-apply-status"></span>
     </div>
@@ -2017,6 +2059,7 @@ function createPipeGroup(evt) {
     empty: el.querySelector('.pg-empty'),
     actions: el.querySelector('.pg-actions'),
     applyBtn: el.querySelector('.pg-apply'),
+    cancelBtn: el.querySelector('.pg-cancel'),
     applyStatus: el.querySelector('.pg-apply-status'),
     spin: el.querySelector('.pg-spin'),
     alertBox: el.querySelector('.pg-alert'),
@@ -2027,6 +2070,12 @@ function createPipeGroup(evt) {
     hidden: { client: new Set(), product: new Set() },
   };
   g.applyBtn.addEventListener('click', () => askApplyGroup(g));
+  g.cancelBtn.addEventListener('click', async () => {
+    if (!g.applyId) return;
+    g.cancelBtn.disabled = true;
+    g.cancelBtn.textContent = 'Cancelling…';
+    try { await api('/api/apply/cancel', { apply_id: g.applyId }); } catch (e) { /* apply may already be done */ }
+  });
   el.querySelector('.pg-select-all').addEventListener('change', (e) => {
     g.tbody.querySelectorAll('tr.plan-row .card-pick:not(:disabled)').forEach(b => {
       if (b.closest('tr').style.display !== 'none') b.checked = e.target.checked;
@@ -2252,32 +2301,62 @@ $('confirmGo').addEventListener('click', async () => {
   _pendingApplyGroup = null;
   $('confirmModal').classList.add('hidden');
   if (!g || !g.token) return;
+  const cover = ((wizOperation === 'add' || wizOperation === 'assign') && coversEnabled && $('coverSaveCb').checked) ? {
+    save: true,
+    batch_id: (wizCoverBatchId = wizCoverBatchId || newBatchId()),
+    name: $('coverName').value.trim(),
+    end_date: $('coverEnd').value || '',
+  } : null;
+  await applyGroup(g, cover);
+});
+
+// In-flight apply ids — beacon-cancelled if the page is refreshed/closed so
+// the server doesn't keep mutating cards nobody is watching.
+const _activeApplyIds = new Set();
+window.addEventListener('pagehide', () => {
+  _activeApplyIds.forEach(id => {
+    try {
+      navigator.sendBeacon('/api/apply/cancel',
+        new Blob([JSON.stringify({ apply_id: id })], { type: 'application/json' }));
+    } catch (e) {}
+  });
+});
+
+async function applyGroup(g, cover) {
+  if (!g || !g.token) return;
+  g.lastCover = cover || null;
+  const applyId = newBatchId();
+  g.applyId = applyId;
+  _activeApplyIds.add(applyId);
   g.applyBtn.disabled = true;
   g.spin.classList.add('on');
   g.applyStatus.textContent = wizOperation === 'replace' ? 'Applying…' : 'Adding co-assignee…';
+  g.alertBox.classList.add('hidden');
+  g.cancelBtn.disabled = false;
+  g.cancelBtn.textContent = 'Cancel';
+  g.cancelBtn.classList.remove('hidden');
   startLogPolling();
   try {
-    const cover = ((wizOperation === 'add' || wizOperation === 'assign') && coversEnabled && $('coverSaveCb').checked) ? {
-      save: true,
-      batch_id: (wizCoverBatchId = wizCoverBatchId || newBatchId()),
-      name: $('coverName').value.trim(),
-      end_date: $('coverEnd').value || '',
-    } : null;
     const data = await api('/api/apply', {
       token: g.token, card_ids: groupSelectedIds(g), operator_email: operatorEmail,
-      cover,
+      cover, apply_id: applyId,
     });
     renderGroupApply(g, data);
     if (data.cover_saved) loadCovers();
   } catch (e) {
     g.applyStatus.textContent = '';
-    g.alertBox.textContent = 'Apply failed: ' + (e.message || e);
+    g.alertBox.textContent = 'Apply failed: ' + (e.message || e)
+      + ' Your selection is unchanged — Retry sends the same request (already-applied cards are skipped). ';
+    appendRetryBtn(g.alertBox, 'Retry apply', () => applyGroup(g, g.lastCover));
     g.alertBox.classList.remove('hidden');
     g.applyBtn.disabled = false;
   } finally {
     g.spin.classList.remove('on');
+    g.cancelBtn.classList.add('hidden');
+    _activeApplyIds.delete(applyId);
+    g.applyId = null;
   }
-});
+}
 
 function renderGroupApply(g, data) {
   const showMeta = $('showMetaCb').checked;
@@ -2299,7 +2378,9 @@ function renderGroupApply(g, data) {
   g.applyStatus.innerHTML =
     `${data.cards_changed} card(s) ${verb}.` +
     (data.cover_saved ? ' Saved — undo any time from “Saved changes” on the home page.' : '') +
-    (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '') +
+    (data.cancelled
+      ? ` Cancelled — ${remaining} card${remaining === 1 ? '' : 's'} left planned; Apply again to continue.`
+      : (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '')) +
     ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
   g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
   g.count.textContent = data.operation === 'add'
@@ -3854,7 +3935,17 @@ def create_app(config_path: str = "config.ini") -> Flask:
             cover_req and cover_req.get("save") and operation == "add" and cover_store is not None
         )
         cover_rows: List[Dict[str, Any]] = []
+        apply_id = str(body.get("apply_id") or "").strip()
+        cancelled = False
+        processed = 0
         for plan in selected:
+            if apply_id:
+                with _APPLY_CANCEL_LOCK:
+                    cancelled = apply_id in _APPLY_CANCEL
+                if cancelled:
+                    log.info("apply %s cancelled after %d card(s)", apply_id, processed)
+                    break
+            processed += 1
             results = execute_plan(client, plan, throttle_ms=throttle_ms)
             any_ok = False
             any_err = False
@@ -3905,6 +3996,10 @@ def create_app(config_path: str = "config.ini") -> Flask:
             except Exception:  # noqa: BLE001 - audit must never block apply
                 log.exception("audit logging failed for card %s", plan.card_id)
 
+        # Cards skipped because of a mid-run cancel go back to "planned".
+        if cancelled:
+            remaining = selected[processed:] + remaining
+
         # Surface the untouched cards as still-planned so the UI can keep them
         # selectable for a follow-up Apply.
         for plan in remaining:
@@ -3934,6 +4029,10 @@ def create_app(config_path: str = "config.ini") -> Flask:
             except Exception:  # noqa: BLE001 - cover memory must never block apply
                 log.exception("cover store write failed (apply succeeded)")
 
+        if apply_id:
+            with _APPLY_CANCEL_LOCK:
+                _APPLY_CANCEL.discard(apply_id)
+
         if remaining:
             entry["plans"] = remaining
             entry["created_at"] = time.time()
@@ -3948,7 +4047,22 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "remaining": len(remaining),
             "operation": operation,
             "cover_saved": cover_saved,
+            "cancelled": cancelled,
         })
+
+    @app.post("/api/apply/cancel")
+    def api_apply_cancel():
+        """Flag an in-flight apply to stop after the card it's currently on.
+        Safe to call for unknown/finished ids — the flag is simply discarded
+        when the apply loop ends."""
+        body = request.get_json(force=True, silent=True) or {}
+        apply_id = str(body.get("apply_id") or "").strip()
+        if not apply_id:
+            return jsonify({"error": "apply_id is required."}), 400
+        with _APPLY_CANCEL_LOCK:
+            _APPLY_CANCEL.add(apply_id)
+        log.info("apply %s: cancel requested", apply_id)
+        return jsonify({"ok": True})
 
     # ---------- cover batches (undo a co-assignee add) ----------
 

@@ -173,3 +173,38 @@ def test_assign_scan_stream_requires_inputs(monkeypatch):
     client = _assign_client(monkeypatch, [])
     resp = client.post("/api/assign/scan/stream", json={"user": "x@dydx.digital"})
     assert resp.status_code == 400
+
+
+def test_apply_cancel_leaves_plans_planned(monkeypatch):
+    import time
+    from swap_assignee.swap_engine import CardPlan, PlannedAction
+
+    client = _assign_client(monkeypatch, [])
+    plan = CardPlan(
+        card_id="C1", card_url="", title="t", phase_name="Doing",
+        actions=[PlannedAction("field:f", "f", [], [NEW], field_label="F", mode="add_only")],
+    )
+    web._PREVIEW_STORE["tok-cancel"] = {
+        "created_at": time.time(), "plans": [plan], "throttle_ms": 0,
+        "summary": {}, "pipe_id": "1", "pipe_name": "Creative",
+        "old_user": "", "new_user": "Robyn", "old_user_id": "", "new_user_id": NEW,
+        "new_user_name": "Robyn", "new_user_email": "robyn@dydx.digital", "operation": "add",
+    }
+    resp = client.post("/api/apply/cancel", json={"apply_id": "ap1"})
+    assert resp.status_code == 200
+    resp = client.post("/api/apply", json={
+        "token": "tok-cancel", "apply_id": "ap1", "operator_email": "op@dydx.digital",
+    })
+    data = resp.get_json()
+    assert data["cancelled"] is True
+    assert data["cards_changed"] == 0
+    assert all(p["status"] == "planned" for p in data["plans"])
+    assert data["remaining"] == 1
+    # Flag is cleared, so a follow-up apply of the same id would run normally.
+    assert "ap1" not in web._APPLY_CANCEL
+
+
+def test_apply_cancel_requires_id(monkeypatch):
+    client = _assign_client(monkeypatch, [])
+    resp = client.post("/api/apply/cancel", json={})
+    assert resp.status_code == 400
