@@ -52,6 +52,7 @@ from .papertrail_logger import attach_papertrail
 from .pipefy_client import PipefyClient
 from .swap_engine import (
     DEFAULT_EXCLUDED_PHASES,
+    card_older_than,
     execute_plan,
     is_review_task_card,
     plan_assign_card,
@@ -1067,14 +1068,14 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <div class="wrap topbar">
     <div class="brand"><span class="b1">slip</span><span class="b2">stream</span></div>
-    <div class="sub">An Up<span class="amp">&amp;</span>Up Tool <span class="dot">&bull;</span> Pipefy Operations</div>
+    <div class="sub">An Up<span class="amp">&amp;</span>Up Tool</div>
   </div>
 </header>
 
 <section class="hero">
   <div class="wrap">
     <h1>Swap <em>people</em>,<br>not pipelines.</h1>
-    <div class="kicker"><span class="rule"></span>Bulk reassignment for Pipefy &mdash; preview every change before a single card moves.</div>
+    <div class="kicker"><span class="rule"></span>Bulk reassignment for Slipstream - Pipefy</div>
   </div>
 </section>
 
@@ -1103,15 +1104,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="row">
       <div class="col" id="oldUserCol">
         <label for="oldUser" id="oldUserLabel">Remove user</label>
-        <input id="oldUser" type="text" placeholder="leaving@dydx.digital" autocomplete="off">
+        <input id="oldUser" type="text" placeholder="leaving@upandupgroup.com" autocomplete="off">
       </div>
       <div class="col hidden" id="clientTextCol">
         <label for="clientText">Client name</label>
-        <input id="clientText" type="text" placeholder="e.g. Acme — matched against card titles" autocomplete="off">
+        <input id="clientText" type="text" placeholder="e.g. Lexus — these are matched against card titles" autocomplete="off">
       </div>
       <div class="col">
         <label for="newUser" id="newUserLabel">Add user</label>
-        <input id="newUser" type="text" placeholder="replacement@dydx.digital" autocomplete="off">
+        <input id="newUser" type="text" placeholder="replacement@upandupgroup.com" autocomplete="off">
       </div>
     </div>
     <div class="actions">
@@ -1171,6 +1172,19 @@ INDEX_HTML = r"""<!doctype html>
         <div id="phasePickList" class="field-list"></div>
         <div class="small" style="margin-top: 8px; color: var(--muted);">
           Cards sitting in a ticked phase are left untouched (Completed, Cancelled, etc.).
+        </div>
+        <div style="margin-top: 18px;">
+          <label for="maxAgeSel">How far back</label>
+          <select id="maxAgeSel" style="max-width: 240px;">
+            <option value="0">Any time</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 3 months</option>
+            <option value="180">Last 6 months</option>
+            <option value="365">Last year</option>
+          </select>
+          <div class="small" style="margin-top: 6px; color: var(--muted);">
+            Cards created before this are skipped (counted as excluded).
+          </div>
         </div>
       </div>
     </div>
@@ -1824,6 +1838,7 @@ async function runWizardScan() {
       exclude_phases_by_pipe: getExcludedPhasesByPipe(),
       roles_by_pipe: getSelectedRolesByPipe(),
       throttle_ms: parseInt($('throttleMs').value, 10) || 0,
+      max_age_days: parseInt($('maxAgeSel').value, 10) || 0,
     } : {
       old_user: $('oldUser').value.trim(),
       new_user: $('newUser').value.trim(),
@@ -1833,6 +1848,7 @@ async function runWizardScan() {
       exclude_phases_by_pipe: getExcludedPhasesByPipe(),
       roles_by_pipe: getSelectedRolesByPipe(),
       throttle_ms: parseInt($('throttleMs').value, 10) || 0,
+      max_age_days: parseInt($('maxAgeSel').value, 10) || 0,
     };
     const resp = await fetch(endpoint, {
       method: 'POST',
@@ -3200,6 +3216,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
           raise ValueError(f"Unsupported assignment operation: {operation}")
         field_ids = list(body.get("field_ids") or [])
         exclude_phases = list(body.get("exclude_phases") or DEFAULT_EXCLUDED_PHASES)
+        try:
+            max_age_days = int(body.get("max_age_days") or 0)
+        except (TypeError, ValueError):
+            max_age_days = 0
+        age_cutoff = (time.time() - max_age_days * 86400) if max_age_days > 0 else None
 
         pipe_ctx, old_u, new_u = _resolve_users(client, pipe_id, old_user, new_user, org_id_override)
         yield {
@@ -3252,7 +3273,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
         for card in card_source:
             cards_scanned += 1
-            if is_review_task_card(card):
+            if is_review_task_card(card) or card_older_than(card, age_cutoff):
                 cards_in_excluded += 1
                 plan = None
             else:
@@ -3610,6 +3631,10 @@ def create_app(config_path: str = "config.ini") -> Flask:
         }
         roles_narrowed = bool(roles_by_pipe) or bool(global_role_keys)
         throttle_ms = body.get("throttle_ms", 250)
+        try:
+            max_age_days = int(body.get("max_age_days") or 0)
+        except (TypeError, ValueError):
+            max_age_days = 0
         if not old_input or not new_input or not pipe_ids:
             return jsonify({"error": "old_user, new_user, and pipe_ids are required."}), 400
         names = {p["id"]: p["name"] for p in KNOWN_PIPES}
@@ -3668,6 +3693,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         "field_ids": list(fields.keys()),
                         "exclude_phases": exclude_by_pipe.get(pid, exclude_phases),
                         "throttle_ms": throttle_ms,
+                        "max_age_days": max_age_days,
                     }
                     plans_n = 0
                     try:
@@ -3757,6 +3783,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
             for pid, keys in raw_by_pipe.items()
         } if isinstance(raw_by_pipe, dict) else {}
         throttle_ms = body.get("throttle_ms", 250)
+        try:
+            assign_max_age_days = int(body.get("max_age_days") or 0)
+        except (TypeError, ValueError):
+            assign_max_age_days = 0
+        age_cutoff = (time.time() - assign_max_age_days * 86400) if assign_max_age_days > 0 else None
         if not user_input or not match_text or not pipe_ids:
             return jsonify({"error": "user, match_text, and pipe_ids are required."}), 400
         names = {p["id"]: p["name"] for p in KNOWN_PIPES}
@@ -3846,7 +3877,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                             cid = str(card.get("id") or "")
                             if cid:
                                 seen_ids.add(cid)
-                            if is_review_task_card(card):
+                            if is_review_task_card(card) or card_older_than(card, age_cutoff):
                                 cards_in_excluded += 1
                             else:
                                 for line in _plan_events(card):
@@ -3865,7 +3896,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                                 cid = str(card.get("id") or "")
                                 if (not cid or cid not in seen_ids) \
                                         and match_text.lower() in (card.get("title") or "").lower():
-                                    if is_review_task_card(card):
+                                    if is_review_task_card(card) or card_older_than(card, age_cutoff):
                                         cards_in_excluded += 1
                                     else:
                                         for line in _plan_events(card):

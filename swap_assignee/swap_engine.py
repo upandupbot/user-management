@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
@@ -300,6 +301,26 @@ def _field_text_candidates(fnode: Dict[str, Any]) -> List[str]:
             elif isinstance(item, str):
                 out.append(item)
     return out
+
+
+def card_created_ts(card: Dict[str, Any]) -> Optional[float]:
+    """Epoch seconds from the card's created_at, or None when missing/unparseable."""
+    raw = str(card.get("created_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def card_older_than(card: Dict[str, Any], cutoff_ts: Optional[float]) -> bool:
+    """True when the card was created before `cutoff_ts`. Cards with no
+    parseable created_at are kept (never treated as old)."""
+    if cutoff_ts is None:
+        return False
+    ts = card_created_ts(card)
+    return ts is not None and ts < cutoff_ts
 
 
 def is_review_task_card(card: Dict[str, Any]) -> bool:

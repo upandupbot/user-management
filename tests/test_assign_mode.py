@@ -2,7 +2,13 @@
 import json
 
 import swap_assignee.web as web
-from swap_assignee.swap_engine import card_matches_text, is_review_task_card, plan_assign_card
+from swap_assignee.swap_engine import (
+    card_created_ts,
+    card_matches_text,
+    card_older_than,
+    is_review_task_card,
+    plan_assign_card,
+)
 from swap_assignee.user_resolver import User
 
 
@@ -247,6 +253,36 @@ def test_assign_scan_excludes_review_task_cards(monkeypatch):
     real = dict(_card(title="Acme — Q3 banners", fields=[_role_field([])]), id="C2")
     client = _assign_client(monkeypatch, [review, real])
     plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body()))
+    assert [p["card_id"] for p in plans] == ["C2"]
+
+
+# ---------- age cutoff ----------
+
+def test_card_created_ts_and_older_than():
+    card = _card()
+    card["created_at"] = "2026-06-17T12:43:37Z"
+    ts = card_created_ts(card)
+    assert ts is not None
+    assert card_older_than(card, ts + 10)
+    assert not card_older_than(card, ts - 10)
+    assert not card_older_than(card, None)
+    # Missing/garbage created_at: card is kept (never treated as old).
+    assert card_created_ts(_card()) is None
+    assert not card_older_than(_card(), ts)
+    card["created_at"] = "not-a-date"
+    assert card_created_ts(card) is None
+
+
+def test_assign_scan_age_cutoff_skips_old_cards(monkeypatch):
+    old = _card(title="Acme — archive job", fields=[_role_field([])])
+    old["created_at"] = "2020-01-01T00:00:00Z"
+    new = dict(_card(title="Acme — Q3 banners", fields=[_role_field([])]), id="C2")
+    new["created_at"] = "2026-08-01T00:00:00Z"
+    client = _assign_client(monkeypatch, [old, new])
+    # No cutoff: both planned.
+    assert len(_plans_from(client.post("/api/assign/scan/stream", json=_scan_body()))) == 2
+    # 90-day cutoff (today is 2026-08): only the recent card.
+    plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body(max_age_days=90)))
     assert [p["card_id"] for p in plans] == ["C2"]
 
 
