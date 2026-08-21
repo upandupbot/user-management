@@ -1173,19 +1173,19 @@ INDEX_HTML = r"""<!doctype html>
         <div class="small" style="margin-top: 8px; color: var(--muted);">
           Cards sitting in a ticked phase are left untouched (Completed, Cancelled, etc.).
         </div>
-        <div style="margin-top: 18px;">
-          <label for="maxAgeSel">How far back</label>
-          <select id="maxAgeSel" style="max-width: 240px;">
-            <option value="0">Any time</option>
-            <option value="30">Last 30 days</option>
-            <option value="90">Last 3 months</option>
-            <option value="180">Last 6 months</option>
-            <option value="365">Last year</option>
-          </select>
-          <div class="small" style="margin-top: 6px; color: var(--muted);">
-            Cards created before this are skipped (counted as excluded).
-          </div>
-        </div>
+      </div>
+    </div>
+    <div style="margin-top: 22px; max-width: 520px;">
+      <label for="maxAgeSel">How far back</label>
+      <select id="maxAgeSel">
+        <option value="0">Any time</option>
+        <option value="30">Last 30 days</option>
+        <option value="90">Last 3 months</option>
+        <option value="180">Last 6 months</option>
+        <option value="365">Last year</option>
+      </select>
+      <div class="small" style="margin-top: 6px; color: var(--muted);">
+        Cards created before this are skipped (counted as excluded).
       </div>
     </div>
     <div class="actions">
@@ -1462,9 +1462,9 @@ function setWizardOperation(operation) {
     : (adding ? 'Add someone alongside an assignee' : "Who's being replaced?");
   $('oldUserLabel').textContent = adding ? 'Existing assignee' : 'Remove user';
   $('newUserLabel').textContent = assigning ? 'Person to add' : (adding ? 'Assignee to add' : 'Add user');
-  $('oldUser').placeholder = adding ? 'existing.assignee@dydx.digital' : 'leaving@dydx.digital';
-  $('newUser').placeholder = assigning ? 'person.to.add@dydx.digital'
-    : (adding ? 'new.assignee@dydx.digital' : 'replacement@dydx.digital');
+  $('oldUser').placeholder = adding ? 'existing.assignee@upandupgroup.com' : 'leaving@upandupgroup.com';
+  $('newUser').placeholder = assigning ? 'person.to.add@upandupgroup.com'
+    : (adding ? 'new.assignee@upandupgroup.com' : 'replacement@upandupgroup.com');
   $('resolvedOperationLabel').textContent = assigning ? 'Add to client cards' : (adding ? 'Add alongside' : 'Swap');
   $('roleListLabel').childNodes[0].nodeValue = (adding || assigning) ? 'Roles to add ' : 'Roles to swap ';
   $('roleHelp').textContent = assigning
