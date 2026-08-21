@@ -3,7 +3,8 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 
@@ -20,4 +21,5 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Single worker: preview plans and the log ring live in process memory.
-CMD gunicorn --workers 1 --threads 8 --timeout 600 --bind 0.0.0.0:$PORT 'swap_assignee.web:create_app()'
+# 4 threads keeps peak memory inside small instances (512 MB).
+CMD gunicorn --workers 1 --threads 4 --timeout 600 --bind 0.0.0.0:$PORT 'swap_assignee.web:create_app()'

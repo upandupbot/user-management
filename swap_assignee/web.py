@@ -117,6 +117,7 @@ def _install_log_capture() -> None:
 # Single-user local tool — fine to hold this in process memory.
 _PREVIEW_STORE: Dict[str, Dict[str, Any]] = {}
 _PREVIEW_TTL_SECONDS = 30 * 60  # 30 minutes
+_PREVIEW_MAX_ENTRIES = 20  # cap resident plan memory on small instances
 
 # Cancellation flags for in-flight applies, keyed by client-generated apply_id.
 # Checked between cards; requires the single-worker deployment (threads share it).
@@ -146,6 +147,9 @@ def _gc_preview_store() -> None:
     expired = [k for k, v in _PREVIEW_STORE.items() if now - v["created_at"] > _PREVIEW_TTL_SECONDS]
     for k in expired:
         _PREVIEW_STORE.pop(k, None)
+    while len(_PREVIEW_STORE) > _PREVIEW_MAX_ENTRIES:
+        oldest = min(_PREVIEW_STORE, key=lambda k: _PREVIEW_STORE[k]["created_at"])
+        _PREVIEW_STORE.pop(oldest, None)
 
 
 def _norm_role_label(label: str) -> str:
@@ -4077,6 +4081,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
             entry["created_at"] = time.time()
         elif token:
             _PREVIEW_STORE.pop(token, None)
+        _gc_preview_store()
 
         return jsonify({
             **summary,
