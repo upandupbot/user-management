@@ -130,13 +130,9 @@ _APPLY_CANCEL_LOCK = threading.Lock()
 # Source of truth lives in PIPES.md.
 KNOWN_PIPES: List[Dict[str, str]] = [
     {"id": "305705781", "name": "Account Management"},
-    {"id": "306751836", "name": "Always On (Social Organic)"},
     {"id": "305709782", "name": "Creative"},
     {"id": "306828440", "name": "Events and Activations"},
     {"id": "305743818", "name": "Media"},
-    {"id": "306683702", "name": "MTN CBU | Social Media"},
-    {"id": "306766298", "name": "MTN EBU - Social Media"},
-    {"id": "306766315", "name": "MTN MoMo - Social Media"},
     {"id": "306773031", "name": "PR Management"},
     {"id": "305787071", "name": "Production"},
     {"id": "305766460", "name": "Retail"},

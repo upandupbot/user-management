@@ -122,17 +122,17 @@ card-level avatars at your convenience.
 > **Web-UI curated list.** The web UI's pipe picker and its **Find their pipes**
 > discovery scan use this curated set (see `KNOWN_PIPES` in
 > `swap_assignee/web.py`): Account Management `305705781`,
-> Always On (Social Organic) `306751836`, Creative `305709782`,
+> Creative `305709782`,
 > Events and Activations `306828440`, Media `305743818`,
-> MTN CBU | Social Media `306683702`, MTN EBU - Social Media `306766298`,
-> MTN MoMo - Social Media `306766315`, PR Management `306773031`,
+> PR Management `306773031`,
 > Production `305787071`, Retail `305766460`,
 > Social Community Management `305723961`, Strategy `305709783`.
 > Slipstream Help & Support (`306283609`) is documented below for CLI use but
 > intentionally left out of the web UI list.
-> The four social pipes don't have field tables in this document yet — run
-> `--list-fields` (see above) if you need them for CLI work; the web UI
-> discovers fields automatically.
+> **Deprecated (removed 2026-08-21):** Always On (Social Organic) `306751836`,
+> MTN CBU | Social Media `306683702`, MTN EBU - Social Media `306766298`,
+> MTN MoMo - Social Media `306766315` — still reachable via the CLI or the
+> web UI's "Other (enter ID)…" option if ever needed.
 
 ## 1. Slipstream Help & Support — pipe id `306283609`
 
