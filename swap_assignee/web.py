@@ -290,6 +290,37 @@ INDEX_HTML = r"""<!doctype html>
       max-width: 280px;
     }
     .sub .dot { color: var(--coral); margin: 0 6px; }
+    .notif-wrap { position: relative; margin-left: auto; }
+    .notif-button {
+      position: relative;
+      width: 42px; height: 42px;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      font-size: 19px;
+      line-height: 1;
+    }
+    .notif-button:hover { border-color: var(--coral); color: var(--coral); }
+    .notif-badge {
+      position: absolute; top: -5px; right: -5px;
+      min-width: 18px; height: 18px; padding: 0 5px;
+      border-radius: 999px; background: var(--coral); color: #fff;
+      font-size: 10px; font-weight: 800; line-height: 18px;
+    }
+    .notif-popover {
+      position: absolute; top: calc(100% + 12px); right: 0; z-index: 20;
+      width: min(390px, calc(100vw - 32px));
+      padding: 16px; border: 1px solid var(--border); border-radius: 16px;
+      background: var(--surface); box-shadow: var(--shadow);
+    }
+    .notif-popover-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    .notif-popover-head strong { font-size: 14px; }
+    .notif-popover-head .small { margin-left:auto; }
+    .notif-popover .notice-list { max-height: 300px; overflow-y: auto; }
+    .notif-popover .notice { grid-template-columns: auto 1fr; }
+    .notif-popover .notice > .small { grid-column: 2; }
 
     /* Hero strip — sans-led statement with a serif accent word,
        echoing "CREATIVITY ELEVATES everything" on theupandupgroup.com */
@@ -1076,6 +1107,20 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <div class="wrap topbar">
     <div class="brand"><span class="b1">slip</span><span class="b2">stream</span></div>
+    <div class="notif-wrap">
+      <button id="notificationsBell" class="notif-button" type="button" aria-label="Open notifications" title="Notifications">
+        &#128276;<span id="notificationsBadge" class="notif-badge hidden">0</span>
+      </button>
+      <div id="notificationsPopover" class="notif-popover hidden" role="dialog" aria-label="Notifications">
+        <div class="notif-popover-head">
+          <strong>Notifications</strong>
+          <button id="notificationsRefresh" class="ghost" type="button" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
+          <span class="small" id="notificationsStatus">&mdash;</span>
+        </div>
+        <p class="small">Actionable warnings and errors from scans, applies, authentication, and audit delivery.</p>
+        <div id="notificationsList" class="notice-list"></div>
+      </div>
+    </div>
     <div class="sub">An Up<span class="amp">&amp;</span>Up Tool <span class="dot">&bull;</span> Pipefy Operations</div>
   </div>
 </header>
@@ -1235,22 +1280,6 @@ INDEX_HTML = r"""<!doctype html>
           <tbody id="historyTbody"></tbody>
         </table>
       </div>
-    </div>
-  </details>
-
-  <!-- Actionable notifications panel -->
-  <details class="dev" id="notificationsPanel">
-    <summary>
-      <span>Notifications</span>
-      <span class="tag">actionable system events</span>
-    </summary>
-    <div class="dev-body">
-      <div class="log-bar">
-        <button id="notificationsRefresh" class="ghost" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
-        <span class="small" id="notificationsStatus">&mdash;</span>
-      </div>
-      <p class="small">Shows warnings and errors from scans, applies, authentication, and audit delivery. Routine activity stays out of this panel.</p>
-      <div id="notificationsList" class="notice-list"></div>
     </div>
   </details>
 
@@ -2467,6 +2496,9 @@ async function loadNotifications() {
     const data = await r.json();
     const list = $('notificationsList');
     const rows = data.notifications || [];
+    const badge = $('notificationsBadge');
+    badge.textContent = rows.length > 99 ? '99+' : String(rows.length);
+    badge.classList.toggle('hidden', rows.length === 0);
     list.innerHTML = rows.length ? rows.map(n =>
       `<div class="notice ${escapeHtml(n.severity || '')}">` +
       `<span class="badge ${n.severity === 'error' ? 'err' : 'warn'}">${escapeHtml(n.severity || 'notice')}</span>` +
@@ -2542,8 +2574,16 @@ $('historyPanel').addEventListener('toggle', () => {
   if ($('historyPanel').open) loadHistory();
 });
 $('notificationsRefresh').addEventListener('click', loadNotifications);
-$('notificationsPanel').addEventListener('toggle', () => {
-  if ($('notificationsPanel').open) loadNotifications();
+$('notificationsBell').addEventListener('click', (event) => {
+  event.stopPropagation();
+  const popover = $('notificationsPopover');
+  popover.classList.toggle('hidden');
+  if (!popover.classList.contains('hidden')) loadNotifications();
+});
+document.addEventListener('click', (event) => {
+  if (!$('notificationsPopover').contains(event.target) && event.target !== $('notificationsBell')) {
+    $('notificationsPopover').classList.add('hidden');
+  }
 });
 
 initGate();
