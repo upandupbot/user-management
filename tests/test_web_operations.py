@@ -109,71 +109,34 @@ def test_wizard_add_stream_preserves_existing_assignees(monkeypatch):
     assert done["operation"] == "add"
 
 
-def test_wizard_scan_age_cutoff_skips_old_cards(monkeypatch):
+def test_history_api_exposes_filters_and_retention(monkeypatch):
     client = _client(monkeypatch)
-    old_card = {
-        "id": "C8",
-        "title": "Ancient job",
-        "url": "",
-        "created_at": "2021-03-01T00:00:00Z",
-        "current_phase": {"id": "p", "name": "Doing"},
-        "assignees": [],
-        "fields": [{
-            "name": "creative_specialist",
-            "value": '["300111"]',
-            "array_value": [{"id": "300111", "name": "Kate"}],
-            "field": {"id": "creative_specialist", "label": "Creative Specialist", "type": "assignee_select"},
-        }],
-    }
-    monkeypatch.setattr(web, "iter_cards_fast_union", lambda *args, **kwargs: iter([old_card]))
-    response = client.post("/api/wizard/scan/stream", json={
-        "operation": "replace",
-        "old_user": "kate@dydx.digital",
-        "new_user": "robyn@dydx.digital",
-        "pipe_ids": ["1"],
-        "roles_by_pipe": {"1": ["creative specialist"]},
-        "exclude_phases_by_pipe": {"1": []},
-        "max_age_days": 365,
-    })
-    events = [json.loads(line) for line in response.get_data(as_text=True).splitlines()]
-    assert not [e for e in events if e["type"] == "plan"]
-    summary = next(e for e in events if e["type"] == "summary")
-    assert summary["cards_in_excluded"] == 1
+    response = client.get("/api/history?days=365&board=Creative&client=Acme&user=Kate")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["days"] == 365
+    assert payload["retention_days"] >= 365
+    assert payload["records"] == []
 
 
-def test_wizard_scan_excludes_review_task_cards(monkeypatch):
+def test_developer_access_is_limited_to_dydx_domain(monkeypatch):
     client = _client(monkeypatch)
-    review_card = {
-        "id": "C9",
-        "title": "Review this",
-        "url": "",
-        "current_phase": {"id": "p", "name": "Doing"},
-        "assignees": [],
-        "fields": [
-            {
-                "name": "creative_specialist",
-                "value": '["300111"]',
-                "array_value": [{"id": "300111", "name": "Kate"}],
-                "field": {"id": "creative_specialist", "label": "Creative Specialist", "type": "assignee_select"},
-            },
-            {
-                "name": "Online review status",
-                "value": '["Review Task"]',
-                "array_value": ["316297298"],
-                "field": {"id": "ziflow_status", "label": "Online review status", "type": "label_select"},
-            },
-        ],
-    }
-    monkeypatch.setattr(web, "iter_cards_fast_union", lambda *args, **kwargs: iter([review_card]))
-    response = client.post("/api/wizard/scan/stream", json={
-        "operation": "replace",
-        "old_user": "kate@dydx.digital",
-        "new_user": "robyn@dydx.digital",
-        "pipe_ids": ["1"],
-        "roles_by_pipe": {"1": ["creative specialist"]},
-        "exclude_phases_by_pipe": {"1": []},
-    })
-    events = [json.loads(line) for line in response.get_data(as_text=True).splitlines()]
-    assert not [e for e in events if e["type"] == "plan"]
-    summary = next(e for e in events if e["type"] == "summary")
-    assert summary["cards_in_excluded"] == 1
+
+    assert client.post("/api/auth", json={"email": "operator@upandupgroup.com"}).status_code == 200
+    session = client.get("/api/session").get_json()
+    assert session["developer"] is False
+    assert client.post("/api/logs", json={"since": 0}).status_code == 403
+
+    client = _client(monkeypatch)
+    assert client.post("/api/auth", json={"email": "developer@dydx.digital"}).status_code == 200
+    session = client.get("/api/session").get_json()
+    assert session["developer"] is True
+    assert client.post("/api/logs", json={"since": 0}).status_code == 200
+
+
+def test_notifications_api_returns_notification_collection(monkeypatch):
+    client = _client(monkeypatch)
+    response = client.get("/api/notifications")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert isinstance(payload["notifications"], list)

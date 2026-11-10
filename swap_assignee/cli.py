@@ -7,7 +7,7 @@ import sys
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from .config import load_config, mask_secret
-from .pipefy_client import PipefyClient
+from .pipefy_client import PipefyClient, PipefyError
 from .papertrail_logger import attach_papertrail
 from .reports import ReportWriter
 from .user_resolver import (
@@ -59,6 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-card",
         default=None,
         help="Fetch a single card by id and dump its raw assignee fields (JSON), then exit. For diagnosing field shape issues.",
+    )
+    p.add_argument(
+        "--remove-from-org",
+        default=None,
+        metavar="EMAIL",
+        help=(
+            "Remove this user from the entire Pipefy organization, then exit. "
+            "Dry-run by default; add --apply to actually remove. Needs --org-id "
+            "(or [Pipefy] org_id in config.ini, or --pipe-id to auto-detect)."
+        ),
     )
     p.add_argument(
         "--trace-card",
@@ -415,6 +425,86 @@ def _list_users_mode(client, pipe_id: str, org_id_override: Optional[str]) -> in
     return 0
 
 
+def _remove_from_org_mode(
+    client,
+    email: str,
+    org_id: Optional[str],
+    pipe_id: Optional[str],
+    *,
+    apply: bool,
+    assume_yes: bool,
+    operator_email: Optional[str],
+) -> int:
+    """Remove a user from the whole Pipefy organization (dry-run unless --apply)."""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        print("ERROR: --remove-from-org needs a full email address.", file=sys.stderr)
+        return 2
+
+    if not org_id and pipe_id:
+        try:
+            org_id = fetch_pipe_context(client, pipe_id).get("org_id")
+        except Exception as exc:
+            print(f"ERROR: could not auto-detect org from pipe {pipe_id}: {exc}", file=sys.stderr)
+            return 2
+    if not org_id:
+        print("ERROR: no organization id. Pass --org-id, set it in config.ini, or give --pipe-id.", file=sys.stderr)
+        return 2
+
+    # Resolve the target against the org roster so we show who we'd remove.
+    target: Optional[User] = None
+    try:
+        org_users = fetch_org_users(client, org_id, use_cache=False)
+        target = next((u for u in org_users if (u.email or "").strip().lower() == email), None)
+    except Exception as exc:
+        print(f"WARNING: could not fetch org roster ({exc}); proceeding on email alone.", file=sys.stderr)
+        org_users = None
+    if org_users is not None and target is None:
+        print(f"ERROR: {email} is not in org {org_id} (already removed?).", file=sys.stderr)
+        return 2
+
+    # Never remove the account that owns the API token — it would brick the tool.
+    try:
+        me = client.execute("query { me { id email name } }")["me"]
+        if (me.get("email") or "").strip().lower() == email:
+            print(
+                f"ERROR: {email} is the account this API token belongs to "
+                f"({me.get('name')}). Removing it would revoke the tool's own access. Refusing.",
+                file=sys.stderr,
+            )
+            return 2
+    except PipefyError as exc:
+        print(f"WARNING: could not verify token owner ({exc}).", file=sys.stderr)
+
+    who = f"{target.name} <{target.email}> (id {target.id})" if target else email
+    print(f"Org:    {org_id}")
+    print(f"User:   {who}")
+    print("Action: remove from the ENTIRE organization (all pipes, all access).")
+
+    if not apply:
+        print("\nDRY-RUN — nothing changed. Re-run with --apply to remove this user.")
+        return 0
+
+    if not assume_yes:
+        answer = input(f"\nType the user's email to confirm removal: ").strip().lower()
+        if answer != email:
+            print("Aborted (email did not match).")
+            return 1
+
+    result = client.execute(
+        "mutation RemoveUser($email: String!, $orgId: ID!) {"
+        " removeUserFromOrg(input: { email: $email, organization_id: $orgId }) { success } }",
+        {"email": email, "orgId": str(org_id)},
+    )
+    success = bool(((result or {}).get("removeUserFromOrg") or {}).get("success"))
+    log.info("removeUserFromOrg email=%s org=%s operator=%s success=%s", email, org_id, operator_email, success)
+    if success:
+        print(f"REMOVED {who} from org {org_id}.")
+        return 0
+    print(f"ERROR: Pipefy reported success=false removing {email}. Check the token's admin rights.", file=sys.stderr)
+    return 1
+
+
 def _resolve_users(client, pipe_id: str, old_input: str, new_input: str, org_id_override: Optional[str], *, use_cache: bool = True):
     import time as _time
     t0 = _time.time()
@@ -515,6 +605,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --debug-card mode: dump raw card payload then exit.
     if args.debug_card:
         return _debug_card_mode(client, args.debug_card)
+
+    # --remove-from-org mode: remove a user from the whole organization, then exit.
+    if args.remove_from_org:
+        return _remove_from_org_mode(
+            client,
+            args.remove_from_org,
+            args.org_id or cfg.org_id,
+            args.pipe_id,
+            apply=args.apply,
+            assume_yes=args.yes,
+            operator_email=operator_email,
+        )
 
     if not args.pipe_id:
         print("ERROR: --pipe-id is required (unless using --debug-card).", file=sys.stderr)

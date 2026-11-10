@@ -30,7 +30,6 @@ JSONL store.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -42,42 +41,6 @@ log = logging.getLogger("swap_assignee.audit.sheets")
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
-def load_sheet_credentials(
-    service_account_file: Optional[str],
-    service_account_json: Optional[str] = None,
-):
-    """Build service-account credentials for the Sheets API, or None.
-
-    Shared by the audit sink and the cover store. Never raises — returns
-    None when the Google libraries are missing, the key file doesn't exist,
-    or the key content is invalid.
-    """
-    if not (service_account_file or service_account_json):
-        return None
-    try:
-        from google.oauth2.service_account import Credentials  # lazy import
-    except ImportError:
-        log.warning(
-            "Google API libraries not installed; Google Sheets features are disabled. "
-            "Run: pip install -r requirements.txt"
-        )
-        return None
-    try:
-        if service_account_json:
-            import json
-
-            info = json.loads(service_account_json)
-            return Credentials.from_service_account_info(info, scopes=_SCOPES)
-        path = Path(service_account_file).expanduser()
-        if not path.exists():
-            log.warning("Audit service_account_file not found: %s", path)
-            return None
-        return Credentials.from_service_account_file(str(path), scopes=_SCOPES)
-    except Exception as exc:  # noqa: BLE001 - never block on credential init
-        log.warning("Could not load Google service-account credentials: %s", exc)
-        return None
-
-
 def _cell(value: Any) -> Any:
     """Coerce a record value into something the Sheets API accepts."""
     if value is None:
@@ -85,14 +48,6 @@ def _cell(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
-
-
-def _ts_epoch(ts: Any) -> float:
-    """Best-effort ISO-8601 -> epoch seconds; unparseable rows are kept (inf)."""
-    try:
-        return datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-    except Exception:  # noqa: BLE001 - hand-edited or legacy rows
-        return float("inf")
 
 
 class GoogleSheetSink:
@@ -151,32 +106,6 @@ class GoogleSheetSink:
         ).execute()
         return True
 
-    def recent(self, *, limit: int = 300, days: int = 30) -> List[Dict[str, Any]]:
-        """Read back the newest audit rows (newest first) from the shared tab.
-
-        This is what makes History a *team* view on hosted deploys: the local
-        JSONL store resets on redeploy and only ever has one machine's applies,
-        while the Sheet has everyone's.
-        """
-        self._ensure()
-        last_col = chr(ord("A") + len(AUDIT_COLUMNS) - 1)
-        resp = (
-            self._svc.spreadsheets()
-            .values()
-            .get(spreadsheetId=self.sheet_id, range=f"{self.tab}!A2:{last_col}")
-            .execute()
-        )
-        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
-        out: List[Dict[str, Any]] = []
-        for raw in resp.get("values") or []:
-            rec = {col: (raw[i] if i < len(raw) else "") for i, col in enumerate(AUDIT_COLUMNS)}
-            if _ts_epoch(rec.get("ts")) >= cutoff:
-                out.append(rec)
-        out.reverse()  # sheet appends chronologically -> newest first
-        if limit and limit > 0:
-            out = out[:limit]
-        return out
-
 
 def build_sheet_sink(
     sheet_id: Optional[str],
@@ -196,10 +125,26 @@ def build_sheet_sink(
     """
     if not sheet_id or not (service_account_file or service_account_json):
         return None
-    creds = load_sheet_credentials(service_account_file, service_account_json)
-    if creds is None:
+    try:
+        from google.oauth2.service_account import Credentials  # lazy import
+    except ImportError:
+        log.warning(
+            "Google API libraries not installed; the Sheets audit sink is disabled. "
+            "Run: pip install -r requirements.txt"
+        )
         return None
     try:
+        if service_account_json:
+            import json
+
+            info = json.loads(service_account_json)
+            creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
+        else:
+            path = Path(service_account_file).expanduser()
+            if not path.exists():
+                log.warning("Audit service_account_file not found: %s", path)
+                return None
+            creds = Credentials.from_service_account_file(str(path), scopes=_SCOPES)
         return GoogleSheetSink(sheet_id, creds, tab=tab)
     except Exception as exc:  # noqa: BLE001 - never block on sink init
         log.warning("Could not initialise Google Sheets audit sink: %s", exc)

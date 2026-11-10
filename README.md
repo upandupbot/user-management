@@ -101,6 +101,9 @@ Then open http://127.0.0.1:5000. The UI mirrors the CLI with a few quality-of-li
 - **Test run first.** The dry run streams matched cards into a table as they're found, with running totals and a phase-skip strip.
 - **Choose which cards to change.** Every preview row has a checkbox (all ticked by default) plus a select-all toggle in the header. **Apply** only changes the ticked cards. Un-ticked cards stay in the table as `planned` and selectable, so you can apply in batches — tick more and **Apply** again without re-running the dry run.
 - **History panel.** Expand **History** to see the last 30 days of real applies (operator, card, before → after, status), pulled from the local audit store.
+- **Filterable history.** Filter applies by board/pipe, client, or swapped user and choose a date range beyond 30 days. Local audit retention defaults to 365 days and can be changed with `SWAP_AUDIT_RETENTION_DAYS` (minimum 30); use the shared Google Sheet for longer-term retention and cross-server history.
+- **Developer settings.** The advanced settings and live activity log are visible only to signed-in `@dydx.digital` users. Other approved-domain users can use the normal scan, preview, apply, and history workflows.
+- **Notifications.** The notifications panel is intentionally limited to actionable warnings and errors from scans, applies, authentication, and audit delivery. It is not a general activity feed.
 
 > Note: per-card selection is a web-UI feature. The CLI applies every matched card in one pass (subject to `--apply`/`--yes`).
 

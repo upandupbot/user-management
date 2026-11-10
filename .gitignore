@@ -3,6 +3,7 @@
 !fixtures/*.json
 up-up-swap-users-*.json
 service-account*.json
+*.pem
 
 # Local config (contains the Pipefy API token + secrets) — use config.example.ini as the template
 config.ini

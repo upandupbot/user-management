@@ -33,6 +33,7 @@ log = logging.getLogger("swap_assignee.audit")
 # Company domains permitted to use the tool. Lower-case, no leading "@".
 ALLOWED_EMAIL_DOMAINS = frozenset({
     "upandupgroup.com",
+    "theupandupgroup.com",
     "dydx.digital",
     "mcsaatchiabel.co.za",
     "upandupconnect.com",
@@ -43,7 +44,7 @@ ALLOWED_EMAIL_DOMAINS = frozenset({
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-RETENTION_DAYS = 30
+RETENTION_DAYS = max(30, int(os.environ.get("SWAP_AUDIT_RETENTION_DAYS", "365")))
 _SECONDS_PER_DAY = 86400
 
 _STORE_LOCK = threading.Lock()

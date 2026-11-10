@@ -39,9 +39,7 @@ except ImportError as exc:  # pragma: no cover
 from .card_iterator import (
     discover_assignee_fields,
     fetch_active_phases,
-    fetch_card,
     iter_cards,
-    iter_cards_by_title,
     iter_cards_fast_union,
     probe_card_level_assignee,
     probe_field_value,
@@ -50,15 +48,7 @@ from .cli import _resolve_users  # reuse exactly the CLI's resolution flow
 from .config import load_config, mask_secret
 from .papertrail_logger import attach_papertrail
 from .pipefy_client import PipefyClient
-from .swap_engine import (
-    DEFAULT_EXCLUDED_PHASES,
-    card_older_than,
-    execute_plan,
-    is_review_task_card,
-    plan_assign_card,
-    plan_card,
-    plan_remove_card,
-)
+from .swap_engine import DEFAULT_EXCLUDED_PHASES, execute_plan, is_review_task_card, plan_card
 from .user_resolver import (
     UserResolutionError,
     fetch_org_users,
@@ -73,7 +63,6 @@ from .audit import (
     record_swap,
 )
 from .sheets_sink import build_sheet_sink
-from .cover_store import build_cover_store
 
 
 log = logging.getLogger("swap_assignee.web")
@@ -81,6 +70,7 @@ log = logging.getLogger("swap_assignee.web")
 
 # ---------- in-memory log ring for the Developer panel ----------
 _LOG_RING: Deque[Dict[str, Any]] = collections.deque(maxlen=500)
+_NOTIFICATION_RING: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
 _LOG_SEQ = {"n": 0}
 _LOG_LOCK = threading.Lock()
 
@@ -93,13 +83,22 @@ class _RingHandler(logging.Handler):
             msg = record.getMessage()
         with _LOG_LOCK:
             _LOG_SEQ["n"] += 1
-            _LOG_RING.append({
+            entry = {
                 "seq": _LOG_SEQ["n"],
                 "ts": record.created,
                 "level": record.levelname,
                 "logger": record.name,
                 "msg": msg,
-            })
+            }
+            _LOG_RING.append(entry)
+            if record.levelno >= logging.WARNING:
+              _NOTIFICATION_RING.append({
+                "id": entry["seq"],
+                "ts": entry["ts"],
+                "severity": "error" if record.levelno >= logging.ERROR else "warning",
+                "title": "Server error" if record.levelno >= logging.ERROR else "Needs attention",
+                "message": msg,
+              })
 
 
 def _install_log_capture() -> None:
@@ -118,12 +117,6 @@ def _install_log_capture() -> None:
 # Single-user local tool — fine to hold this in process memory.
 _PREVIEW_STORE: Dict[str, Dict[str, Any]] = {}
 _PREVIEW_TTL_SECONDS = 30 * 60  # 30 minutes
-_PREVIEW_MAX_ENTRIES = 20  # cap resident plan memory on small instances
-
-# Cancellation flags for in-flight applies, keyed by client-generated apply_id.
-# Checked between cards; requires the single-worker deployment (threads share it).
-_APPLY_CANCEL: set = set()
-_APPLY_CANCEL_LOCK = threading.Lock()
 
 
 # Curated list of pipes shown in the "Pipe" dropdown and probed by the
@@ -132,9 +125,13 @@ _APPLY_CANCEL_LOCK = threading.Lock()
 # Source of truth lives in PIPES.md.
 KNOWN_PIPES: List[Dict[str, str]] = [
     {"id": "305705781", "name": "Account Management"},
+    {"id": "306751836", "name": "Always On (Social Organic)"},
     {"id": "305709782", "name": "Creative"},
     {"id": "306828440", "name": "Events and Activations"},
     {"id": "305743818", "name": "Media"},
+    {"id": "306683702", "name": "MTN CBU | Social Media"},
+    {"id": "306766298", "name": "MTN EBU - Social Media"},
+    {"id": "306766315", "name": "MTN MoMo - Social Media"},
     {"id": "306773031", "name": "PR Management"},
     {"id": "305787071", "name": "Production"},
     {"id": "305766460", "name": "Retail"},
@@ -148,9 +145,6 @@ def _gc_preview_store() -> None:
     expired = [k for k, v in _PREVIEW_STORE.items() if now - v["created_at"] > _PREVIEW_TTL_SECONDS]
     for k in expired:
         _PREVIEW_STORE.pop(k, None)
-    while len(_PREVIEW_STORE) > _PREVIEW_MAX_ENTRIES:
-        oldest = min(_PREVIEW_STORE, key=lambda k: _PREVIEW_STORE[k]["created_at"])
-        _PREVIEW_STORE.pop(oldest, None)
 
 
 def _norm_role_label(label: str) -> str:
@@ -475,10 +469,6 @@ INDEX_HTML = r"""<!doctype html>
     }
     button.primary:hover { background: var(--coral); color: #fff; border-color: var(--coral); }
     button.ghost { background: transparent; border-color: var(--ink); }
-    /* Explicit hover: the transparent background above ties with button:hover
-       on specificity and wins on source order, leaving white text on a white
-       background. */
-    button.ghost:hover { background: var(--ink); color: var(--bg); }
     button.danger {
       background: var(--coral);
       color: #fff;
@@ -745,15 +735,6 @@ INDEX_HTML = r"""<!doctype html>
       padding: 2px 10px; border-radius: 999px;
       text-transform: uppercase; letter-spacing: 0.14em;
     }
-    /* Small operation chip used in the results "Change" column (e.g. co-assign). */
-    .op-pill {
-      display: inline-block;
-      font-size: 9px; font-weight: 700;
-      padding: 2px 9px; border-radius: 999px;
-      margin-left: 8px; vertical-align: 1px;
-      text-transform: uppercase; letter-spacing: 0.12em;
-      white-space: nowrap;
-    }
     .field-list .meta {
       display: none;
       color: var(--muted);
@@ -892,6 +873,35 @@ INDEX_HTML = r"""<!doctype html>
       margin-bottom: 8px;
     }
     .log-bar .small { margin-left: auto; }
+    .history-filters {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .history-filters input,
+    .history-filters select {
+      width: 100%;
+      min-width: 0;
+    }
+    .notice-list { display: grid; gap: 8px; }
+    .notice {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: start;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--coral);
+      border-radius: 10px;
+      background: var(--surface-2);
+    }
+    .notice.error { border-left-color: var(--danger); }
+    .notice-title { font-weight: 700; }
+    .notice-message { color: var(--muted); font-size: 13px; }
+    @media (max-width: 700px) {
+      .history-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
 
     /* ---------- Modal ---------- */
     .modal-backdrop {
@@ -904,12 +914,10 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 28px;
-      padding: 40px 44px;
-      max-width: 600px;
+      padding: 36px 38px;
+      max-width: 480px;
       width: 92%;
       box-shadow: var(--shadow);
-      max-height: 90vh;
-      overflow-y: auto;
     }
     .modal h3 {
       margin: 0 0 14px;
@@ -1068,14 +1076,14 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <div class="wrap topbar">
     <div class="brand"><span class="b1">slip</span><span class="b2">stream</span></div>
-    <div class="sub">An Up<span class="amp">&amp;</span>Up Tool</div>
+    <div class="sub">An Up<span class="amp">&amp;</span>Up Tool <span class="dot">&bull;</span> Pipefy Operations</div>
   </div>
 </header>
 
 <section class="hero">
   <div class="wrap">
     <h1>Swap <em>people</em>,<br>not pipelines.</h1>
-    <div class="kicker"><span class="rule"></span>Bulk reassignment for Slipstream - Pipefy</div>
+    <div class="kicker"><span class="rule"></span>Bulk reassignment for Pipefy &mdash; preview every change before a single card moves.</div>
   </div>
 </section>
 
@@ -1094,7 +1102,6 @@ INDEX_HTML = r"""<!doctype html>
         <select id="operationSelect" aria-describedby="operationDescription">
           <option value="replace">Replace assignee</option>
           <option value="add">Add co-assignee</option>
-          <option value="assign">Add to a client's cards</option>
         </select>
       </div>
       <div id="operationDescription" class="operation-description">
@@ -1102,17 +1109,13 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <div class="row">
-      <div class="col" id="oldUserCol">
+      <div class="col">
         <label for="oldUser" id="oldUserLabel">Remove user</label>
-        <input id="oldUser" type="text" placeholder="leaving@upandupgroup.com" autocomplete="off">
-      </div>
-      <div class="col hidden" id="clientTextCol">
-        <label for="clientText">Client name</label>
-        <input id="clientText" type="text" placeholder="e.g. Lexus — these are matched against card titles" autocomplete="off">
+        <input id="oldUser" type="text" placeholder="leaving@dydx.digital" autocomplete="off">
       </div>
       <div class="col">
         <label for="newUser" id="newUserLabel">Add user</label>
-        <input id="newUser" type="text" placeholder="replacement@upandupgroup.com" autocomplete="off">
+        <input id="newUser" type="text" placeholder="replacement@dydx.digital" autocomplete="off">
       </div>
     </div>
     <div class="actions">
@@ -1175,22 +1178,8 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div style="margin-top: 22px; max-width: 520px;">
-      <label for="maxAgeSel">How far back</label>
-      <select id="maxAgeSel">
-        <option value="0">Any time</option>
-        <option value="30">Last 30 days</option>
-        <option value="90">Last 3 months</option>
-        <option value="180">Last 6 months</option>
-        <option value="365">Last year</option>
-      </select>
-      <div class="small" style="margin-top: 6px; color: var(--muted);">
-        Cards created before this are skipped (counted as excluded).
-      </div>
-    </div>
     <div class="actions">
       <button id="scanBtn" class="primary">Find their jobs</button>
-      <button id="scanCancelBtn" class="ghost hidden">Cancel scan</button>
       <span id="scanSpin" class="spinner"></span>
       <span id="scanStatus" class="small"></span>
     </div>
@@ -1208,16 +1197,6 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pipeGroups"></div>
   </section>
 
-  <!-- Saved changes (undoable co-assignee adds) -->
-  <section id="coversPanel" class="panel hidden">
-    <div class="panel-head">
-      <span class="step" aria-hidden="true"></span>
-      <h2>Saved changes</h2>
-      <span class="hint">Co-assignees added by this tool &mdash; undo them here when they're no longer needed</span>
-    </div>
-    <div id="coversList"></div>
-  </section>
-
   <!-- History panel -->
   <details class="dev" id="historyPanel">
     <summary>
@@ -1228,6 +1207,18 @@ INDEX_HTML = r"""<!doctype html>
       <div class="log-bar">
         <button id="historyRefresh" class="ghost" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
         <span class="small" id="historyStatus">&mdash;</span>
+      </div>
+      <div class="history-filters" aria-label="Filter history">
+        <input id="historyBoard" type="search" placeholder="Board or pipe" autocomplete="off">
+        <input id="historyClient" type="search" placeholder="Client" autocomplete="off">
+        <input id="historyUser" type="search" placeholder="User swapped" autocomplete="off">
+        <select id="historyDays" aria-label="History date range">
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="180">Last 6 months</option>
+          <option value="365">Last 12 months</option>
+          <option value="730">Last 24 months</option>
+        </select>
       </div>
       <div style="max-height: 360px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
         <table>
@@ -1244,6 +1235,22 @@ INDEX_HTML = r"""<!doctype html>
           <tbody id="historyTbody"></tbody>
         </table>
       </div>
+    </div>
+  </details>
+
+  <!-- Actionable notifications panel -->
+  <details class="dev" id="notificationsPanel">
+    <summary>
+      <span>Notifications</span>
+      <span class="tag">actionable system events</span>
+    </summary>
+    <div class="dev-body">
+      <div class="log-bar">
+        <button id="notificationsRefresh" class="ghost" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
+        <span class="small" id="notificationsStatus">&mdash;</span>
+      </div>
+      <p class="small">Shows warnings and errors from scans, applies, authentication, and audit delivery. Routine activity stays out of this panel.</p>
+      <div id="notificationsList" class="notice-list"></div>
     </div>
   </details>
 
@@ -1299,26 +1306,6 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal">
     <h3>Apply changes?</h3>
     <p id="confirmText"></p>
-    <div id="coverForm" class="hidden" style="margin: 22px 0 10px; padding: 22px 24px; border: 1px solid var(--border); border-radius: 16px;">
-      <label style="display: flex; align-items: center; gap: 12px; cursor: pointer; margin: 0;">
-        <input type="checkbox" id="coverSaveCb" style="width: auto;">
-        <span>Save this change so it can be undone later</span>
-      </label>
-      <div id="coverFields" class="hidden">
-        <div style="margin-top: 20px;">
-          <label for="coverName">Name it, so it's easy to find later</label>
-          <input id="coverName" type="text" placeholder="Simphiwe added alongside Katekani" autocomplete="off">
-        </div>
-        <div style="margin-top: 20px;">
-          <label for="coverEnd">Do you already know when you'll want to undo this? <span style="text-transform:none;font-weight:400;">(optional)</span></label>
-          <input id="coverEnd" type="date" style="max-width: 220px;">
-        </div>
-        <div class="small" style="margin-top: 18px; color: var(--muted); line-height: 1.6;">
-          Nothing happens automatically — you'll find this under “Saved changes” on the
-          home page, where you (or anyone on the team) can undo it whenever it's time.
-        </div>
-      </div>
-    </div>
     <div class="actions">
       <button id="confirmCancel" class="ghost">Cancel</button>
       <button id="confirmGo" class="danger">Yes, apply</button>
@@ -1331,7 +1318,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal modal-wide">
     <h3>Recent applies</h3>
     <p class="small" style="margin: 0 0 14px; color: var(--muted);">
-      Last 30 days.
+      Last 30 days from this machine's local audit log.
       <span id="recentSyncNote"></span>
     </p>
     <div id="recentBody" style="max-height: 52vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
@@ -1352,41 +1339,6 @@ INDEX_HTML = r"""<!doctype html>
     <div class="actions">
       <span class="small" id="recentStatus" style="margin-right: auto; color: var(--muted);"></span>
       <button id="recentClose" class="ghost">Close</button>
-    </div>
-  </div>
-</div>
-
-<!-- Undo-change modal -->
-<div id="coverModal" class="modal-backdrop hidden">
-  <div class="modal modal-wide">
-    <h3 id="coverModalTitle">Undo change</h3>
-    <p class="small" id="coverModalMeta" style="margin: 0 0 14px; color: var(--muted);"></p>
-    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
-      <input id="coverSearch" type="text" placeholder="Filter cards…" autocomplete="off" style="max-width: 220px;">
-      <select id="coverPipeFilter"></select>
-      <select id="coverClientFilter"></select>
-      <span class="small" id="coverFilterCount" style="color: var(--muted);"></span>
-    </div>
-    <div style="max-height: 48vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;">
-      <table>
-        <thead>
-          <tr>
-            <th style="width: 34px; text-align: center;"><input type="checkbox" id="coverSelectAll" checked title="Select / deselect all"></th>
-            <th>Card</th>
-            <th style="width: 160px;">Pipe</th>
-            <th style="width: 140px;">Client</th>
-            <th>Added to</th>
-            <th style="width: 120px;">Status</th>
-          </tr>
-        </thead>
-        <tbody id="coverTbody"></tbody>
-      </table>
-    </div>
-    <div class="actions">
-      <span class="small" id="coverStatus" style="margin-right: auto; color: var(--muted);"></span>
-      <button id="coverClose" class="ghost">Close</button>
-      <button id="coverRemoveBtn" class="danger">Remove co-assignee</button>
-      <span id="coverSpin" class="spinner"></span>
     </div>
   </div>
 </div>
@@ -1427,19 +1379,6 @@ function escapeHtml(s) {
 }
 function escapeAttr(s) { return escapeHtml(s); }
 
-// Small "Retry" affordance appended to an error alert/summary — re-runs the
-// failed step with the details still in the form (free-tier 502s usually
-// succeed on a second attempt).
-function appendRetryBtn(host, label, fn) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'ghost';
-  b.style.cssText = 'margin-left:10px;padding:4px 12px;font-size:12px;vertical-align:middle;';
-  b.textContent = label;
-  b.addEventListener('click', fn);
-  host.appendChild(b);
-}
-
 // ---------- wizard state ----------
 // One group per scanned pipe: token + plan rows + apply controls.
 const wizGroups = new Map();
@@ -1447,34 +1386,24 @@ let wizUsers = null;   // response of /api/wizard/users (resolved users + member
 let wizOperation = 'replace';
 
 function setWizardOperation(operation) {
-  wizOperation = operation === 'add' ? 'add' : (operation === 'assign' ? 'assign' : 'replace');
+  wizOperation = operation === 'add' ? 'add' : 'replace';
   $('operationSelect').value = wizOperation;
   const adding = wizOperation === 'add';
-  const assigning = wizOperation === 'assign';
-  $('oldUserCol').classList.toggle('hidden', assigning);
-  $('clientTextCol').classList.toggle('hidden', !assigning);
-  $('operationDescription').textContent = assigning
-    ? 'Find every card whose title mentions a client, and add someone to a role on those cards.'
-    : (adding
-      ? 'Add someone to matching roles without removing any existing assignees.'
-      : 'Move selected role assignments from one person to another.');
-  $('step1Title').textContent = assigning ? "Whose client, and who's joining?"
-    : (adding ? 'Add someone alongside an assignee' : "Who's being replaced?");
+  $('operationDescription').textContent = adding
+    ? 'Add someone to matching roles without removing any existing assignees.'
+    : 'Move selected role assignments from one person to another.';
+  $('step1Title').textContent = adding ? 'Add someone alongside an assignee' : "Who's being replaced?";
   $('oldUserLabel').textContent = adding ? 'Existing assignee' : 'Remove user';
-  $('newUserLabel').textContent = assigning ? 'Person to add' : (adding ? 'Assignee to add' : 'Add user');
-  $('oldUser').placeholder = adding ? 'existing.assignee@upandupgroup.com' : 'leaving@upandupgroup.com';
-  $('newUser').placeholder = assigning ? 'person.to.add@upandupgroup.com'
-    : (adding ? 'new.assignee@upandupgroup.com' : 'replacement@upandupgroup.com');
-  $('resolvedOperationLabel').textContent = assigning ? 'Add to client cards' : (adding ? 'Add alongside' : 'Swap');
-  $('roleListLabel').childNodes[0].nodeValue = (adding || assigning) ? 'Roles to add ' : 'Roles to swap ';
-  $('roleHelp').textContent = assigning
-    ? 'Tick the role(s) the person should be added to on every matching card.'
-    : (adding
-      ? 'Tick the role(s) where the new person should be added. Existing assignees remain in place.'
-      : "Tick the role(s) this person holds — e.g. Account Manager. Ticking everything searches every assignee field, which is slower.");
+  $('newUserLabel').textContent = adding ? 'Assignee to add' : 'Add user';
+  $('oldUser').placeholder = adding ? 'existing.assignee@dydx.digital' : 'leaving@dydx.digital';
+  $('newUser').placeholder = adding ? 'new.assignee@dydx.digital' : 'replacement@dydx.digital';
+  $('resolvedOperationLabel').textContent = adding ? 'Add alongside' : 'Swap';
+  $('roleListLabel').childNodes[0].nodeValue = adding ? 'Roles to add ' : 'Roles to swap ';
+  $('roleHelp').textContent = adding
+    ? 'Tick the role(s) where the new person should be added. Existing assignees remain in place.'
+    : "Tick the role(s) this person holds — e.g. Account Manager. Ticking everything searches every assignee field, which is slower.";
   $('oldUser').value = '';
   $('newUser').value = '';
-  $('clientText').value = '';
   clearAlerts('usersAlerts');
   $('usersStatus').textContent = '';
   $('pipePickList').innerHTML = '';
@@ -1485,12 +1414,7 @@ function setWizardOperation(operation) {
   ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   wizGroups.clear();
   wizUsers = null;
-  wizCoverBatchId = null;
-  $('coverSaveCb').checked = false;
-  $('coverFields').classList.add('hidden');
-  $('coverName').value = '';
-  $('coverEnd').value = '';
-  (assigning ? $('clientText') : $('oldUser')).focus();
+  $('oldUser').focus();
 }
 
 $('operationSelect').addEventListener('change', (event) => {
@@ -1515,40 +1439,21 @@ $('usersBtn').addEventListener('click', async () => {
   ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   const oldUser = $('oldUser').value.trim();
   const newUser = $('newUser').value.trim();
-  const clientText = $('clientText').value.trim();
-  if (wizOperation === 'assign') {
-    if (!clientText || !newUser) {
-      $('usersAlerts').appendChild(alertEl('error', 'Enter both the client name to match and the person to add.'));
-      return;
-    }
-  } else if (!oldUser || !newUser) {
+  if (!oldUser || !newUser) {
     $('usersAlerts').appendChild(alertEl('error', wizOperation === 'add'
       ? 'Enter both the person whose jobs should be found and the person to add.'
       : 'Both the remove user and the add user are required.'));
     return;
   }
-  const baseMsg = wizOperation === 'assign' ? 'Resolving user\u2026' : 'Resolving users\u2026';
+  const baseMsg = 'Resolving users\u2026';
   setBusy('usersSpin', 'usersStatus', true, baseMsg);
   const cancelHint = slowHint('usersStatus', baseMsg);
   try {
-    let data;
-    if (wizOperation === 'assign') {
-      const resp = await api('/api/assign/users', {
-        user: newUser, org_id: $('orgId').value.trim() || null,
-      });
-      data = {
-        operation: 'assign', old_user: null, new_user: resp.user,
-        pipes: resp.pipes, match_text: clientText,
-      };
-    } else {
-      data = await api('/api/wizard/users', {
-        old_user: oldUser, new_user: newUser, operation: wizOperation,
-        org_id: $('orgId').value.trim() || null,
-      });
-    }
+    const data = await api('/api/wizard/users', {
+      old_user: oldUser, new_user: newUser, operation: wizOperation,
+      org_id: $('orgId').value.trim() || null,
+    });
     wizUsers = data;
-    wizCoverBatchId = null;      // new user pair = new cover batch
-    $('coverName').value = '';   // re-prefill from the new names on confirm
     setBusy('usersSpin', 'usersStatus', false, '');
     renderResolvedUsers(data);
     renderPipePick(data);
@@ -1556,9 +1461,7 @@ $('usersBtn').addEventListener('click', async () => {
     $('pipesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     setBusy('usersSpin', 'usersStatus', false, '');
-    const al = alertEl('error', escapeHtml(e.message));
-    appendRetryBtn(al, 'Retry', () => $('usersBtn').click());
-    $('usersAlerts').appendChild(al);
+    $('usersAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
   } finally {
     cancelHint();
   }
@@ -1567,20 +1470,6 @@ $('usersBtn').addEventListener('click', async () => {
 function renderResolvedUsers(data) {
   const oldU = data.old_user, newU = data.new_user;
   const operation = data.operation || wizOperation;
-  if (operation === 'assign') {
-    $('resolvedUsers').innerHTML = `
-      <div class="user">
-        <b>Cards mentioning \u201c${escapeHtml(data.match_text || '')}\u201d</b>
-        <span class="email">card titles</span>
-      </div>
-      <span class="arrow">+</span>
-      <div class="user">
-        <b>${escapeHtml(newU.name || '(no name)')}</b>
-        <span class="email">${escapeHtml(newU.email)}</span>
-      </div>
-    `;
-    return;
-  }
   $('resolvedUsers').innerHTML = `
     <div class="user">
       <b>${escapeHtml(oldU.name || '(no name)')}</b>
@@ -1639,9 +1528,7 @@ $('pipesBtn').addEventListener('click', async () => {
     $('phasesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     setBusy('pipesSpin', 'pipesStatus', false, '');
-    const al = alertEl('error', escapeHtml(e.message));
-    appendRetryBtn(al, 'Retry', () => $('pipesBtn').click());
-    $('pipesAlerts').appendChild(al);
+    $('pipesAlerts').appendChild(alertEl('error', escapeHtml(e.message)));
   } finally {
     cancelHint();
   }
@@ -1743,13 +1630,8 @@ function getSelectedRolesByPipe() {
 
 // ---------- step 3 -> 4: multi-pipe field-level scan ----------
 let _scanError = null;
-let _scanAborter = null;
-let _scanCancelled = false;
 
 $('scanBtn').addEventListener('click', runWizardScan);
-$('scanCancelBtn').addEventListener('click', () => {
-  if (_scanAborter) { _scanCancelled = true; _scanAborter.abort(); }
-});
 
 // Live progress state for the scan status line.
 const _scanProg = { startedAt: 0, lastEventAt: 0, stage: '', ticker: null };
@@ -1795,22 +1677,17 @@ async function runWizardScan() {
   const sum = $('scanSummary');
   sum.className = 'alert';
   sum.classList.remove('hidden');
-  sum.textContent = wizOperation === 'assign'
-    ? 'Scanning for cards that mention the client…'
-    : (wizOperation === 'add'
-      ? 'Scanning for jobs where a co-assignee can be added…'
-      : 'Scanning — jobs stream in below as they are found…');
+  sum.textContent = wizOperation === 'add'
+    ? 'Scanning for jobs where a co-assignee can be added…'
+    : 'Scanning — jobs stream in below as they are found…';
   $('resultsPanel').classList.remove('hidden');
-  $('resultsTitle').textContent = wizOperation === 'assign' ? 'Matching cards, by pipe'
-    : (wizOperation === 'add' ? 'Jobs ready for co-assignment' : 'Their jobs, by pipe');
-  $('resultsHint').textContent = wizOperation === 'replace'
-    ? 'Nothing changes in Pipefy until you click Apply on a pipe.'
-    : 'Existing assignees remain in place until you review and apply.';
+  $('resultsTitle').textContent = wizOperation === 'add' ? 'Jobs ready for co-assignment' : 'Their jobs, by pipe';
+  $('resultsHint').textContent = wizOperation === 'add'
+    ? 'Existing assignees remain in place until you review and apply.'
+    : 'Nothing changes in Pipefy until you click Apply on a pipe.';
   $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   setBusy('scanSpin', 'scanStatus', true, 'Contacting server…');
   $('scanBtn').disabled = true;
-  _scanCancelled = false;
-  $('scanCancelBtn').classList.remove('hidden');
   startLogPolling();
 
   // Progress ticker + stall watchdog: the elapsed clock reassures the user
@@ -1819,7 +1696,6 @@ async function runWizardScan() {
   _scanProg.startedAt = _scanProg.lastEventAt = Date.now();
   _scanProg.stage = 'Contacting server (may take ~30\u201360s if it was asleep)';
   const aborter = new AbortController();
-  _scanAborter = aborter;
   _scanProg.ticker = setInterval(() => {
     _scanTick();
     if (Date.now() - _scanProg.lastEventAt > SCAN_STALL_LIMIT_MS) {
@@ -1828,33 +1704,20 @@ async function runWizardScan() {
   }, 1000);
 
   try {
-    const isAssign = wizOperation === 'assign';
-    const endpoint = isAssign ? '/api/assign/scan/stream' : '/api/wizard/scan/stream';
-    const payload = isAssign ? {
-      user: $('newUser').value.trim(),
-      match_text: (wizUsers && wizUsers.match_text) || $('clientText').value.trim(),
-      org_id: $('orgId').value.trim() || null,
-      pipe_ids: pipeIds,
-      exclude_phases_by_pipe: getExcludedPhasesByPipe(),
-      roles_by_pipe: getSelectedRolesByPipe(),
-      throttle_ms: parseInt($('throttleMs').value, 10) || 0,
-      max_age_days: parseInt($('maxAgeSel').value, 10) || 0,
-    } : {
-      old_user: $('oldUser').value.trim(),
-      new_user: $('newUser').value.trim(),
-      operation: wizOperation,
-      org_id: $('orgId').value.trim() || null,
-      pipe_ids: pipeIds,
-      exclude_phases_by_pipe: getExcludedPhasesByPipe(),
-      roles_by_pipe: getSelectedRolesByPipe(),
-      throttle_ms: parseInt($('throttleMs').value, 10) || 0,
-      max_age_days: parseInt($('maxAgeSel').value, 10) || 0,
-    };
-    const resp = await fetch(endpoint, {
+    const resp = await fetch('/api/wizard/scan/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: aborter.signal,
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        old_user: $('oldUser').value.trim(),
+        new_user: $('newUser').value.trim(),
+        operation: wizOperation,
+        org_id: $('orgId').value.trim() || null,
+        pipe_ids: pipeIds,
+        exclude_phases_by_pipe: getExcludedPhasesByPipe(),
+        roles_by_pipe: getSelectedRolesByPipe(),
+        throttle_ms: parseInt($('throttleMs').value, 10) || 0,
+      }),
     });
     if (resp.status === 401) { showGate(); return; }
     if (!resp.ok || !resp.body) {
@@ -1885,24 +1748,14 @@ async function runWizardScan() {
       `Scan complete in ${_fmtElapsed(Date.now() - _scanProg.startedAt)} — review below.`);
   } catch (e) {
     setBusy('scanSpin', 'scanStatus', false, '');
-    const s = $('scanSummary');
-    if (_scanCancelled) {
-      s.className = 'alert warn';
-      s.textContent = 'Scan cancelled — any results above are partial. ';
-      appendRetryBtn(s, 'Rescan', runWizardScan);
-    } else {
-      s.className = 'alert error';
-      s.textContent = ((e && e.name === 'AbortError')
-        ? `Scan stopped: no response from the server for ${_fmtElapsed(SCAN_STALL_LIMIT_MS)}. `
-          + 'The results below may be incomplete — try again, or scan fewer pipes at once. '
-        : 'Scan failed: ' + (e.message || e) + ' ');
-      appendRetryBtn(s, 'Retry scan', runWizardScan);
-    }
+    $('scanSummary').className = 'alert error';
+    $('scanSummary').textContent = (e && e.name === 'AbortError')
+      ? `Scan stopped: no response from the server for ${_fmtElapsed(SCAN_STALL_LIMIT_MS)}. `
+        + 'The results below may be incomplete — try again, or scan fewer pipes at once.'
+      : 'Scan failed: ' + (e.message || e);
   } finally {
     clearInterval(_scanProg.ticker);
     _scanProg.ticker = null;
-    _scanAborter = null;
-    $('scanCancelBtn').classList.add('hidden');
     $('scanBtn').disabled = false;
   }
 }
@@ -1913,20 +1766,15 @@ async function runWizardScan() {
 let _appliedTotal = 0;
 
 function renderScanCard(host, totalPlans, withJobs) {
-  const who = (wizUsers && wizUsers.old_user) ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
+  const who = wizUsers ? (wizUsers.old_user.name || wizUsers.old_user.email) : 'This user';
   const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the new assignee';
-  const matchText = (wizUsers && wizUsers.match_text) || '';
   const sub = (withJobs.length === 1 ? 'All within one pipe. ' : `Across ${withJobs.length} pipes. `)
-    + (wizOperation === 'assign'
-      ? `Review each match before adding ${target} to the selected role(s).`
-      : (wizOperation === 'add'
-        ? `Review each match before adding ${target}; client and product filters are optional.`
-        : 'Review each match and apply where the fit is right.'));
-  const headline = wizOperation === 'assign'
-    ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} card${totalPlans === 1 ? '' : 's'} mentioning \u201c${escapeHtml(matchText)}\u201d`
-    : (wizOperation === 'add'
-      ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} job${totalPlans === 1 ? '' : 's'} held by ${escapeHtml(who)}`
-      : `<span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}`);
+    + (wizOperation === 'add'
+      ? `Review each match before adding ${target}; client and product filters are optional.`
+      : 'Review each match and apply where the fit is right.');
+  const headline = wizOperation === 'add'
+    ? `<span class="who">${escapeHtml(target)}</span> can be added to ${totalPlans} job${totalPlans === 1 ? '' : 's'} held by ${escapeHtml(who)}`
+    : `<span class="who">${escapeHtml(who)}</span> matched ${totalPlans} job${totalPlans === 1 ? '' : 's'}`;
   host.className = 'scan-card';
   host.innerHTML = `
     <div class="sc-body">
@@ -1998,11 +1846,9 @@ function handleScanEvent(evt) {
         renderScanCard(s, evt.total_plans, withJobs);
       } else {
         s.className = 'alert ok';
-        s.textContent = wizOperation === 'assign'
-          ? 'No matching cards need this person added (outside the excluded phases).'
-          : (wizOperation === 'add'
-            ? 'No matching jobs need this co-assignee (outside the excluded phases).'
-            : 'No jobs found in the selected pipes (outside the excluded phases).');
+        s.textContent = wizOperation === 'add'
+          ? 'No matching jobs need this co-assignee (outside the excluded phases).'
+          : 'No jobs found in the selected pipes (outside the excluded phases).';
       }
       break;
     }
@@ -2060,8 +1906,7 @@ function createPipeGroup(evt) {
     </div>
     <div class="pg-empty hidden"></div>
     <div class="pg-actions hidden">
-      <button class="danger pg-apply" disabled>${wizOperation === 'replace' ? 'Apply changes…' : 'Add co-assignee…'}</button>
-      <button class="ghost pg-cancel hidden">Cancel</button>
+      <button class="danger pg-apply" disabled>${wizOperation === 'add' ? 'Add co-assignee…' : 'Apply changes…'}</button>
       <span class="spinner pg-spin"></span>
       <span class="small pg-apply-status"></span>
     </div>
@@ -2076,7 +1921,6 @@ function createPipeGroup(evt) {
     empty: el.querySelector('.pg-empty'),
     actions: el.querySelector('.pg-actions'),
     applyBtn: el.querySelector('.pg-apply'),
-    cancelBtn: el.querySelector('.pg-cancel'),
     applyStatus: el.querySelector('.pg-apply-status'),
     spin: el.querySelector('.pg-spin'),
     alertBox: el.querySelector('.pg-alert'),
@@ -2087,12 +1931,6 @@ function createPipeGroup(evt) {
     hidden: { client: new Set(), product: new Set() },
   };
   g.applyBtn.addEventListener('click', () => askApplyGroup(g));
-  g.cancelBtn.addEventListener('click', async () => {
-    if (!g.applyId) return;
-    g.cancelBtn.disabled = true;
-    g.cancelBtn.textContent = 'Cancelling…';
-    try { await api('/api/apply/cancel', { apply_id: g.applyId }); } catch (e) { /* apply may already be done */ }
-  });
   el.querySelector('.pg-select-all').addEventListener('change', (e) => {
     g.tbody.querySelectorAll('tr.plan-row .card-pick:not(:disabled)').forEach(b => {
       if (b.closest('tr').style.display !== 'none') b.checked = e.target.checked;
@@ -2219,15 +2057,13 @@ function finalizePipeGroup(g, evt) {
     g.count.textContent = evt.no_matching_roles ? 'no roles ticked' : 'no assignee fields';
     g.empty.textContent = evt.no_matching_roles
       ? 'No roles ticked for this pipe — nothing searched.'
-      : `This pipe has no assignee fields — nothing to ${wizOperation === 'replace' ? 'swap' : 'add'}.`;
+      : `This pipe has no assignee fields — nothing to ${wizOperation === 'add' ? 'add' : 'swap'}.`;
     g.empty.classList.remove('hidden');
     return;
   }
   if (!g.plans) {
-    g.count.textContent = wizOperation === 'assign' ? 'no matches' : 'no jobs';
-    g.empty.textContent = wizOperation === 'assign'
-      ? 'No cards mentioning the client need this person added (outside the excluded phases).'
-      : 'No jobs found for this user (outside the excluded phases).';
+    g.count.textContent = 'no jobs';
+    g.empty.textContent = 'No jobs found for this user (outside the excluded phases).';
     g.empty.classList.remove('hidden');
     return;
   }
@@ -2278,13 +2114,7 @@ function askApplyGroup(g) {
   if (!g.token) { alert('Run the scan first.'); return; }
   if (!ids.length) { alert('Tick at least one card to change.'); return; }
   _pendingApplyGroup = g;
-  if (wizOperation === 'assign') {
-    const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the person';
-    const matchText = (wizUsers && wizUsers.match_text) || 'the client';
-    $('confirmText').textContent =
-      `This will add ${target} to the selected role fields on ${ids.length} card${ids.length === 1 ? '' : 's'} mentioning \u201c${matchText}\u201d in \u201c${g.name}\u201d. ` +
-      'All existing assignees will remain. Are you sure?';
-  } else if (wizOperation === 'add') {
+  if (wizOperation === 'add') {
     const target = wizUsers ? (wizUsers.new_user.name || wizUsers.new_user.email) : 'the new assignee';
     $('confirmText').textContent =
       `This will add ${target} to the selected role fields on ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
@@ -2293,17 +2123,6 @@ function askApplyGroup(g) {
     $('confirmText').textContent =
       `This will modify ${ids.length} card${ids.length === 1 ? '' : 's'} in “${g.name}”. ` +
       'This action cannot be undone. Are you sure?';
-  }
-  // Opt-in cover memory (add operation only, and only when the server has a
-  // Sheet to store it in). Values persist across per-pipe applies so one
-  // wizard run makes one named cover.
-  const showCover = (wizOperation === 'add' || wizOperation === 'assign') && coversEnabled;
-  $('coverForm').classList.toggle('hidden', !showCover);
-  if (showCover && !$('coverName').value.trim() && wizUsers) {
-    const nu = wizUsers.new_user, ou = wizUsers.old_user;
-    $('coverName').value = wizOperation === 'assign'
-      ? `${nu.name || nu.email} added to \u201c${wizUsers.match_text || ''}\u201d cards`
-      : `${nu.name || nu.email} added alongside ${ou.name || ou.email}`;
   }
   $('confirmModal').classList.remove('hidden');
 }
@@ -2318,62 +2137,24 @@ $('confirmGo').addEventListener('click', async () => {
   _pendingApplyGroup = null;
   $('confirmModal').classList.add('hidden');
   if (!g || !g.token) return;
-  const cover = ((wizOperation === 'add' || wizOperation === 'assign') && coversEnabled && $('coverSaveCb').checked) ? {
-    save: true,
-    batch_id: (wizCoverBatchId = wizCoverBatchId || newBatchId()),
-    name: $('coverName').value.trim(),
-    end_date: $('coverEnd').value || '',
-  } : null;
-  await applyGroup(g, cover);
-});
-
-// In-flight apply ids — beacon-cancelled if the page is refreshed/closed so
-// the server doesn't keep mutating cards nobody is watching.
-const _activeApplyIds = new Set();
-window.addEventListener('pagehide', () => {
-  _activeApplyIds.forEach(id => {
-    try {
-      navigator.sendBeacon('/api/apply/cancel',
-        new Blob([JSON.stringify({ apply_id: id })], { type: 'application/json' }));
-    } catch (e) {}
-  });
-});
-
-async function applyGroup(g, cover) {
-  if (!g || !g.token) return;
-  g.lastCover = cover || null;
-  const applyId = newBatchId();
-  g.applyId = applyId;
-  _activeApplyIds.add(applyId);
   g.applyBtn.disabled = true;
   g.spin.classList.add('on');
-  g.applyStatus.textContent = wizOperation === 'replace' ? 'Applying…' : 'Adding co-assignee…';
-  g.alertBox.classList.add('hidden');
-  g.cancelBtn.disabled = false;
-  g.cancelBtn.textContent = 'Cancel';
-  g.cancelBtn.classList.remove('hidden');
+  g.applyStatus.textContent = wizOperation === 'add' ? 'Adding co-assignee…' : 'Applying…';
   startLogPolling();
   try {
     const data = await api('/api/apply', {
       token: g.token, card_ids: groupSelectedIds(g), operator_email: operatorEmail,
-      cover, apply_id: applyId,
     });
     renderGroupApply(g, data);
-    if (data.cover_saved) loadCovers();
   } catch (e) {
     g.applyStatus.textContent = '';
-    g.alertBox.textContent = 'Apply failed: ' + (e.message || e)
-      + ' Your selection is unchanged — Retry sends the same request (already-applied cards are skipped). ';
-    appendRetryBtn(g.alertBox, 'Retry apply', () => applyGroup(g, g.lastCover));
+    g.alertBox.textContent = 'Apply failed: ' + (e.message || e);
     g.alertBox.classList.remove('hidden');
     g.applyBtn.disabled = false;
   } finally {
     g.spin.classList.remove('on');
-    g.cancelBtn.classList.add('hidden');
-    _activeApplyIds.delete(applyId);
-    g.applyId = null;
   }
-}
+});
 
 function renderGroupApply(g, data) {
   const showMeta = $('showMetaCb').checked;
@@ -2394,10 +2175,7 @@ function renderGroupApply(g, data) {
   const verb = data.operation === 'add' ? 'updated with the co-assignee' : 'changed';
   g.applyStatus.innerHTML =
     `${data.cards_changed} card(s) ${verb}.` +
-    (data.cover_saved ? ' Saved — undo any time from “Saved changes” on the home page.' : '') +
-    (data.cancelled
-      ? ` Cancelled — ${remaining} card${remaining === 1 ? '' : 's'} left planned; Apply again to continue.`
-      : (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '')) +
+    (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '') +
     ' <button type="button" class="ghost pg-recent" style="padding:2px 8px;font-size:12px;">Recent applies</button>';
   g.applyStatus.querySelector('.pg-recent').addEventListener('click', openRecentModal);
   g.count.textContent = data.operation === 'add'
@@ -2434,7 +2212,7 @@ function actionsCellHtml(p, showMeta) {
   return (p.actions || []).map(a => {
     if (a.scope === 'card') {
       if (a.mode === 'add_only') {
-        return '<div>Card assignees <span class="op-pill" style="background:var(--warn-bg);color:var(--warn);">add-only</span></div>';
+        return '<div>Card assignees <span class="pill" style="background:var(--warn-bg);color:var(--warn);">add-only</span></div>';
       }
       return '<div>Card assignees</div>';
     }
@@ -2443,9 +2221,9 @@ function actionsCellHtml(p, showMeta) {
       ? ` <span class="small mono">${escapeHtml(a.field_id)}</span>`
       : '';
     const mode = a.mode === 'add_only'
-      ? ' <span class="op-pill" style="background:var(--coral-soft);color:var(--coral-deep);">co-assign</span>'
+      ? ' <span class="pill" style="background:var(--coral-soft);color:var(--coral-deep);">add</span>'
       : '';
-    return `<div style="margin:2px 0;">${escapeHtml(label)}${slug}${mode}</div>`;
+    return `<div>${escapeHtml(label)}${slug}${mode}</div>`;
   }).join('');
 }
 
@@ -2594,7 +2372,6 @@ function showGate() {
 function unlockApp(email) {
   operatorEmail = email;
   $('gateBackdrop').classList.add('hidden');
-  loadCovers();
   $('oldUser').focus();
 }
 
@@ -2633,8 +2410,8 @@ async function initGate() {
     const r = await fetch('/api/session');
     const s = await r.json();
     gatePasswordRequired = !!s.password_required;
-    // Hosted mode: operators don't need the developer terminal.
-    if (gatePasswordRequired) {
+    // Developer settings are restricted to the dydx.digital engineering domain.
+    if (!s.developer) {
       logsEnabled = false;
       $('devPanel').classList.add('hidden');
     }
@@ -2660,17 +2437,46 @@ function fmtHistTs(ts) {
 async function loadHistory() {
   $('historyStatus').textContent = 'Loading…';
   try {
-    const r = await fetch('/api/history');
+    const params = new URLSearchParams({
+      board: $('historyBoard').value.trim(),
+      client: $('historyClient').value.trim(),
+      user: $('historyUser').value.trim(),
+      days: $('historyDays').value,
+    });
+    const r = await fetch('/api/history?' + params.toString());
     const data = await r.json();
     const rows = data.records || [];
     const n = renderHistoryInto(rows, $('historyTbody'));
-    const sync = data.source === 'sheet'
-      ? 'shared team history'
-      : (data.sheet_sync ? 'local view — shared history unavailable right now'
-                         : 'local to this server only — resets on redeploy');
-    $('historyStatus').textContent = `${n} record${n === 1 ? '' : 's'} · ${sync}`;
+    const sync = data.sheet_sync
+      ? 'mirrored to the shared Google Sheet'
+      : 'local to this server only — resets on redeploy';
+    $('historyStatus').textContent = `${n} record${n === 1 ? '' : 's'} · ${data.days} days · ${sync}`;
   } catch (e) {
     $('historyStatus').textContent = 'load error';
+  }
+}
+
+function fmtNoticeTs(ts) {
+  return ts ? new Date(ts * 1000).toLocaleString() : '';
+}
+
+async function loadNotifications() {
+  $('notificationsStatus').textContent = 'Loading…';
+  try {
+    const r = await fetch('/api/notifications');
+    const data = await r.json();
+    const list = $('notificationsList');
+    const rows = data.notifications || [];
+    list.innerHTML = rows.length ? rows.map(n =>
+      `<div class="notice ${escapeHtml(n.severity || '')}">` +
+      `<span class="badge ${n.severity === 'error' ? 'err' : 'warn'}">${escapeHtml(n.severity || 'notice')}</span>` +
+      `<div><div class="notice-title">${escapeHtml(n.title || 'Notification')}</div>` +
+      `<div class="notice-message">${escapeHtml(n.message || '')}</div></div>` +
+      `<span class="small">${escapeHtml(fmtNoticeTs(n.ts))}</span></div>`
+    ).join('') : '<div class="small">No actionable notifications.</div>';
+    $('notificationsStatus').textContent = `${rows.length} notification${rows.length === 1 ? '' : 's'}`;
+  } catch (e) {
+    $('notificationsStatus').textContent = 'load error';
   }
 }
 
@@ -2715,9 +2521,9 @@ async function openRecentModal() {
     const rows = data.records || [];
     const n = renderHistoryInto(rows, $('recentTbody'));
     $('recentStatus').textContent = `${n} record${n === 1 ? '' : 's'} · last 30 days`;
-    $('recentSyncNote').textContent = data.source === 'sheet'
-      ? 'Shared team history — includes applies made by everyone.'
-      : 'Local history for this server only.';
+    $('recentSyncNote').textContent = data.sheet_sync
+      ? 'Also mirrored to the shared Google Sheet.'
+      : 'Local only — set [Audit] webhook_url to also mirror to a shared Sheet.';
   } catch (e) {
     $('recentStatus').textContent = 'load error';
   }
@@ -2728,248 +2534,17 @@ $('recentClose').addEventListener('click', closeRecentModal);
 $('recentModal').addEventListener('click', (e) => { if (e.target === $('recentModal')) closeRecentModal(); });
 
 $('historyRefresh').addEventListener('click', loadHistory);
+$('historyBoard').addEventListener('change', loadHistory);
+$('historyClient').addEventListener('change', loadHistory);
+$('historyUser').addEventListener('change', loadHistory);
+$('historyDays').addEventListener('change', loadHistory);
 $('historyPanel').addEventListener('toggle', () => {
   if ($('historyPanel').open) loadHistory();
 });
-
-// ---------- covers (undo a co-assignee add) ----------
-let coversEnabled = false;   // true when the server has a Sheet to store covers in
-let wizCoverBatchId = null;  // one batch per wizard run, shared across per-pipe applies
-let _coverBatch = null;      // batch currently open in the end-cover modal
-let _coverCards = [];        // grouped per card: {card_id, title, ..., roles: []}
-let _coverBusy = false;
-
-function newBatchId() {
-  const a = new Uint8Array(9);
-  crypto.getRandomValues(a);
-  return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
-}
-
-// Toggle the name/date fields with the "save this cover" checkbox.
-$('coverSaveCb').addEventListener('change', () => {
-  $('coverFields').classList.toggle('hidden', !$('coverSaveCb').checked);
+$('notificationsRefresh').addEventListener('click', loadNotifications);
+$('notificationsPanel').addEventListener('toggle', () => {
+  if ($('notificationsPanel').open) loadNotifications();
 });
-
-async function loadCovers() {
-  try {
-    const r = await fetch('/api/covers');
-    if (!r.ok) return;
-    const data = await r.json();
-    coversEnabled = !!data.enabled;
-    renderCovers(data.covers || []);
-  } catch (e) { /* panel simply stays hidden */ }
-}
-
-function coverDatesLabel(b) {
-  return b.end_date ? `undo planned for ${b.end_date}` : '';
-}
-
-function renderCovers(covers) {
-  const host = $('coversList');
-  host.innerHTML = '';
-  const active = covers.filter(c => (c.status || 'active') === 'active');
-  $('coversPanel').classList.toggle('hidden', active.length === 0);
-  if (!active.length) return;
-  const today = new Date().toISOString().slice(0, 10);
-  active.forEach(c => {
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:24px;padding:20px 4px;border-bottom:1px solid var(--border);flex-wrap:wrap;';
-    const overdue = c.end_date && c.end_date <= today;
-    const meta = [
-      `${c.cards_active} card${c.cards_active === 1 ? '' : 's'}`,
-      c.pipe_names && c.pipe_names.length ? c.pipe_names.join(', ') : '',
-      coverDatesLabel(c),
-      c.created_by ? `by ${c.created_by}` : '',
-    ].filter(Boolean).join(' \u00b7 ');
-    row.innerHTML = `
-      <div style="flex:0 1 auto;min-width:200px;">
-        <b>${escapeHtml(c.name || 'Unnamed change')}</b>
-        ${overdue ? ' <span class="badge warn">planned undo date reached</span>' : ''}
-      </div>
-      <div class="small" style="flex:1 1 auto;text-align:right;color:var(--muted);">${escapeHtml(meta)}</div>
-      <button class="danger" style="padding:8px 22px;font-size:13px;flex:0 0 auto;">Undo</button>
-    `;
-    row.querySelector('button').addEventListener('click', () => openCoverModal(c));
-    host.appendChild(row);
-  });
-}
-
-function groupCoverRows(rows) {
-  const map = new Map();
-  rows.forEach(r => {
-    const key = String(r.card_id);
-    const e = map.get(key) || {
-      card_id: key, card_url: r.card_url, title: r.title,
-      pipe_name: r.pipe_name, client: r.client, roles: [],
-    };
-    const role = r.scope === 'card' ? 'Card-level' : (r.field_label || r.field_id || r.scope);
-    if (role && !e.roles.includes(role)) e.roles.push(role);
-    map.set(key, e);
-  });
-  return Array.from(map.values());
-}
-
-async function openCoverModal(batch) {
-  _coverBatch = batch;
-  _coverCards = [];
-  const who = batch.cover_user_name || batch.cover_user_email || 'the co-assignee';
-  $('coverModalTitle').textContent = batch.name || 'Undo change';
-  $('coverModalMeta').textContent =
-    `Removes ${who} from the cards below \u2014 only the roles this tool added them to. ` +
-    'Untick anything they should stay on.';
-  $('coverStatus').textContent = '';
-  $('coverSearch').value = '';
-  $('coverRemoveBtn').disabled = true;
-  $('coverTbody').innerHTML = '<tr><td colspan="6" class="small" style="padding:14px;">Loading\u2026</td></tr>';
-  $('coverModal').classList.remove('hidden');
-  try {
-    const data = await api('/api/covers/cards', { batch_id: batch.batch_id });
-    _coverCards = groupCoverRows(data.cards || []);
-    buildCoverFilters();
-    renderCoverRows();
-    $('coverRemoveBtn').disabled = _coverCards.length === 0;
-    if (!_coverCards.length) {
-      $('coverTbody').innerHTML = '<tr><td colspan="6" class="small" style="padding:14px;">No active cards left on this cover.</td></tr>';
-    }
-  } catch (e) {
-    $('coverTbody').innerHTML = `<tr><td colspan="6" class="small" style="padding:14px;">${escapeHtml(e.message || 'Could not load the cover.')}</td></tr>`;
-  }
-}
-
-function _fillCoverSelect(sel, values, allLabel) {
-  sel.innerHTML = '';
-  const all = document.createElement('option');
-  all.value = '';
-  all.textContent = allLabel;
-  sel.appendChild(all);
-  values.forEach(v => {
-    const o = document.createElement('option');
-    o.value = v;
-    o.textContent = v || '(none)';
-    sel.appendChild(o);
-  });
-  sel.style.display = values.length > 1 ? '' : 'none';
-}
-
-function buildCoverFilters() {
-  const pipes = Array.from(new Set(_coverCards.map(c => c.pipe_name || ''))).sort();
-  const clients = Array.from(new Set(_coverCards.map(c => c.client || ''))).sort();
-  _fillCoverSelect($('coverPipeFilter'), pipes, 'All pipes');
-  _fillCoverSelect($('coverClientFilter'), clients, 'All clients');
-}
-
-function coverRowVisible(c) {
-  const q = ($('coverSearch').value || '').toLowerCase();
-  const pipe = $('coverPipeFilter').value;
-  const client = $('coverClientFilter').value;
-  if (pipe !== '' && (c.pipe_name || '') !== pipe) return false;
-  if (client !== '' && (c.client || '') !== client) return false;
-  if (q && !(`${c.title} ${c.client} ${c.pipe_name} ${c.roles.join(' ')}`.toLowerCase().includes(q))) return false;
-  return true;
-}
-
-function renderCoverRows() {
-  const tbody = $('coverTbody');
-  tbody.innerHTML = '';
-  let shown = 0;
-  _coverCards.forEach(c => {
-    const visible = coverRowVisible(c);
-    const tr = document.createElement('tr');
-    tr.dataset.cardId = c.card_id;
-    tr.style.display = visible ? '' : 'none';
-    if (visible) shown++;
-    const cardCell = c.card_url
-      ? `<a href="${escapeAttr(c.card_url)}" target="_blank" rel="noopener">${escapeHtml(c.title || c.card_id)}</a>`
-      : escapeHtml(c.title || c.card_id);
-    tr.innerHTML = `
-      <td style="text-align:center;"><input type="checkbox" class="cover-pick" checked></td>
-      <td>${cardCell}</td>
-      <td class="small">${escapeHtml(c.pipe_name || '')}</td>
-      <td class="small">${escapeHtml(c.client || '')}</td>
-      <td class="small">${escapeHtml(c.roles.join(', '))}</td>
-      <td class="cover-state small">\u2014</td>
-    `;
-    tbody.appendChild(tr);
-  });
-  $('coverFilterCount').textContent = shown < _coverCards.length ? `showing ${shown} of ${_coverCards.length}` : '';
-  updateCoverSelection();
-}
-
-function coverSelectedIds() {
-  return Array.from($('coverTbody').querySelectorAll('tr'))
-    .filter(tr => tr.style.display !== 'none')
-    .filter(tr => { const cb = tr.querySelector('.cover-pick'); return cb && cb.checked && !cb.disabled; })
-    .map(tr => tr.dataset.cardId);
-}
-
-function updateCoverSelection() {
-  const n = coverSelectedIds().length;
-  $('coverRemoveBtn').disabled = _coverBusy || n === 0;
-  $('coverRemoveBtn').textContent = n ? `Remove from ${n} card${n === 1 ? '' : 's'}` : 'Remove co-assignee';
-}
-
-$('coverSearch').addEventListener('input', renderCoverRows);
-$('coverPipeFilter').addEventListener('change', renderCoverRows);
-$('coverClientFilter').addEventListener('change', renderCoverRows);
-$('coverSelectAll').addEventListener('change', (e) => {
-  $('coverTbody').querySelectorAll('tr').forEach(tr => {
-    if (tr.style.display === 'none') return;
-    const cb = tr.querySelector('.cover-pick');
-    if (cb && !cb.disabled) cb.checked = e.target.checked;
-  });
-  updateCoverSelection();
-});
-$('coverTbody').addEventListener('change', (e) => {
-  if (e.target.classList && e.target.classList.contains('cover-pick')) updateCoverSelection();
-});
-
-$('coverRemoveBtn').addEventListener('click', async () => {
-  if (!_coverBatch || _coverBusy) return;
-  const ids = coverSelectedIds();
-  if (!ids.length) return;
-  const who = _coverBatch.cover_user_name || _coverBatch.cover_user_email || 'the co-assignee';
-  if (!window.confirm(`Remove ${who} from ${ids.length} card${ids.length === 1 ? '' : 's'}? Only the roles this tool added them to are touched.`)) return;
-  _coverBusy = true;
-  $('coverRemoveBtn').disabled = true;
-  $('coverSpin').classList.add('on');
-  $('coverStatus').textContent = 'Removing\u2026 one card at a time.';
-  try {
-    const data = await api('/api/covers/remove', {
-      batch_id: _coverBatch.batch_id, card_ids: ids, operator_email: operatorEmail,
-    });
-    const byId = new Map((data.results || []).map(r => [String(r.card_id), r]));
-    $('coverTbody').querySelectorAll('tr').forEach(tr => {
-      const res = byId.get(tr.dataset.cardId);
-      if (!res) return;
-      const cell = tr.querySelector('.cover-state');
-      const cb = tr.querySelector('.cover-pick');
-      const okish = res.status === 'ok' || res.status === 'already_removed' || res.status === 'gone';
-      if (cell) {
-        const label = res.status === 'ok' ? 'removed'
-          : res.status === 'already_removed' ? 'already removed'
-          : res.status === 'gone' ? 'card deleted'
-          : res.status;
-        cell.innerHTML = `<span class="badge ${okish ? 'ok' : 'err'}">${escapeHtml(label)}</span>`;
-      }
-      if (cb && okish) { cb.checked = false; cb.disabled = true; }
-    });
-    const bits = [`${data.removed} removed`];
-    if (data.skipped) bits.push(`${data.skipped} already gone`);
-    if ((data.errors || []).length) bits.push(`${data.errors.length} error(s)`);
-    $('coverStatus').textContent = bits.join(' \u00b7 ') + (data.batch_ended ? ' \u2014 fully undone; removed from Saved changes.' : '');
-    loadCovers();
-  } catch (e) {
-    $('coverStatus').textContent = 'Remove failed: ' + (e.message || e);
-  } finally {
-    _coverBusy = false;
-    $('coverSpin').classList.remove('on');
-    updateCoverSelection();
-  }
-});
-
-function closeCoverModal() { $('coverModal').classList.add('hidden'); _coverBatch = null; }
-$('coverClose').addEventListener('click', closeCoverModal);
-$('coverModal').addEventListener('click', (e) => { if (e.target === $('coverModal')) closeCoverModal(); });
 
 initGate();
 </script>
@@ -3031,11 +2606,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
         cfg.audit_service_account_file,
         service_account_json=cfg.audit_service_account_json,
     )
-    cover_store = build_cover_store(
-        cfg.audit_sheet_id,
-        cfg.audit_service_account_file,
-        service_account_json=cfg.audit_service_account_json,
-    )
 
     @app.before_request
     def _require_session():
@@ -3060,6 +2630,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         return jsonify({
             "authed": bool(email) and is_allowed_email(email),
             "email": email,
+            "developer": email.endswith("@dydx.digital"),
             "password_required": password_required,
         })
 
@@ -3069,7 +2640,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "token_mask": mask_secret(cfg.pipefy_api_token),
             "default_excluded_phases": list(DEFAULT_EXCLUDED_PHASES),
             "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
-            "covers_enabled": cover_store is not None,
         })
 
     @app.post("/api/auth")
@@ -3102,25 +2672,41 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
     @app.get("/api/history")
     def api_history():
-        """Recent applies. Prefer the shared Google Sheet (everyone's applies,
-        survives redeploys); fall back to the local JSONL store when the
-        Sheet is unconfigured or unreachable."""
-        rows: List[Dict[str, Any]] = []
-        source = "local"
-        if audit_sheet_sink is not None:
+        def query_int(name: str, default: int, minimum: int, maximum: int) -> int:
             try:
-                rows = audit_sheet_sink.recent(limit=300, days=30)
-                source = "sheet"
-            except Exception as exc:  # noqa: BLE001 - Sheet down; local still works
-                log.warning("history: Sheet read failed, falling back to local: %s", exc)
-        if source == "local":
-            rows = audit_store.recent(limit=300, days=30)
+                return max(minimum, min(maximum, int(request.args.get(name, default))))
+            except (TypeError, ValueError):
+                return default
+
+        days = query_int("days", 30, 1, audit_store.retention_days)
+        limit = query_int("limit", 300, 1, 2000)
+        board = (request.args.get("board") or "").strip().casefold()
+        client_filter = (request.args.get("client") or "").strip().casefold()
+        user_filter = (request.args.get("user") or "").strip().casefold()
+        rows = audit_store.recent(limit=0, days=days)
+        if board:
+            rows = [r for r in rows if board in f"{r.get('pipe_name', '')} {r.get('pipe_id', '')}".casefold()]
+        if client_filter:
+            rows = [r for r in rows if client_filter in str(r.get("client") or "").casefold()]
+        if user_filter:
+            rows = [
+                r for r in rows
+                if user_filter in f"{r.get('old_user', '')} {r.get('new_user', '')}".casefold()
+            ]
+        rows = rows[:limit]
         return jsonify({
             "records": rows,
             "count": len(rows),
-            "source": source,
+            "days": days,
+            "retention_days": audit_store.retention_days,
             "sheet_sync": bool(cfg.audit_webhook_url) or audit_sheet_sink is not None,
         })
+
+    @app.get("/api/notifications")
+    def api_notifications():
+        with _LOG_LOCK:
+            notifications = list(reversed(_NOTIFICATION_RING))
+        return jsonify({"notifications": notifications, "count": len(notifications)})
 
     @app.get("/api/pipes")
     def api_pipes():
@@ -3128,6 +2714,8 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
     @app.post("/api/logs")
     def api_logs():
+        if not session.get("operator_email", "").casefold().endswith("@dydx.digital"):
+            return jsonify({"error": "Developer settings are restricted."}), 403
         body = request.get_json(force=True, silent=True) or {}
         try:
             since = int(body.get("since") or 0)
@@ -3216,11 +2804,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
           raise ValueError(f"Unsupported assignment operation: {operation}")
         field_ids = list(body.get("field_ids") or [])
         exclude_phases = list(body.get("exclude_phases") or DEFAULT_EXCLUDED_PHASES)
-        try:
-            max_age_days = int(body.get("max_age_days") or 0)
-        except (TypeError, ValueError):
-            max_age_days = 0
-        age_cutoff = (time.time() - max_age_days * 86400) if max_age_days > 0 else None
 
         pipe_ctx, old_u, new_u = _resolve_users(client, pipe_id, old_user, new_user, org_id_override)
         yield {
@@ -3273,7 +2856,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
         for card in card_source:
             cards_scanned += 1
-            if is_review_task_card(card) or card_older_than(card, age_cutoff):
+            if is_review_task_card(card):
                 cards_in_excluded += 1
                 plan = None
             else:
@@ -3333,10 +2916,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "pipe_name": pipe_ctx.get("pipe_name") or "",
             "old_user": f"{old_u.name} <{old_u.email}>".strip(),
             "new_user": f"{new_u.name} <{new_u.email}>".strip(),
-            "old_user_id": old_u.id,
-            "new_user_id": new_u.id,
-            "new_user_name": new_u.name or "",
-            "new_user_email": new_u.email or "",
             "operation": operation,
         }
 
@@ -3631,10 +3210,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
         }
         roles_narrowed = bool(roles_by_pipe) or bool(global_role_keys)
         throttle_ms = body.get("throttle_ms", 250)
-        try:
-            max_age_days = int(body.get("max_age_days") or 0)
-        except (TypeError, ValueError):
-            max_age_days = 0
         if not old_input or not new_input or not pipe_ids:
             return jsonify({"error": "old_user, new_user, and pipe_ids are required."}), 400
         names = {p["id"]: p["name"] for p in KNOWN_PIPES}
@@ -3693,7 +3268,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         "field_ids": list(fields.keys()),
                         "exclude_phases": exclude_by_pipe.get(pid, exclude_phases),
                         "throttle_ms": throttle_ms,
-                        "max_age_days": max_age_days,
                     }
                     plans_n = 0
                     try:
@@ -3728,227 +3302,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 }) + "\n"
             except Exception as exc:  # noqa: BLE001
                 log.exception("wizard scan stream failed")
-                yield json.dumps({"type": "error", "message": f"Scan failed: {exc}"}) + "\n"
-
-        resp = Response(_gen(), mimetype="application/x-ndjson")
-        resp.headers["Cache-Control"] = "no-cache, no-transform"
-        resp.headers["X-Accel-Buffering"] = "no"
-        return resp
-
-    # ---------- client-match assign mode ----------
-
-    @app.post("/api/assign/users")
-    def api_assign_users():
-        """Assign mode step 1: resolve the single person to add, org-wide."""
-        body = request.get_json(force=True, silent=True) or {}
-        user_input = (body.get("user") or "").strip()
-        org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
-        if not user_input:
-            return jsonify({"error": "user is required."}), 400
-        try:
-            user = _discover_resolve_user(client, KNOWN_PIPES, user_input, org_id_override)
-        except UserResolutionError as exc:
-            return jsonify({"error": str(exc)}), 400
-        except Exception as exc:  # noqa: BLE001 - network / API failure
-            log.exception("assign users failed")
-            return jsonify({"error": f"Pipefy API error: {exc}"}), 500
-        return jsonify({
-            "user": {"id": user.id, "name": user.name, "email": user.email},
-            "pipes": [{"id": p["id"], "name": p["name"]} for p in KNOWN_PIPES],
-        })
-
-    @app.post("/api/assign/scan/stream")
-    def api_assign_scan_stream():
-        """Assign mode scan (NDJSON stream): full-scan the selected pipes and
-        match cards whose title OR client field contains `match_text`
-        (case-insensitive). Matched cards get a plan adding the user to the
-        selected role fields. Events mirror the wizard scan, so the existing
-        /api/apply endpoint works per pipe unchanged (operation="add", covers
-        supported).
-        """
-        body = request.get_json(force=True, silent=True) or {}
-        user_input = (body.get("user") or "").strip()
-        match_text = (body.get("match_text") or "").strip()
-        org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
-        pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
-        exclude_phases = list(body.get("exclude_phases") or [])
-        raw_excl = body.get("exclude_phases_by_pipe") or {}
-        exclude_by_pipe = {
-            str(pid): [str(n) for n in (names_ or []) if n]
-            for pid, names_ in raw_excl.items()
-        } if isinstance(raw_excl, dict) else {}
-        raw_by_pipe = body.get("roles_by_pipe") or {}
-        roles_by_pipe = {
-            str(pid): {_norm_role_label(r) for r in (keys or []) if r}
-            for pid, keys in raw_by_pipe.items()
-        } if isinstance(raw_by_pipe, dict) else {}
-        throttle_ms = body.get("throttle_ms", 250)
-        try:
-            assign_max_age_days = int(body.get("max_age_days") or 0)
-        except (TypeError, ValueError):
-            assign_max_age_days = 0
-        age_cutoff = (time.time() - assign_max_age_days * 86400) if assign_max_age_days > 0 else None
-        if not user_input or not match_text or not pipe_ids:
-            return jsonify({"error": "user, match_text, and pipe_ids are required."}), 400
-        names = {p["id"]: p["name"] for p in KNOWN_PIPES}
-
-        def _gen():
-            try:
-                try:
-                    user = _discover_resolve_user(client, KNOWN_PIPES, user_input, org_id_override)
-                except UserResolutionError as exc:
-                    yield json.dumps({"type": "error", "message": str(exc), "kind": "resolution"}) + "\n"
-                    return
-                total_plans = 0
-                pipes_scanned = 0
-                for pid in pipe_ids:
-                    pname = names.get(pid, pid)
-                    try:
-                        fields = discover_assignee_fields(client, pid)
-                    except Exception as exc:  # noqa: BLE001
-                        yield json.dumps({
-                            "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
-                            "message": f"Could not discover fields: {exc}",
-                        }) + "\n"
-                        continue
-                    keys = roles_by_pipe.get(pid) or set()
-                    fields = {
-                        fid: m for fid, m in fields.items()
-                        if _norm_role_label(m.get("label") or fid) in keys
-                    }
-                    yield json.dumps({
-                        "type": "pipe_start", "pipe_id": pid, "pipe_name": pname,
-                        "fields": len(fields),
-                    }) + "\n"
-                    if not fields:
-                        yield json.dumps({
-                            "type": "pipe_done", "pipe_id": pid, "token": None,
-                            "plans": 0, "no_fields": True, "no_matching_roles": True,
-                        }) + "\n"
-                        pipes_scanned += 1
-                        continue
-                    excl = exclude_by_pipe.get(pid) or exclude_phases or list(DEFAULT_EXCLUDED_PHASES)
-                    try:
-                        phases_info = fetch_active_phases(client, pid, exclude_phases=excl)
-                        for ph in phases_info["skipped"]:
-                            yield json.dumps({"type": "phase_skip", "pipe_id": pid, "phase": ph["name"], "cards_count": ph["cards_count"], "done": ph["done"]}) + "\n"
-                        for ph in phases_info["active"]:
-                            yield json.dumps({"type": "phase_scan_start", "pipe_id": pid, "phase": ph["name"], "cards_count": ph["cards_count"]}) + "\n"
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("assign: phase meta probe failed for %s: %s", pid, exc)
-                    plans: List[Any] = []
-                    seen_ids: set = set()
-                    cards_scanned = 0
-                    cards_in_excluded = 0
-                    cards_already = 0
-
-                    def _plan_events(card):
-                        """Plan one matched card; returns NDJSON lines to emit."""
-                        nonlocal cards_in_excluded, cards_already
-                        plan = plan_assign_card(
-                            card,
-                            new_id=user.id,
-                            field_ids=set(fields.keys()),
-                            excluded_phases=excl,
-                            id_names={user.id: user.name},
-                            field_meta=fields,
-                        )
-                        if plan.skipped_reason:
-                            cards_in_excluded += 1
-                            return []
-                        if not plan.actions:
-                            cards_already += 1
-                            return []
-                        plans.append(plan)
-                        return [json.dumps({"type": "plan", "pipe_id": pid, "plan": _plan_to_dict(plan)}) + "\n"]
-
-                    def _progress():
-                        return json.dumps({
-                            "type": "progress", "pipe_id": pid,
-                            "cards_scanned": cards_scanned, "plans": len(plans),
-                            "in_excluded": cards_in_excluded, "already_swapped": cards_already,
-                        }) + "\n"
-
-                    # Fast path: server-side title search only downloads hits.
-                    title_search_ok = True
-                    try:
-                        for card in iter_cards_by_title(client, pid, match_text, exclude_phases=excl):
-                            cards_scanned += 1
-                            cid = str(card.get("id") or "")
-                            if cid:
-                                seen_ids.add(cid)
-                            if is_review_task_card(card) or card_older_than(card, age_cutoff):
-                                cards_in_excluded += 1
-                            else:
-                                for line in _plan_events(card):
-                                    yield line
-                            yield _progress()
-                    except Exception as exc:  # noqa: BLE001
-                        title_search_ok = False
-                        log.warning("assign: server-side title search failed for %s (%s); using full scan", pid, exc)
-
-                    # Fallback: full scan with client-side title matching, only
-                    # when the server-side title search errored.
-                    if not title_search_ok:
-                        try:
-                            for card in iter_cards(client, pid, exclude_phases=excl):
-                                cards_scanned += 1
-                                cid = str(card.get("id") or "")
-                                if (not cid or cid not in seen_ids) \
-                                        and match_text.lower() in (card.get("title") or "").lower():
-                                    if is_review_task_card(card) or card_older_than(card, age_cutoff):
-                                        cards_in_excluded += 1
-                                    else:
-                                        for line in _plan_events(card):
-                                            yield line
-                                if cards_scanned <= 50 or cards_scanned % 25 == 0:
-                                    yield _progress()
-                        except Exception as exc:  # noqa: BLE001
-                            log.exception("assign scan failed for pipe %s", pid)
-                            yield json.dumps({
-                                "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
-                                "message": f"Scan failed: {exc}",
-                            }) + "\n"
-                            continue
-                    summary = {
-                        "cards_scanned": cards_scanned,
-                        "cards_in_excluded": cards_in_excluded,
-                        "cards_already_swapped": cards_already,
-                        "card_level_changes": 0,
-                        "field_level_changes": sum(len(p.actions) for p in plans),
-                    }
-                    token = None
-                    if plans:
-                        token = secrets.token_urlsafe(16)
-                        _gc_preview_store()
-                        _PREVIEW_STORE[token] = {
-                            "created_at": time.time(),
-                            "plans": plans,
-                            "throttle_ms": int(throttle_ms or 250),
-                            "summary": summary,
-                            "pipe_id": pid,
-                            "pipe_name": pname,
-                            "old_user": f'client match \u201c{match_text}\u201d',
-                            "new_user": f"{user.name} <{user.email}>".strip(),
-                            "old_user_id": "",
-                            "new_user_id": user.id,
-                            "new_user_name": user.name or "",
-                            "new_user_email": user.email or "",
-                            "operation": "add",
-                        }
-                    yield json.dumps({"type": "summary", "pipe_id": pid, **summary}) + "\n"
-                    yield json.dumps({
-                        "type": "pipe_done", "pipe_id": pid, "token": token,
-                        "plans": len(plans), "operation": "add",
-                    }) + "\n"
-                    total_plans += len(plans)
-                    pipes_scanned += 1
-                yield json.dumps({
-                    "type": "all_done", "pipes_scanned": pipes_scanned,
-                    "total_plans": total_plans, "operation": "add",
-                }) + "\n"
-            except Exception as exc:  # noqa: BLE001
-                log.exception("assign scan stream failed")
                 yield json.dumps({"type": "error", "message": f"Scan failed: {exc}"}) + "\n"
 
         resp = Response(_gen(), mimetype="application/x-ndjson")
@@ -4000,26 +3353,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         errors: List[str] = []
         cards_changed = 0
         out_plans: List[Dict[str, Any]] = []
-        # Opt-in cover memory: when adding a co-assignee the operator can ask
-        # us to remember exactly which cards/fields were touched so the add
-        # can be undone later (see /api/covers/*). Collected per successful
-        # action, written once after the loop — always best-effort.
-        cover_req = body.get("cover") if isinstance(body.get("cover"), dict) else None
-        save_cover = bool(
-            cover_req and cover_req.get("save") and operation == "add" and cover_store is not None
-        )
-        cover_rows: List[Dict[str, Any]] = []
-        apply_id = str(body.get("apply_id") or "").strip()
-        cancelled = False
-        processed = 0
         for plan in selected:
-            if apply_id:
-                with _APPLY_CANCEL_LOCK:
-                    cancelled = apply_id in _APPLY_CANCEL
-                if cancelled:
-                    log.info("apply %s cancelled after %d card(s)", apply_id, processed)
-                    break
-            processed += 1
             results = execute_plan(client, plan, throttle_ms=throttle_ms)
             any_ok = False
             any_err = False
@@ -4031,19 +3365,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     err_msgs.append(str(err))
                 else:
                     any_ok = True
-                    if save_cover:
-                        cover_rows.append({
-                            "pipe_id": pipe_id,
-                            "pipe_name": pipe_name,
-                            "card_id": plan.card_id,
-                            "card_url": plan.card_url,
-                            "title": plan.title,
-                            "client": getattr(plan, "client", "") or "",
-                            "product": getattr(plan, "product", "") or "",
-                            "scope": action.scope,
-                            "field_id": action.field_id or "",
-                            "field_label": action.field_label or "",
-                        })
             status = "ok" if any_ok and not any_err else ("partial" if any_ok else "error")
             d = _plan_to_dict(plan)
             d["status"] = status
@@ -4070,10 +3391,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
             except Exception:  # noqa: BLE001 - audit must never block apply
                 log.exception("audit logging failed for card %s", plan.card_id)
 
-        # Cards skipped because of a mid-run cancel go back to "planned".
-        if cancelled:
-            remaining = selected[processed:] + remaining
-
         # Surface the untouched cards as still-planned so the UI can keep them
         # selectable for a follow-up Apply.
         for plan in remaining:
@@ -4081,38 +3398,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
             d["status"] = "planned"
             out_plans.append(d)
 
-        cover_saved = 0
-        if cover_rows and cover_req is not None and cover_store is not None:
-            try:
-                batch_id = str(cover_req.get("batch_id") or "").strip() or secrets.token_urlsafe(8)
-                cover_saved = cover_store.record(
-                    {
-                        "batch_id": batch_id,
-                        "name": str(cover_req.get("name") or "").strip()
-                        or f"{entry.get('new_user_name') or new_user} covering {old_user}",
-                        "leaver": old_user,
-                        "cover_user_id": entry.get("new_user_id") or "",
-                        "cover_user_name": entry.get("new_user_name") or "",
-                        "cover_user_email": entry.get("new_user_email") or "",
-                        "start_date": str(cover_req.get("start_date") or "").strip(),
-                        "end_date": str(cover_req.get("end_date") or "").strip(),
-                        "created_by": operator_email,
-                    },
-                    cover_rows,
-                )
-            except Exception:  # noqa: BLE001 - cover memory must never block apply
-                log.exception("cover store write failed (apply succeeded)")
-
-        if apply_id:
-            with _APPLY_CANCEL_LOCK:
-                _APPLY_CANCEL.discard(apply_id)
-
         if remaining:
             entry["plans"] = remaining
             entry["created_at"] = time.time()
         elif token:
             _PREVIEW_STORE.pop(token, None)
-        _gc_preview_store()
 
         return jsonify({
             **summary,
@@ -4121,195 +3411,6 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "plans": out_plans,
             "remaining": len(remaining),
             "operation": operation,
-            "cover_saved": cover_saved,
-            "cancelled": cancelled,
-        })
-
-    @app.post("/api/apply/cancel")
-    def api_apply_cancel():
-        """Flag an in-flight apply to stop after the card it's currently on.
-        Safe to call for unknown/finished ids — the flag is simply discarded
-        when the apply loop ends."""
-        body = request.get_json(force=True, silent=True) or {}
-        apply_id = str(body.get("apply_id") or "").strip()
-        if not apply_id:
-            return jsonify({"error": "apply_id is required."}), 400
-        with _APPLY_CANCEL_LOCK:
-            _APPLY_CANCEL.add(apply_id)
-        log.info("apply %s: cancel requested", apply_id)
-        return jsonify({"ok": True})
-
-    # ---------- cover batches (undo a co-assignee add) ----------
-
-    @app.get("/api/covers")
-    def api_covers():
-        if cover_store is None:
-            return jsonify({"covers": [], "enabled": False})
-        try:
-            return jsonify({"covers": cover_store.list_batches(), "enabled": True})
-        except Exception as exc:  # noqa: BLE001 - sheet unreachable
-            log.exception("cover list failed")
-            return jsonify({"error": f"Could not read covers: {exc}"}), 500
-
-    @app.post("/api/covers/cards")
-    def api_cover_cards():
-        if cover_store is None:
-            return jsonify({"error": "Cover storage is not configured."}), 400
-        body = request.get_json(force=True, silent=True) or {}
-        batch_id = str(body.get("batch_id") or "").strip()
-        if not batch_id:
-            return jsonify({"error": "batch_id is required."}), 400
-        try:
-            return jsonify({"cards": cover_store.list_cards(batch_id)})
-        except Exception as exc:  # noqa: BLE001
-            log.exception("cover cards failed")
-            return jsonify({"error": f"Could not read cover cards: {exc}"}), 500
-
-    @app.post("/api/covers/remove")
-    def api_cover_remove():
-        """Undo a cover: remove the co-assignee from the selected stored cards.
-
-        Per card: one fresh read (Pipefy mutations SET the whole assignee
-        list, so we must compute `current minus user`), then one write per
-        recorded scope where the user is still present. Cards where they're
-        already gone are marked removed without any mutation — the whole
-        flow is idempotent and safe to re-run.
-        """
-        if cover_store is None:
-            return jsonify({"error": "Cover storage is not configured."}), 400
-        body = request.get_json(force=True, silent=True) or {}
-        operator_email = normalize_email(
-            session.get("operator_email") or body.get("operator_email")
-        )
-        if not is_allowed_email(operator_email):
-            return jsonify({
-                "error": "A valid company email is required before applying changes.",
-                "allowed_domains": sorted(ALLOWED_EMAIL_DOMAINS),
-            }), 403
-        batch_id = str(body.get("batch_id") or "").strip()
-        if not batch_id:
-            return jsonify({"error": "batch_id is required."}), 400
-        try:
-            throttle_ms = int(body.get("throttle_ms", 250))
-        except (TypeError, ValueError):
-            throttle_ms = 250
-
-        try:
-            rows = cover_store.list_cards(batch_id)
-            batches = [b for b in cover_store.list_batches(status=None) if b["batch_id"] == batch_id]
-        except Exception as exc:  # noqa: BLE001
-            log.exception("cover read failed")
-            return jsonify({"error": f"Could not read the cover from the Sheet: {exc}"}), 500
-        if not batches:
-            return jsonify({"error": "Cover not found. It may already be ended."}), 404
-        batch = batches[0]
-        user_id = str(batch.get("cover_user_id") or "")
-        if not user_id:
-            return jsonify({"error": "This cover has no stored user id; remove manually in Pipefy."}), 400
-        user_label = f"{batch.get('cover_user_name') or ''} <{batch.get('cover_user_email') or ''}>".strip()
-
-        raw_ids = body.get("card_ids")
-        if isinstance(raw_ids, list) and raw_ids:
-            wanted = {str(x) for x in raw_ids}
-            rows = [r for r in rows if str(r.get("card_id")) in wanted]
-        if not rows:
-            return jsonify({"error": "No matching active cards in this cover."}), 400
-
-        # Group the stored rows by card: each card gets ONE read + the
-        # removal scopes recorded for it.
-        by_card: Dict[str, List[Dict[str, Any]]] = {}
-        for r in rows:
-            by_card.setdefault(str(r.get("card_id")), []).append(r)
-
-        results: List[Dict[str, Any]] = []
-        errors: List[str] = []
-        removed = 0
-        skipped = 0
-        done_ids: set = set()
-        for card_id, card_rows in by_card.items():
-            field_ids = {r["field_id"] for r in card_rows if r.get("field_id")}
-            include_card_level = any((r.get("scope") or "") == "card" for r in card_rows)
-            base = {
-                "card_id": card_id,
-                "card_url": card_rows[0].get("card_url") or "",
-                "title": card_rows[0].get("title") or "",
-                "pipe_name": card_rows[0].get("pipe_name") or "",
-            }
-            try:
-                card = fetch_card(client, card_id)
-            except Exception as exc:  # noqa: BLE001 - network/API
-                errors.append(f"{base['card_url'] or card_id}: {exc}")
-                results.append({**base, "status": "error", "detail": str(exc)})
-                continue
-            if card is None:
-                # Card deleted — nothing left to undo; clear the record.
-                done_ids.add(card_id)
-                skipped += 1
-                results.append({**base, "status": "gone", "detail": "Card no longer exists."})
-                continue
-            plan = plan_remove_card(
-                card,
-                user_id=user_id,
-                field_ids=field_ids,
-                include_card_level=include_card_level,
-                id_names={user_id: batch.get("cover_user_name") or ""},
-            )
-            if not plan.actions:
-                done_ids.add(card_id)
-                skipped += 1
-                results.append({**base, "status": "already_removed",
-                                "detail": "User no longer on the recorded fields."})
-                continue
-            exec_results = execute_plan(client, plan, throttle_ms=throttle_ms)
-            err_msgs = [str(err) for _, err in exec_results if err]
-            any_ok = any(err is None for _, err in exec_results)
-            status = "ok" if any_ok and not err_msgs else ("partial" if any_ok else "error")
-            if any_ok and not err_msgs:
-                done_ids.add(card_id)
-                removed += 1
-            else:
-                errors.extend(f"{base['card_url'] or card_id}: {m}" for m in err_msgs)
-            d = _plan_to_dict(plan)
-            results.append({**base, "status": status, "detail": "; ".join(err_msgs),
-                            "actions": d["actions"]})
-            # Audit the removal like any other apply.
-            try:
-                record_swap(
-                    store=audit_store,
-                    webhook_url=cfg.audit_webhook_url,
-                    operator_email=operator_email,
-                    source="web",
-                    pipe_id=card_rows[0].get("pipe_id") or "",
-                    pipe_name=base["pipe_name"],
-                    old_user=user_label,
-                    new_user="",
-                    plan_dict=d,
-                    status=status,
-                    error="; ".join(err_msgs),
-                    operation="remove",
-                    sheet_sink=audit_sheet_sink,
-                )
-            except Exception:  # noqa: BLE001 - audit must never block
-                log.exception("audit logging failed for cover removal %s", card_id)
-
-        batch_ended = False
-        if done_ids:
-            try:
-                batch_ended = cover_store.mark_cards_removed(batch_id, done_ids)
-            except Exception:  # noqa: BLE001 - Pipefy is already updated
-                log.exception("cover store update failed after removal")
-                errors.append(
-                    "Pipefy was updated, but the cover records could not be marked "
-                    "removed in the Sheet — re-running is safe (already-removed "
-                    "cards are skipped)."
-                )
-
-        return jsonify({
-            "removed": removed,
-            "skipped": skipped,
-            "errors": errors,
-            "results": results,
-            "batch_ended": batch_ended,
         })
 
     return app
