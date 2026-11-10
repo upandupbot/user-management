@@ -30,6 +30,9 @@ JSONL store.
 from __future__ import annotations
 
 import logging
+import ssl
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -78,6 +81,35 @@ def load_sheet_credentials(
         return None
 
 
+class ThreadLocalSheetsService:
+    """One Sheets API client per server thread.
+
+    The Google client sends requests over a single httplib2 connection that
+    is not thread-safe. With gunicorn's 4 threads, two requests reading the
+    Sheet at once (e.g. History and the notification bell after sign-in)
+    corrupted the shared TLS stream ("decryption failed or bad record mac",
+    "[SSL] internal error"). Giving each thread its own client avoids that
+    without serialising every call.
+    """
+
+    def __init__(self, credentials: Any) -> None:
+        self._credentials = credentials
+        self._local = threading.local()
+
+    def get(self):
+        svc = getattr(self._local, "svc", None)
+        if svc is None:
+            from googleapiclient.discovery import build  # lazy import
+
+            svc = build("sheets", "v4", credentials=self._credentials, cache_discovery=False)
+            self._local.svc = svc
+        return svc
+
+    def reset(self) -> None:
+        """Drop this thread's client (and its connection) after a transport error."""
+        self._local.svc = None
+
+
 def _cell(value: Any) -> Any:
     """Coerce a record value into something the Sheets API accepts."""
     if value is None:
@@ -98,18 +130,34 @@ def _ts_epoch(ts: Any) -> float:
 class GoogleSheetSink:
     """Appends audit rows to a tab of a Google Sheet via the Sheets API."""
 
-    def __init__(self, sheet_id: str, credentials: Any, *, tab: str = "Audit") -> None:
-        from googleapiclient.discovery import build  # lazy import
+    # History and the notification bell both read the whole tab, usually at
+    # the same moment; share one read between them for a short while.
+    CACHE_SECONDS = 30.0
 
+    def __init__(self, sheet_id: str, credentials: Any, *, tab: str = "Audit") -> None:
         self.sheet_id = sheet_id
         self.tab = tab
-        self._svc = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+        self._clients = ThreadLocalSheetsService(credentials)
+        self._clients.get()  # fail fast at startup if the client can't be built
         self._ensured = False
+        self._ensure_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._cache: Optional[List[List[Any]]] = None
+        self._cache_at = 0.0
+
+    @property
+    def _svc(self):
+        return self._clients.get()
 
     def _ensure(self) -> None:
         """Make sure the target tab and a header row exist (idempotent)."""
         if self._ensured:
             return
+        with self._ensure_lock:
+            if not self._ensured:
+                self._ensure_locked()
+
+    def _ensure_locked(self) -> None:
         meta = self._svc.spreadsheets().get(spreadsheetId=self.sheet_id).execute()
         titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
         if self.tab not in titles:
@@ -149,7 +197,29 @@ class GoogleSheetSink:
             insertDataOption="INSERT_ROWS",
             body={"values": rows},
         ).execute()
+        with self._cache_lock:
+            self._cache = None  # next History read includes these rows
         return True
+
+    def _read_values(self) -> List[List[Any]]:
+        """All data rows of the tab, cached for CACHE_SECONDS. Retries once on
+        a dropped or broken connection, with a fresh client."""
+        with self._cache_lock:
+            if self._cache is not None and time.monotonic() - self._cache_at < self.CACHE_SECONDS:
+                return self._cache
+        self._ensure()
+        last_col = chr(ord("A") + len(AUDIT_COLUMNS) - 1)
+        rng = f"{self.tab}!A2:{last_col}"
+        try:
+            resp = self._svc.spreadsheets().values().get(spreadsheetId=self.sheet_id, range=rng).execute()
+        except (ssl.SSLError, ConnectionError, TimeoutError) as exc:
+            log.info("Sheet read hit a connection error (%s); retrying with a fresh client", exc)
+            self._clients.reset()
+            resp = self._svc.spreadsheets().values().get(spreadsheetId=self.sheet_id, range=rng).execute()
+        values = resp.get("values") or []
+        with self._cache_lock:
+            self._cache, self._cache_at = values, time.monotonic()
+        return values
 
     def recent(self, *, limit: int = 300, days: Optional[int] = 30) -> List[Dict[str, Any]]:
         """Read back the newest audit rows (newest first) from the shared tab.
@@ -158,17 +228,10 @@ class GoogleSheetSink:
         JSONL store resets on redeploy and only ever has one machine's applies,
         while the Sheet has everyone's.
         """
-        self._ensure()
-        last_col = chr(ord("A") + len(AUDIT_COLUMNS) - 1)
-        resp = (
-            self._svc.spreadsheets()
-            .values()
-            .get(spreadsheetId=self.sheet_id, range=f"{self.tab}!A2:{last_col}")
-            .execute()
-        )
+        values = self._read_values()
         cutoff = (datetime.now(timezone.utc).timestamp() - days * 86400) if days else float("-inf")
         out: List[Dict[str, Any]] = []
-        for raw in resp.get("values") or []:
+        for raw in values:
             rec = {col: (raw[i] if i < len(raw) else "") for i, col in enumerate(AUDIT_COLUMNS)}
             if _ts_epoch(rec.get("ts")) >= cutoff:
                 out.append(rec)
