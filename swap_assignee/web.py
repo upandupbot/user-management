@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -58,6 +59,7 @@ from .user_resolver import (
 from .audit import (
     ALLOWED_EMAIL_DOMAINS,
     AuditStore,
+    email_domain,
     is_allowed_email,
     normalize_email,
     record_swap,
@@ -73,6 +75,56 @@ _LOG_RING: Deque[Dict[str, Any]] = collections.deque(maxlen=500)
 _NOTIFICATION_RING: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
 _LOG_SEQ = {"n": 0}
 _LOG_LOCK = threading.Lock()
+
+
+def _email_domains_in_text(*values: Any) -> set[str]:
+  domains: set[str] = set()
+  for value in values:
+    domains.update(re.findall(r"[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})", str(value or ""), re.IGNORECASE))
+  return {d.casefold() for d in domains}
+
+
+def _agency_label(email: str) -> str:
+  domain = email_domain(email)
+  labels = {
+    "dydx.digital": "DYDX Digital",
+    "upandupgroup.com": "Up&Up",
+    "theupandupgroup.com": "Up&Up",
+    "levergy.co.za": "Levergy",
+    "mcsaatchiabel.co.za": "M&C Saatchi Abel",
+    "upandupconnect.com": "Up&Up Connect",
+    "inblackandwhite.co.za": "In Black & White",
+    "razorpr.co.za": "Razor PR",
+  }
+  return labels.get(domain, domain or "the team")
+
+
+def _person_label(value: str) -> str:
+  text = str(value or "").strip()
+  text = re.sub(r"\s*<[^>]+>", "", text).strip()
+  if "@" in text:
+    text = text.split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ")
+  return text or "Someone"
+
+
+def _change_notification(record: Dict[str, Any]) -> Dict[str, Any]:
+  operator = _person_label(str(record.get("operator_email") or record.get("os_user") or "Someone"))
+  old_user = _person_label(str(record.get("old_user") or "the previous assignee"))
+  new_user = _person_label(str(record.get("new_user") or "the new assignee"))
+  agency = _agency_label(str(record.get("operator_email") or record.get("old_user") or ""))
+  location = str(record.get("client") or record.get("pipe_name") or record.get("title") or "a Pipefy card")
+  if record.get("operation") == "add":
+    message = f"{operator} added {new_user} to {agency} work for {location}."
+  else:
+    message = f"{operator} removed {old_user} and assigned {new_user} on {agency} work for {location}."
+  return {
+    "id": "change:" + ":".join(str(record.get(k) or "") for k in ("ts", "operator_email", "pipe_id", "card_id", "old_user", "new_user", "operation")),
+    "ts": record.get("ts"),
+    "kind": "change",
+    "severity": "change",
+    "title": "Assignee change",
+    "message": message,
+  }
 
 
 class _RingHandler(logging.Handler):
@@ -91,14 +143,16 @@ class _RingHandler(logging.Handler):
                 "msg": msg,
             }
             _LOG_RING.append(entry)
-            if record.levelno >= logging.WARNING:
-              _NOTIFICATION_RING.append({
-                "id": entry["seq"],
-                "ts": entry["ts"],
-                "severity": "error" if record.levelno >= logging.ERROR else "warning",
-                "title": "Server error" if record.levelno >= logging.ERROR else "Needs attention",
-                "message": msg,
-              })
+            optional_dependency_notice = "Google API libraries not installed" in msg
+            if record.levelno >= logging.WARNING and not optional_dependency_notice:
+                _NOTIFICATION_RING.append({
+                    "id": entry["seq"],
+                    "ts": entry["ts"],
+                    "kind": "system",
+                    "severity": "error" if record.levelno >= logging.ERROR else "warning",
+                    "title": "Developer error" if record.levelno >= logging.ERROR else "Developer warning",
+                    "message": msg,
+                })
 
 
 def _install_log_capture() -> None:
@@ -250,38 +304,40 @@ INDEX_HTML = r"""<!doctype html>
 
     /* ---------- Header ---------- */
     header {
-      background: var(--bg);
-      padding: 30px 40px 24px;
-      border-bottom: 1px solid var(--rule);
+      background: #000;
+      padding: 16px 40px 14px;
+      border-bottom: 4px solid var(--coral);
     }
     .wrap { max-width: 1140px; margin: 0 auto; }
-    .topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+    .topbar { display: flex; align-items: center; justify-content: flex-start; gap: 20px; flex-wrap: wrap; }
     .brand {
       font-family: "Bodoni Moda", "Bodoni MT", Didot, Georgia, serif;
       font-weight: 800;
-      font-size: 64px;
-      line-height: 0.9;
+      font-size: 30px;
+      line-height: 0.95;
       letter-spacing: -0.03em;
       user-select: none;
-      color: var(--ink);
+      color: #fff;
       text-transform: lowercase;
     }
     .brand .b1 { color: var(--coral); }
     .brand .b2 {
-      color: var(--blush);
+      color: #f9bec0;
       font-family: "Inter", -apple-system, "Segoe UI", sans-serif;
       font-weight: 800;
       letter-spacing: -0.05em;
     }
-    .brand .amp {
-      font-style: italic;
-      font-weight: 700;
-      color: var(--ink);
-      padding: 0 2px;
-    }
+    .brand-lockup { display: flex; flex-direction: column; align-items: flex-end; min-width: 150px; }
+    .brand-meta { color: #fff; font-size: 11px; line-height: 1; }
+    .brand-meta b { color: #fff; margin-right: 4px; }
+    .header-divider { width: 1px; align-self: stretch; background: #fff; opacity: .8; }
+    .product-heading { display: flex; flex-direction: column; gap: 2px; margin-right: auto; }
+    .product-heading strong { color: #fff; font-size: 24px; line-height: 1.1; }
+    .product-heading span { color: var(--coral); font-size: 13px; }
+    .header-mark { color: #fff; font-size: 34px; line-height: 1; transform: rotate(180deg); }
     .sub {
       margin: 0;
-      color: var(--ink);
+      color: #fff;
       font-size: 11px;
       font-weight: 600;
       letter-spacing: 0.22em;
@@ -290,18 +346,29 @@ INDEX_HTML = r"""<!doctype html>
       max-width: 280px;
     }
     .sub .dot { color: var(--coral); margin: 0 6px; }
+    .header-user { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; font-size: 12px; white-space: nowrap; }
+    .header-user b { color: #fff; font-weight: 600; }
+    .header-user a { color: var(--coral); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
     .notif-wrap { position: relative; margin-left: auto; }
     .notif-button {
       position: relative;
-      width: 42px; height: 42px;
+      width: 42px !important; height: 42px !important; min-width: 42px;
+      max-width: 42px; flex: 0 0 42px;
       border: 1px solid var(--border);
-      border-radius: 50%;
+      border-radius: 50% !important;
       background: var(--surface);
       color: var(--ink);
       cursor: pointer;
-      font-size: 19px;
+      padding: 0 !important;
+      font-size: 0;
       line-height: 1;
+      letter-spacing: 0;
+      text-transform: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
+    .notif-button svg { width: 19px; height: 19px; fill: none; stroke: #111; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
     .notif-button:hover { border-color: var(--coral); color: var(--coral); }
     .notif-badge {
       position: absolute; top: -5px; right: -5px;
@@ -992,9 +1059,13 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--border);
       border-left: 4px solid var(--coral);
       border-radius: 10px;
-      background: var(--surface-2);
+      background: #fff;
     }
-    .notice.error { border-left-color: var(--danger); }
+    .notice.error { border-left-color: var(--ink); }
+    .notice.change { border-left-color: var(--coral); }
+    .notice .badge.warn,
+    .notice .badge.change { color: var(--coral); }
+    .notice .badge.err { color: var(--ink); }
     .notice-title { font-weight: 700; }
     .notice-message { color: var(--muted); font-size: 13px; }
     @media (max-width: 700px) {
@@ -1134,6 +1205,13 @@ INDEX_HTML = r"""<!doctype html>
 
     @media (max-width: 640px) {
       header, .hero { padding-left: 20px; padding-right: 20px; }
+      header { padding-top: 12px; padding-bottom: 10px; }
+      .brand-lockup { min-width: 112px; }
+      .brand { font-size: 24px; }
+      .brand-meta { font-size: 9px; }
+      .header-divider, .header-mark, .product-heading span { display: none; }
+      .product-heading strong { font-size: 18px; }
+      .header-user { font-size: 10px; }
       main { padding-left: 20px; padding-right: 20px; }
       .hero .wrap { grid-template-columns: 1fr; gap: 20px; }
       .hero .kicker { max-width: none; text-align: left; padding-bottom: 0; }
@@ -1144,6 +1222,47 @@ INDEX_HTML = r"""<!doctype html>
       .panel-head .hint { grid-column: 2; text-align: left; max-width: none; }
       .scan-card .sc-body { padding: 22px 20px; }
       .scan-card .sc-foot { align-items: flex-start; flex-direction: column; padding: 14px 20px; }
+    }
+
+    /* ---------- final mock-up alignment ---------- */
+    .notif-button:hover,
+    .notif-button:focus-visible { background: #fff; color: #111; }
+    .notif-button:hover svg,
+    .notif-button:focus-visible svg { stroke: #111; }
+    .hero { padding: 34px 40px 32px; }
+    .hero .wrap { display: block; max-width: 860px; }
+    .hero .eyebrow {
+      display: inline-block; padding: 3px 11px; border-radius: 999px;
+      background: var(--coral); color: #fff; font-size: 11.5px;
+      font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    }
+    .hero h1 {
+      margin: 14px 0 12px; font-size: 42px; line-height: 1.1;
+      letter-spacing: -.02em; text-transform: none;
+    }
+    .hero h1 em { text-decoration: underline; text-decoration-color: var(--coral); text-decoration-thickness: 4px; text-underline-offset: 5px; }
+    .hero p { margin: 0; max-width: 600px; font-size: 18px; color: var(--ink); }
+    .hero p.sub { margin-top: 8px; max-width: 600px; font-size: 14.5px; color: var(--ink-2); font-weight: 400; letter-spacing: 0; text-align: left; text-transform: none; }
+    .hero p.sub b { color: var(--coral-deep); }
+    .hero .kicker { display: none; }
+    main.wrap { max-width: 860px; }
+    .panel { background: #fff; border: 1px solid var(--ink); border-radius: 6px; box-shadow: none; padding: 0; margin: 0 0 18px; overflow: hidden; }
+    .panel-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px; margin: 0; border-bottom: 1px solid var(--border); }
+    .panel-head .step { width: 26px; height: 26px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center; background: var(--coral); color: #fff; font-family: "Inter", sans-serif; font-size: 13px; font-style: normal; font-weight: 700; line-height: 1; letter-spacing: 0; }
+    .panel-head h2 { font-size: 17px; line-height: 1.2; letter-spacing: 0; text-transform: none; }
+    .panel-head .hint { margin-left: auto; max-width: 280px; font-size: 12.5px; letter-spacing: 0; line-height: 1.4; text-transform: none; }
+    .panel > .operation-picker, .panel > .row, .panel > .resolved, .panel > .col, .panel > .actions, .panel > .alert, .panel > #scanSummary, .panel > #pipeGroups, .panel > #phasesAlerts, .panel > #usersAlerts, .panel > #pipesAlerts { margin-left: 18px; margin-right: 18px; }
+    .panel > .operation-picker { margin-top: 18px; }
+    .panel > .actions { margin-bottom: 18px; }
+    .panel > #pipeGroups { margin-bottom: 18px; }
+    @media (max-width: 640px) {
+      .hero { padding: 26px 20px 24px; }
+      .hero h1 { font-size: 32px; }
+      .hero p { font-size: 16px; }
+      .hero p.sub { font-size: 13.5px; }
+      .panel-head { display: flex; padding: 14px 16px; }
+      .panel-head .step { width: 24px; height: 24px; font-size: 12px; }
+      .panel-head .hint { margin-left: auto; text-align: right; }
     }
   </style>
 </head>
@@ -1176,10 +1295,19 @@ INDEX_HTML = r"""<!doctype html>
 
 <header>
   <div class="wrap topbar">
-    <div class="brand"><span class="b1">slip</span><span class="b2">stream</span></div>
+    <div class="brand-lockup">
+      <div class="brand"><span class="b1">slip</span><span class="b2">stream</span></div>
+      <div class="brand-meta"><b>up&amp;up</b> group</div>
+    </div>
+    <div class="header-divider"></div>
+    <div class="product-heading">
+      <strong>Assignee Swap</strong>
+      <span>User management tool for Slipstream</span>
+    </div>
+    <div class="header-mark" aria-hidden="true">↔</div>
     <div class="notif-wrap">
       <button id="notificationsBell" class="notif-button" type="button" aria-label="Open notifications" title="Notifications">
-        &#128276;<span id="notificationsBadge" class="notif-badge hidden">0</span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg><span id="notificationsBadge" class="notif-badge hidden">0</span>
       </button>
       <div id="notificationsPopover" class="notif-popover hidden" role="dialog" aria-label="Notifications">
         <div class="notif-popover-head">
@@ -1187,18 +1315,23 @@ INDEX_HTML = r"""<!doctype html>
           <button id="notificationsRefresh" class="ghost" type="button" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
           <span class="small" id="notificationsStatus">&mdash;</span>
         </div>
-        <p class="small">Actionable warnings and errors from scans, applies, authentication, and audit delivery.</p>
+        <p class="small">Changes made by or affecting your agency, plus developer errors for DYDX Digital.</p>
         <div id="notificationsList" class="notice-list"></div>
       </div>
     </div>
-    <div class="sub">An Up<span class="amp">&amp;</span>Up Tool <span class="dot">&bull;</span> Pipefy Operations</div>
+    <div class="header-user">
+      <b id="whoEmail">Signed out</b>
+      <a id="signOutLink" href="#">Sign out</a>
+    </div>
   </div>
 </header>
 
 <section class="hero">
   <div class="wrap">
-    <h1>Swap <em>people</em>,<br>not pipelines.</h1>
-    <div class="kicker"><span class="rule"></span>Bulk reassignment for Pipefy &mdash; preview every change before a single card moves.</div>
+    <span class="eyebrow">An Up&amp;Up tool</span>
+    <h1>Swap <em>people</em>, not pipelines.</h1>
+    <p>Move or add people on lots of Slipstream cards at once.</p>
+    <p class="sub">Use it when someone leaves, goes on leave or joins a client team. <b>Nothing changes until you click Apply.</b></p>
   </div>
 </section>
 
@@ -2470,8 +2603,15 @@ function showGate() {
 
 function unlockApp(email) {
   operatorEmail = email;
+  $('whoEmail').textContent = email || 'Signed in';
   $('gateBackdrop').classList.add('hidden');
   $('oldUser').focus();
+}
+
+async function signOut() {
+  try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+  try { localStorage.removeItem(GATE_KEY); } catch (e) {}
+  window.location.reload();
 }
 
 async function submitGate() {
@@ -2499,6 +2639,7 @@ async function submitGate() {
 $('gateGo').addEventListener('click', submitGate);
 $('gateEmail').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitGate(); });
 $('gatePw').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitGate(); });
+$('signOutLink').addEventListener('click', (e) => { e.preventDefault(); signOut(); });
 
 async function initGate() {
   let saved = '';
@@ -2571,7 +2712,7 @@ async function loadNotifications() {
     badge.classList.toggle('hidden', rows.length === 0);
     list.innerHTML = rows.length ? rows.map(n =>
       `<div class="notice ${escapeHtml(n.severity || '')}">` +
-      `<span class="badge ${n.severity === 'error' ? 'err' : 'warn'}">${escapeHtml(n.severity || 'notice')}</span>` +
+      `<span class="badge ${n.severity === 'error' ? 'err' : (n.kind === 'change' ? 'change' : 'warn')} ">${escapeHtml(n.severity === 'change' ? 'change' : (n.severity || 'notice'))}</span>` +
       `<div><div class="notice-title">${escapeHtml(n.title || 'Notification')}</div>` +
       `<div class="notice-message">${escapeHtml(n.message || '')}</div></div>` +
       `<span class="small">${escapeHtml(fmtNoticeTs(n.ts))}</span></div>`
@@ -2780,6 +2921,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
         log.info("auth: %s signed in", email)
         return jsonify({"ok": True, "email": email})
 
+    @app.post("/api/logout")
+    def api_logout():
+        session.clear()
+        return jsonify({"ok": True})
+
     @app.get("/api/history")
     def api_history():
         def query_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -2814,8 +2960,26 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
     @app.get("/api/notifications")
     def api_notifications():
+        viewer = normalize_email(session.get("operator_email") or "")
+        viewer_domain = email_domain(viewer)
+        is_developer = viewer_domain == "dydx.digital"
+        records = audit_store.recent(limit=1000, days=30)
+        seen: set[str] = set()
+        notifications: List[Dict[str, Any]] = []
+        for record in records:
+            key = ":".join(str(record.get(k) or "") for k in ("ts", "operator_email", "pipe_id", "card_id", "old_user", "new_user", "operation"))
+            if key in seen or record.get("status") not in {"ok", "partial", "error"}:
+                continue
+            seen.add(key)
+            domains = _email_domains_in_text(
+                record.get("operator_email"), record.get("old_user"), record.get("new_user")
+            )
+            if is_developer or viewer_domain in domains:
+                notifications.append(_change_notification(record))
         with _LOG_LOCK:
-            notifications = list(reversed(_NOTIFICATION_RING))
+            if is_developer:
+                notifications.extend(reversed(_NOTIFICATION_RING))
+        notifications.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
         return jsonify({"notifications": notifications, "count": len(notifications)})
 
     @app.get("/api/pipes")

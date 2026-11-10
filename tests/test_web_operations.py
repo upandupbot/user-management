@@ -140,3 +140,40 @@ def test_notifications_api_returns_notification_collection(monkeypatch):
     assert response.status_code == 200
     payload = response.get_json()
     assert isinstance(payload["notifications"], list)
+
+
+def test_notifications_are_scoped_by_viewer_agency(monkeypatch):
+    records = [
+        {
+            "ts": "2026-11-10T10:00:00Z", "operator_email": "simphiwe@levergy.co.za",
+            "old_user": "Magda <magda@levergy.co.za>", "new_user": "Simphiwe <simphiwe@levergy.co.za>",
+            "pipe_id": "1", "card_id": "C1", "pipe_name": "Creative", "client": "Acme",
+            "operation": "replace", "status": "ok",
+        },
+        {
+            "ts": "2026-11-10T09:00:00Z", "operator_email": "operator@upandupgroup.com",
+            "old_user": "Old <old@upandupgroup.com>", "new_user": "New <new@upandupgroup.com>",
+            "pipe_id": "1", "card_id": "C2", "pipe_name": "Creative", "client": "Globex",
+            "operation": "replace", "status": "ok",
+        },
+    ]
+
+    class FakeAuditStore:
+        retention_days = 365
+
+        def recent(self, **kwargs):
+            return records
+
+    monkeypatch.setattr(web, "AuditStore", FakeAuditStore)
+
+    client = _client(monkeypatch)
+    client.post("/api/auth", json={"email": "person@levergy.co.za"})
+    levergy = client.get("/api/notifications").get_json()["notifications"]
+    assert len(levergy) == 1
+    assert "Magda" in levergy[0]["message"]
+    assert "Globex" not in levergy[0]["message"]
+
+    client = _client(monkeypatch)
+    client.post("/api/auth", json={"email": "developer@dydx.digital"})
+    dydx = client.get("/api/notifications").get_json()["notifications"]
+    assert len(dydx) >= 2
