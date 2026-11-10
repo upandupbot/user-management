@@ -66,6 +66,7 @@ from .user_resolver import (
     fetch_pipe_context,
     resolve_user,
 )
+from .history_groups import change_mode, client_match_text, group_changes, person_label as _person_label
 from .audit import (
     ALLOWED_EMAIL_DOMAINS,
     AuditStore,
@@ -94,52 +95,6 @@ def _email_domains_in_text(*values: Any) -> set[str]:
   for value in values:
     domains.update(re.findall(r"[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})", str(value or ""), re.IGNORECASE))
   return {d.casefold() for d in domains}
-
-
-def _agency_label(email: str) -> str:
-  domain = email_domain(email)
-  labels = {
-    "dydx.digital": "DYDX Digital",
-    "upandupgroup.com": "Up&Up",
-    "theupandupgroup.com": "Up&Up",
-    "levergy.co.za": "Levergy",
-    "mcsaatchiabel.co.za": "M&C Saatchi Abel",
-    "upandupconnect.com": "Up&Up Connect",
-    "inblackandwhite.co.za": "In Black & White",
-    "razorpr.co.za": "Razor PR",
-  }
-  return labels.get(domain, domain or "the team")
-
-
-def _person_label(value: str, fallback: str = "Someone") -> str:
-  """Readable name for a user value: "Magda <magda@x>" -> "Magda",
-  "simphiwe.zungu@x" -> "Simphiwe Zungu"."""
-  text = str(value or "").strip()
-  text = re.sub(r"\s*<[^>]+>", "", text).strip()
-  if "@" in text:
-    text = text.split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ")
-    text = " ".join(part[:1].upper() + part[1:] for part in text.split())
-  return text or fallback
-
-
-def _change_notification(record: Dict[str, Any]) -> Dict[str, Any]:
-  operator = _person_label(str(record.get("operator_email") or record.get("os_user") or "Someone"))
-  old_user = _person_label(str(record.get("old_user") or "the previous assignee"))
-  new_user = _person_label(str(record.get("new_user") or "the new assignee"))
-  agency = _agency_label(str(record.get("operator_email") or record.get("old_user") or ""))
-  location = str(record.get("client") or record.get("pipe_name") or record.get("title") or "a Pipefy card")
-  if record.get("operation") == "add":
-    message = f"{operator} added {new_user} to {agency} work for {location}."
-  else:
-    message = f"{operator} removed {old_user} and assigned {new_user} on {agency} work for {location}."
-  return {
-    "id": "change:" + ":".join(str(record.get(k) or "") for k in ("ts", "operator_email", "pipe_id", "card_id", "old_user", "new_user", "operation")),
-    "ts": record.get("ts"),
-    "kind": "change",
-    "severity": "change",
-    "title": "Assignee change",
-    "message": message,
-  }
 
 
 class _RingHandler(logging.Handler):
@@ -1376,7 +1331,7 @@ INDEX_HTML = r"""<!doctype html>
     .tag.gap { background: var(--coral); border-color: var(--coral); color: #fff; }
     .saved .tag.part, .tag.part { display: inline-block; background: #fff; border-color: var(--coral); color: var(--orange-ink); }
     .hist { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-    .hist .filters { background: var(--ink); padding: 12px 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .hist .filters { background: var(--ink); padding: 12px 14px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
     .hist .filters label { display: block; margin: 0 0 4px; font-size: 11.5px; font-weight: 600; color: var(--coral); text-transform: uppercase; letter-spacing: .05em; }
     .hist .filters select, .hist .filters input { padding: 8px 10px; font-size: 13.5px; border-color: #333; }
     .hist .custom { display: none; grid-column: 1 / -1; gap: 10px; grid-template-columns: 1fr 1fr 2fr; }
@@ -1388,6 +1343,21 @@ INDEX_HTML = r"""<!doctype html>
     .hist table { font-size: 13.5px; }
     .hist td.c span { display: block; font-size: 12px; color: var(--mute); }
     .hist td.c a { color: var(--ink); }
+    .hist .chg-mode { display: inline-block; margin-bottom: 4px; }
+    .hist .chg-sentence { font-weight: 600; color: var(--ink); line-height: 1.4; }
+    .hist .chg-meta { font-size: 12.5px; color: var(--mute); margin-top: 2px; }
+    .hist .chg-toggle { margin-top: 4px; }
+    .hist tr.chg-jobs > td { background: #fafafa; padding: 0 8px 12px 8px; }
+    .hist .jobs-list { list-style: none; margin: 0; padding: 0; border: 1px solid #eee; border-radius: 6px; background: #fff; max-height: 320px; overflow: auto; }
+    .hist .jobs-list li { display: flex; gap: 12px; align-items: baseline; padding: 8px 12px; border-bottom: 1px solid #eee; font-size: 13px; }
+    .hist .jobs-list li:last-child { border-bottom: 0; }
+    .hist .jobs-list li a, .hist .jobs-list li b { color: var(--ink); font-weight: 600; }
+    .hist .jobs-list li .small { margin-left: auto; text-align: right; }
+    .tag.mode-replace { background: var(--ink); color: #fff; }
+    .tag.mode-coassign { background: #fff; color: var(--ink); }
+    .tag.mode-client { background: #fff; border-color: var(--coral); color: var(--orange-ink); }
+    .tag.mode-undo { background: #f5f5f5; border-color: #bbb; color: #444; }
+    .notice-message { color: var(--ink); font-size: 13.5px; line-height: 1.45; }
     #devPanel { margin-top: 14px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
     #devPanel > summary { padding: 12px 14px; font-size: 15px; font-weight: 600; letter-spacing: 0; text-transform: none; background: #fff; }
     #devPanel > summary::before { content: none; }
@@ -1405,6 +1375,21 @@ INDEX_HTML = r"""<!doctype html>
     .modal.dialog-branded .actions { justify-content: flex-start; margin-bottom: 22px; }
     .modal.dialog-branded #gateDomains { margin-bottom: 0; }
 
+    .panel > .panel-field { margin: 22px 18px 0; }
+    section.more > details.more-collapse > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+    section.more > details.more-collapse > summary::-webkit-details-marker { display: none; }
+    section.more > details.more-collapse > summary h2 { display: flex; align-items: center; gap: 10px; font-size: 19px; line-height: 1.2; margin: 0; }
+    section.more > details.more-collapse > summary h2::before { content: ""; width: 14px; height: 14px; border-radius: 3px; background: var(--coral); flex: none; }
+    section.more > details.more-collapse > summary::after { content: "Show"; margin-left: auto; font-size: 13px; text-decoration: underline; text-decoration-color: var(--coral); text-underline-offset: 3px; }
+    section.more > details.more-collapse[open] > summary::after { content: "Hide"; }
+    section.more > details.more-collapse > .help { font-size: 12.5px; color: var(--mute); margin: -4px 0 12px; }
+
+    /* Alerts: white card with a coloured edge, so the text always reads */
+    .alert { background: #fff; color: var(--ink); border: 1px solid var(--line); border-left: 4px solid var(--line); border-radius: 0 6px 6px 0; padding: 12px 14px; font-size: 13.5px; }
+    .alert.error { background: #fff; border-color: var(--line); border-left-color: var(--coral); color: var(--orange-ink); font-weight: 600; }
+    .alert.warn { background: #fff; border-color: var(--line); border-left-color: var(--warn); color: var(--ink); }
+    .alert.ok { background: #fff; border-color: var(--line); border-left-color: var(--ink); color: var(--ink); }
+
     footer { background: var(--ink); color: #bdbdbd; font-size: 12px; border-top: 4px solid var(--coral); }
     footer .wrap { max-width: 860px; padding: 16px 24px; }
     footer b { color: #fff; font-weight: 500; }
@@ -1421,6 +1406,7 @@ INDEX_HTML = r"""<!doctype html>
       .panel-head .hint { display: none; }
       .seg { grid-template-columns: 1fr; }
       .hist .filters { grid-template-columns: 1fr 1fr; }
+      .hist th:nth-child(3), .hist td.chg-by { display: none; }
       .hist .custom { grid-template-columns: 1fr 1fr; }
       main { padding: 22px 16px 60px; }
       footer .wrap { padding: 16px; }
@@ -1598,7 +1584,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div style="margin-top: 22px; max-width: 520px;">
+    <div class="panel-field" style="max-width: 520px;">
       <label for="maxAgeSel">How far back</label>
       <select id="maxAgeSel">
         <option value="0">Any time</option>
@@ -1631,11 +1617,13 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pipeGroups"></div>
   </section>
 
-  <!-- Saved changes (undoable co-assignee adds) -->
+  <!-- Previous co-assignee additions (saved, undoable co-assignee adds) -->
   <section id="coversPanel" class="more hidden">
-    <h2>Saved changes</h2>
-    <div class="help">Changes you saved so they can be undone later. Anyone on the team can undo them.</div>
-    <div class="saved" id="coversList"></div>
+    <details id="coversDetails" class="more-collapse">
+      <summary><h2>Previous co-assignee additions</h2><span class="tag" id="coversCount"></span></summary>
+      <div class="help">Co-assignees added with the tool that were saved so they can be removed later. Anyone on the team can undo them.</div>
+      <div class="saved" id="coversList"></div>
+    </details>
   </section>
 
   <!-- History -->
@@ -1647,6 +1635,15 @@ INDEX_HTML = r"""<!doctype html>
         <div><label for="historyBoard">Board</label><select id="historyBoard"><option value="">All boards</option></select></div>
         <div><label for="historyClient">Client</label><select id="historyClient"><option value="">All clients</option></select></div>
         <div><label for="historyUser">User swapped</label><select id="historyUser"><option value="">Anyone</option></select></div>
+        <div><label for="historyType">Change type</label>
+          <select id="historyType">
+            <option value="">All changes</option>
+            <option value="replace">Replaced</option>
+            <option value="coassign">Co-assignee added</option>
+            <option value="client">Added to client cards</option>
+            <option value="undo">Saved change undone</option>
+          </select>
+        </div>
         <div><label for="historyDays">Period</label>
           <select id="historyDays">
             <option value="30" selected>Last 30 days</option>
@@ -1670,7 +1667,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="tw">
         <table>
           <thead>
-            <tr><th>When</th><th>By</th><th>Card</th><th>Change</th><th>Result</th></tr>
+            <tr><th style="width:120px;">When</th><th>Change</th><th style="width:150px;">By</th><th style="width:110px;">Result</th></tr>
           </thead>
           <tbody id="historyTbody"></tbody>
         </table>
@@ -1749,7 +1746,7 @@ INDEX_HTML = r"""<!doctype html>
           <input id="coverEnd" type="date" style="max-width: 220px;">
         </div>
         <div class="small" style="margin-top: 18px; color: var(--muted); line-height: 1.6;">
-          Nothing happens automatically — you'll find this under “Saved changes” on the
+          Nothing happens automatically — you'll find this under “Previous co-assignee additions” on the
           home page, where you (or anyone on the team) can undo it whenever it's time.
         </div>
       </div>
@@ -2837,7 +2834,7 @@ function renderGroupApply(g, data) {
   const verb = data.operation === 'add' ? 'updated with the co-assignee' : 'changed';
   g.applyStatus.innerHTML =
     `${data.cards_changed} card(s) ${verb}.` +
-    (data.cover_saved ? ' Saved — undo any time from “Saved changes” on the home page.' : '') +
+    (data.cover_saved ? ' Saved — undo any time from “Previous co-assignee additions” on the home page.' : '') +
     (data.cancelled
       ? ` Cancelled — ${remaining} card${remaining === 1 ? '' : 's'} left planned; Apply again to continue.`
       : (remaining ? ` ${remaining} left unticked — tick and Apply again.` : '')) +
@@ -3144,6 +3141,7 @@ async function loadHistory() {
       board: $('historyBoard').value,
       client: $('historyClient').value,
       user: $('historyUser').value,
+      type: $('historyType').value,
       days: custom ? 'all' : period,
     });
     if (custom) {
@@ -3157,14 +3155,17 @@ async function loadHistory() {
     fillHistoryOptions('historyBoard', opts.boards, 'All boards');
     fillHistoryOptions('historyClient', opts.clients, 'All clients');
     fillHistoryOptions('historyUser', opts.users, 'Anyone');
-    const rows = data.records || [];
-    renderHistoryInto(rows, $('historyTbody'), 'No changes match these filters. Try a longer period.');
+    const changes = data.changes || [];
+    renderChanges(changes, $('historyTbody'));
     const sync = data.source === 'sheet'
       ? 'shared team history'
       : (data.sheet_sync ? 'shared history unavailable right now, showing this server only'
                          : 'this server only, resets when it restarts');
-    const total = data.in_range != null ? data.in_range : rows.length;
-    $('historyStatus').textContent = `Showing ${rows.length} of ${total} change${total === 1 ? '' : 's'} · ${sync}`;
+    const total = data.changes_in_range != null ? data.changes_in_range : changes.length;
+    const shown = data.change_count != null ? data.change_count : changes.length;
+    const jobs = changes.reduce((n, c) => n + (c.job_count || 0), 0);
+    $('historyStatus').textContent =
+      `Showing ${shown} of ${total} change${total === 1 ? '' : 's'} (${jobs} job${jobs === 1 ? '' : 's'}) · ${sync}`;
   } catch (e) {
     if (seq === _historySeq) $('historyStatus').textContent = 'Could not load history.';
   }
@@ -3187,9 +3188,8 @@ async function loadNotifications() {
     list.innerHTML = rows.length ? rows.map(n =>
       `<div class="notice ${escapeHtml(n.severity || '')}">` +
       `<span class="badge ${n.severity === 'error' ? 'err' : (n.kind === 'change' ? 'change' : 'warn')} ">${escapeHtml(n.severity === 'change' ? 'change' : (n.severity || 'notice'))}</span>` +
-      `<div><div class="notice-title">${escapeHtml(n.title || 'Notification')}</div>` +
-      `<div class="notice-message">${escapeHtml(n.message || '')}</div></div>` +
-      `<span class="small">${escapeHtml(fmtNoticeTs(n.ts))}</span></div>`
+      `<div><div class="notice-message">${escapeHtml(n.message || '')}</div>` +
+      `<div class="small">${escapeHtml([n.kind === 'change' ? n.title : '', n.by ? `by ${n.by}` : '', fmtNoticeTs(n.ts)].filter(Boolean).join(' \u00b7 '))}</div></div></div>`
     ).join('') : '<div class="small">No actionable notifications.</div>';
     $('notificationsStatus').textContent = `${rows.length} notification${rows.length === 1 ? '' : 's'}`;
   } catch (e) {
@@ -3197,7 +3197,57 @@ async function loadNotifications() {
   }
 }
 
-// Shared renderer for both the History panel and the "Recent applies" modal.
+// History section: one row per change (an Apply click), not per field.
+function renderChanges(changes, tbody) {
+  tbody.innerHTML = '';
+  if (!changes.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="small" style="padding:14px;">No changes match these filters. Try a longer period.</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  changes.forEach(c => {
+    const tr = document.createElement('tr');
+    const clients = c.clients || [];
+    const clientText = clients.length > 3
+      ? `${clients.slice(0, 3).join(', ')} and ${clients.length - 3} more`
+      : clients.join(', ');
+    const meta = [c.roles_text ? c.roles_text.charAt(0).toUpperCase() + c.roles_text.slice(1) : '',
+                  c.mode === 'client' ? '' : clientText].filter(Boolean).join(' · ');
+    let result;
+    if (!c.failed_count) result = `<span class="tag ok">${c.ok_count} done</span>`;
+    else if (!c.ok_count) result = `<span class="tag gap">${c.failed_count} failed</span>`;
+    else result = `<span class="tag ok">${c.ok_count} done</span><div style="margin-top:4px;"><span class="tag gap">${c.failed_count} failed</span></div>`;
+    tr.innerHTML =
+      `<td class="small" style="white-space:nowrap;">${escapeHtml(fmtHistWhen(c.ts))}</td>` +
+      `<td><span class="tag mode-${escapeHtml(c.mode)} chg-mode">${escapeHtml(c.mode_label || '')}</span>` +
+      `<div class="chg-sentence">${escapeHtml(c.sentence || '')}</div>` +
+      (meta ? `<div class="chg-meta">${escapeHtml(meta)}</div>` : '') +
+      `<button type="button" class="linkish chg-toggle" aria-expanded="false">Show ${c.job_count === 1 ? 'job' : `all ${c.job_count} jobs`}</button></td>` +
+      `<td class="small chg-by" title="${escapeHtml(c.operator_email || '')}">${escapeHtml(c.operator || '')}</td>` +
+      `<td>${result}</td>`;
+    const detail = document.createElement('tr');
+    detail.className = 'chg-jobs hidden';
+    const items = (c.cards || []).map(card => {
+      const title = escapeHtml(card.title || card.card_id || 'Card');
+      const name = card.card_url ? `<a href="${escapeHtml(card.card_url)}" target="_blank" rel="noopener">${title}</a>` : `<b>${title}</b>`;
+      const sub = [card.client, (card.roles || []).join(', ')].filter(Boolean).map(escapeHtml).join(' · ');
+      const status = card.status === 'ok' ? '' : ` <span class="tag gap">Failed</span>${card.error ? ` ${escapeHtml(card.error)}` : ''}`;
+      return `<li><div>${name}${status}</div><span class="small">${sub}</span></li>`;
+    }).join('');
+    detail.innerHTML = `<td colspan="4"><ul class="jobs-list">${items}</ul></td>`;
+    const btn = tr.querySelector('.chg-toggle');
+    btn.addEventListener('click', () => {
+      const open = detail.classList.toggle('hidden') === false;
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.textContent = open ? 'Hide jobs' : `Show ${c.job_count === 1 ? 'job' : `all ${c.job_count} jobs`}`;
+    });
+    frag.appendChild(tr);
+    frag.appendChild(detail);
+  });
+  tbody.appendChild(frag);
+}
+
+// Per-field renderer, used by the "Recent applies" modal.
 function historyPerson(v) {
   const t = String(v || '').replace(/\s*<[^>]+>/, '').trim();
   if (!t.includes('@')) return t;
@@ -3294,10 +3344,10 @@ $('recentClose').addEventListener('click', closeRecentModal);
 $('recentModal').addEventListener('click', (e) => { if (e.target === $('recentModal')) closeRecentModal(); });
 
 $('historyRefresh').addEventListener('click', loadHistory);
-['historyBoard', 'historyClient', 'historyUser', 'historyDays', 'historyFrom', 'historyTo']
+['historyBoard', 'historyClient', 'historyUser', 'historyType', 'historyDays', 'historyFrom', 'historyTo']
   .forEach(id => $(id).addEventListener('change', loadHistory));
 $('historyClear').addEventListener('click', () => {
-  ['historyBoard', 'historyClient', 'historyUser'].forEach(id => { $(id).value = ''; });
+  ['historyBoard', 'historyClient', 'historyUser', 'historyType'].forEach(id => { $(id).value = ''; });
   $('historyDays').value = '30';
   loadHistory();
 });
@@ -3351,6 +3401,7 @@ function renderCovers(covers) {
   host.innerHTML = '';
   const active = covers.filter(c => (c.status || 'active') === 'active');
   $('coversPanel').classList.toggle('hidden', active.length === 0);
+  $('coversCount').textContent = `${active.length} saved`;
   if (!active.length) return;
   const today = new Date().toISOString().slice(0, 10);
   active.forEach(c => {
@@ -3538,7 +3589,7 @@ $('coverRemoveBtn').addEventListener('click', async () => {
     const bits = [`${data.removed} removed`];
     if (data.skipped) bits.push(`${data.skipped} already gone`);
     if ((data.errors || []).length) bits.push(`${data.errors.length} error(s)`);
-    $('coverStatus').textContent = bits.join(' \u00b7 ') + (data.batch_ended ? ' \u2014 fully undone; removed from Saved changes.' : '');
+    $('coverStatus').textContent = bits.join(' \u00b7 ') + (data.batch_ended ? ' \u2014 fully undone; removed from Previous co-assignee additions.' : '');
     loadCovers();
   } catch (e) {
     $('coverStatus').textContent = 'Remove failed: ' + (e.message || e);
@@ -3731,13 +3782,16 @@ def create_app(config_path: str = "config.ini") -> Flask:
         return rows, source
 
     def _history_people(record: Dict[str, Any]) -> List[str]:
-        return [p for p in (_person_label(record.get("old_user") or "", fallback=""),
-                            _person_label(record.get("new_user") or "", fallback="")) if p]
+        old = "" if client_match_text(record) else record.get("old_user")
+        return [p for p in (_person_label(old), _person_label(record.get("new_user"))) if p]
 
     def _filter_history(rows: List[Dict[str, Any]], args) -> List[Dict[str, Any]]:
         board = (args.get("board") or "").strip().casefold()
         client_filter = (args.get("client") or "").strip().casefold()
         user_filter = (args.get("user") or "").strip().casefold()
+        type_filter = (args.get("type") or "").strip().casefold()
+        if type_filter:
+            rows = [r for r in rows if change_mode(r) == type_filter]
         if board:
             rows = [r for r in rows if board in f"{r.get('pipe_name', '')} {r.get('pipe_id', '')}".casefold()]
         if client_filter:
@@ -3766,6 +3820,8 @@ def create_app(config_path: str = "config.ini") -> Flask:
         in_range, source = _load_history(request.args)
         rows = _filter_history(in_range, request.args)
         total = len(rows)
+        changes = group_changes(rows)
+        all_changes = len(changes)
         rows = rows[:limit]
         options = {
             "boards": sorted({str(r.get("pipe_name") or "").strip() for r in in_range} - {""}, key=str.casefold),
@@ -3773,6 +3829,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "users": sorted({p for r in in_range for p in _history_people(r)}, key=str.casefold),
         }
         return jsonify({
+            "changes": changes[:limit],
+            "change_count": all_changes,
+            "changes_in_range": len(group_changes(in_range)),
             "records": rows,
             "count": len(rows),
             "total": total,
@@ -3789,22 +3848,27 @@ def create_app(config_path: str = "config.ini") -> Flask:
         viewer_domain = email_domain(viewer)
         is_developer = viewer_domain == "dydx.digital"
         records, _source = _load_history({"days": "30"})
-        seen: set[str] = set()
         notifications: List[Dict[str, Any]] = []
-        for record in records:
-            key = ":".join(str(record.get(k) or "") for k in ("ts", "operator_email", "pipe_id", "card_id", "old_user", "new_user", "operation"))
-            if key in seen or record.get("status") not in {"ok", "partial", "error"}:
-                continue
-            seen.add(key)
+        for change in group_changes(records):
             domains = _email_domains_in_text(
-                record.get("operator_email"), record.get("old_user"), record.get("new_user")
+                change.get("operator_email"), change.get("old_user"), change.get("new_user")
             )
-            if is_developer or viewer_domain in domains:
-                notifications.append(_change_notification(record))
+            if not (is_developer or viewer_domain in domains):
+                continue
+            failed = change["failed_count"]
+            notifications.append({
+                "id": "change:" + (change.get("run_id") or f"{change.get('ts')}:{change.get('pipe_id')}:{change.get('mode')}"),
+                "ts": _record_epoch({"ts": change.get("ts")}),
+                "kind": "change",
+                "severity": "change" if not failed else "warning",
+                "title": change["mode_label"],
+                "message": change["sentence"] + (f" {failed} could not be changed." if failed else ""),
+                "by": change["operator"],
+            })
         with _LOG_LOCK:
             if is_developer:
                 notifications.extend(reversed(_NOTIFICATION_RING))
-        notifications.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
+        notifications.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
         return jsonify({"notifications": notifications, "count": len(notifications)})
 
     @app.get("/api/pipes")
@@ -4672,6 +4736,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         old_user = entry.get("old_user", "")
         new_user = entry.get("new_user", "")
         operation = entry.get("operation", "replace")
+        run_id = secrets.token_hex(6)  # groups this Apply's audit rows in History
 
         # Optional per-card selection: apply only the ticked cards and keep the
         # rest in the preview store for a later batch.
@@ -4753,6 +4818,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     error="; ".join(err_msgs),
                     operation=operation,
                     sheet_sink=audit_sheet_sink,
+                    run_id=run_id,
                 )
             except Exception:  # noqa: BLE001 - audit must never block apply
                 log.exception("audit logging failed for card %s", plan.card_id)
@@ -4865,6 +4931,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         if cover_store is None:
             return jsonify({"error": "Cover storage is not configured."}), 400
         body = request.get_json(force=True, silent=True) or {}
+        run_id = secrets.token_hex(6)  # groups this undo in History
         operator_email = normalize_email(
             session.get("operator_email") or body.get("operator_email")
         )
@@ -4975,6 +5042,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     error="; ".join(err_msgs),
                     operation="remove",
                     sheet_sink=audit_sheet_sink,
+                    run_id=run_id,
                 )
             except Exception:  # noqa: BLE001 - audit must never block
                 log.exception("audit logging failed for cover removal %s", card_id)
