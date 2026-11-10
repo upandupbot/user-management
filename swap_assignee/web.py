@@ -1358,6 +1358,15 @@ INDEX_HTML = r"""<!doctype html>
     .tag.mode-client { background: #fff; border-color: var(--coral); color: var(--orange-ink); }
     .tag.mode-undo { background: #f5f5f5; border-color: #bbb; color: #444; }
     .notice-message { color: var(--ink); font-size: 13.5px; line-height: 1.45; }
+    .notif-popover-head { flex-wrap: wrap; }
+    .notif-popover-head .small { margin-left: 0; margin-right: auto; }
+    .notif-popover-head button.linkish + button.linkish { margin-left: 0; }
+    .notif-popover-head button.linkish:disabled { opacity: .4; text-decoration: none; cursor: default; }
+    .notice.unread { background: #fff7f4; border-left-color: var(--coral); }
+    .notice.unread .notice-message { font-weight: 600; }
+    .notice.read { border-left-color: var(--line); }
+    .notice.read .notice-message { color: #555; }
+    .notice .notice-read { margin-top: 4px; font-size: 12.5px; }
     #devPanel { margin-top: 14px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
     #devPanel > summary { padding: 12px 14px; font-size: 15px; font-weight: 600; letter-spacing: 0; text-transform: none; background: #fff; }
     #devPanel > summary::before { content: none; }
@@ -1447,7 +1456,6 @@ INDEX_HTML = r"""<!doctype html>
   <div class="wrap topbar">
     <div class="brand-lockup">
       <img class="brand-logo" src="/static/slipstream-logo.png" alt="slipstream">
-      <div class="brand-meta"><img src="/static/upandup-logo.png" alt="up&amp;up"><span>group</span></div>
     </div>
     <div class="header-divider"></div>
     <div class="product-heading">
@@ -1462,8 +1470,9 @@ INDEX_HTML = r"""<!doctype html>
       <div id="notificationsPopover" class="notif-popover hidden" role="dialog" aria-label="Notifications">
         <div class="notif-popover-head">
           <strong>Notifications</strong>
-          <button id="notificationsRefresh" class="ghost" type="button" style="padding: 4px 10px; font-size: 12px;">Refresh</button>
           <span class="small" id="notificationsStatus">&mdash;</span>
+          <button id="notificationsMarkAll" class="linkish" type="button">Mark all as read</button>
+          <button id="notificationsRefresh" class="linkish" type="button">Refresh</button>
         </div>
         <p class="small">Changes made by or affecting your agency, plus developer errors for DYDX Digital.</p>
         <div id="notificationsList" class="notice-list"></div>
@@ -1478,7 +1487,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <section class="hero">
   <div class="wrap">
-    <span class="eyebrow">An Up&amp;Up tool</span>
+    <span class="eyebrow">A Slipstream tool</span>
     <h1>Swap <em>people</em>, not pipelines.</h1>
     <p>Move or add people on lots of Slipstream cards at once.</p>
     <p class="sub">Use it when someone leaves, goes on leave or joins a client team. <b>Nothing changes until you click Apply.</b></p>
@@ -3177,25 +3186,92 @@ function fmtNoticeTs(ts) {
   return ts ? new Date(ts * 1000).toLocaleString() : '';
 }
 
+// Read/unread state lives in this browser, per signed-in email.
+let _notifRows = [];
+const NOTIF_READ_PREFIX = 'slipstream.notificationsRead.';
+
+function notifKey(n) { return `${n.id}|${n.ts}`; }
+
+function loadNotifReadState() {
+  try {
+    const raw = localStorage.getItem(NOTIF_READ_PREFIX + (operatorEmail || ''));
+    const st = raw ? JSON.parse(raw) : null;
+    return { upTo: Number(st && st.upTo) || 0, ids: Array.isArray(st && st.ids) ? st.ids : [] };
+  } catch (e) { return { upTo: 0, ids: [] }; }
+}
+
+function saveNotifReadState(st) {
+  try {
+    st.ids = st.ids.slice(-500);
+    localStorage.setItem(NOTIF_READ_PREFIX + (operatorEmail || ''), JSON.stringify(st));
+  } catch (e) { /* private mode: read state just won't persist */ }
+}
+
+function isNotifRead(n, st) {
+  return (Number(n.ts) || 0) <= st.upTo || st.ids.includes(notifKey(n));
+}
+
+function markNotifRead(n) {
+  const st = loadNotifReadState();
+  if (!st.ids.includes(notifKey(n))) st.ids.push(notifKey(n));
+  saveNotifReadState(st);
+  renderNotifications();
+}
+
+function markAllNotifsRead() {
+  const st = loadNotifReadState();
+  const newest = _notifRows.reduce((m, n) => Math.max(m, Number(n.ts) || 0), 0);
+  st.upTo = Math.max(st.upTo, newest);
+  st.ids = [];
+  saveNotifReadState(st);
+  renderNotifications();
+}
+
+function renderNotifications() {
+  const st = loadNotifReadState();
+  const rows = _notifRows;
+  const unread = rows.filter(n => !isNotifRead(n, st)).length;
+  const badge = $('notificationsBadge');
+  badge.textContent = unread > 99 ? '99+' : String(unread);
+  badge.classList.toggle('hidden', unread === 0);
+  $('notificationsBell').setAttribute('aria-label', unread ? `Open notifications, ${unread} unread` : 'Open notifications');
+  $('notificationsMarkAll').disabled = unread === 0;
+  const list = $('notificationsList');
+  list.innerHTML = '';
+  if (!rows.length) {
+    list.innerHTML = '<div class="small">No notifications.</div>';
+  }
+  rows.forEach(n => {
+    const read = isNotifRead(n, st);
+    const item = document.createElement('div');
+    item.className = `notice ${n.severity || ''} ${read ? 'read' : 'unread'}`;
+    const kind = n.severity === 'error' ? 'err' : (n.kind === 'change' ? 'change' : 'warn');
+    const label = n.severity === 'change' ? 'change' : (n.severity || 'notice');
+    const meta = [n.kind === 'change' ? n.title : '', n.by ? `by ${n.by}` : '', fmtNoticeTs(n.ts)].filter(Boolean).join(' · ');
+    item.innerHTML =
+      `<span class="badge ${kind}">${escapeHtml(label)}</span>` +
+      `<div><div class="notice-message">${escapeHtml(n.message || '')}</div>` +
+      `<div class="small">${escapeHtml(meta)}</div>` +
+      (read ? '' : '<button type="button" class="linkish notice-read">Mark as read</button>') +
+      `</div>`;
+    const btn = item.querySelector('.notice-read');
+    if (btn) btn.addEventListener('click', (e) => { e.stopPropagation(); markNotifRead(n); });
+    list.appendChild(item);
+  });
+  $('notificationsStatus').textContent = rows.length
+    ? (unread ? `${unread} unread` : 'All read')
+    : '';
+}
+
 async function loadNotifications() {
   $('notificationsStatus').textContent = 'Loading…';
   try {
     const r = await fetch('/api/notifications');
     const data = await r.json();
-    const list = $('notificationsList');
-    const rows = data.notifications || [];
-    const badge = $('notificationsBadge');
-    badge.textContent = rows.length > 99 ? '99+' : String(rows.length);
-    badge.classList.toggle('hidden', rows.length === 0);
-    list.innerHTML = rows.length ? rows.map(n =>
-      `<div class="notice ${escapeHtml(n.severity || '')}">` +
-      `<span class="badge ${n.severity === 'error' ? 'err' : (n.kind === 'change' ? 'change' : 'warn')} ">${escapeHtml(n.severity === 'change' ? 'change' : (n.severity || 'notice'))}</span>` +
-      `<div><div class="notice-message">${escapeHtml(n.message || '')}</div>` +
-      `<div class="small">${escapeHtml([n.kind === 'change' ? n.title : '', n.by ? `by ${n.by}` : '', fmtNoticeTs(n.ts)].filter(Boolean).join(' \u00b7 '))}</div></div></div>`
-    ).join('') : '<div class="small">No actionable notifications.</div>';
-    $('notificationsStatus').textContent = `${rows.length} notification${rows.length === 1 ? '' : 's'}`;
+    _notifRows = data.notifications || [];
+    renderNotifications();
   } catch (e) {
-    $('notificationsStatus').textContent = 'load error';
+    $('notificationsStatus').textContent = 'Could not load';
   }
 }
 
@@ -3354,6 +3430,7 @@ $('historyClear').addEventListener('click', () => {
   loadHistory();
 });
 $('notificationsRefresh').addEventListener('click', loadNotifications);
+$('notificationsMarkAll').addEventListener('click', markAllNotifsRead);
 $('notificationsBell').addEventListener('click', (event) => {
   event.stopPropagation();
   const popover = $('notificationsPopover');
