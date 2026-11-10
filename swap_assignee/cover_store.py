@@ -25,7 +25,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from .sheets_sink import load_sheet_credentials
+from .sheets_sink import ThreadLocalSheetsService, load_sheet_credentials
 
 log = logging.getLogger("swap_assignee.covers")
 
@@ -88,11 +88,16 @@ class CoverStore:
     """Reads/writes cover batches in a Google Sheet via the Sheets API."""
 
     def __init__(self, sheet_id: str, credentials: Any) -> None:
-        from googleapiclient.discovery import build  # lazy import
-
         self.sheet_id = sheet_id
-        self._svc = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+        # One client per server thread: the Google client's connection is not
+        # thread-safe (see ThreadLocalSheetsService).
+        self._clients = ThreadLocalSheetsService(credentials)
+        self._clients.get()
         self._ensured = False
+
+    @property
+    def _svc(self):
+        return self._clients.get()
 
     # ---------- low-level sheet I/O (overridden by tests) ----------
 
