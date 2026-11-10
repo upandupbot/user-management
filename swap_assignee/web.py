@@ -1220,7 +1220,7 @@ INDEX_HTML = r"""<!doctype html>
     .notif-button:hover svg,
     .notif-button:focus-visible svg { stroke: #111; }
     .hero { padding: 34px 40px 32px; }
-    .hero .wrap { display: block; max-width: 860px; }
+    .hero .wrap { display: block; max-width: var(--page-width); }
     .hero .eyebrow {
       display: inline-block; padding: 3px 11px; border-radius: 999px;
       background: var(--coral); color: #fff; font-size: 11.5px;
@@ -1231,11 +1231,11 @@ INDEX_HTML = r"""<!doctype html>
       letter-spacing: -.02em; text-transform: none;
     }
     .hero h1 em { text-decoration: underline; text-decoration-color: var(--coral); text-decoration-thickness: 4px; text-underline-offset: 5px; }
-    .hero p { margin: 0; max-width: 600px; font-size: 18px; color: var(--ink); }
-    .hero p.sub { margin-top: 8px; max-width: 600px; font-size: 14.5px; color: var(--ink-2); font-weight: 400; letter-spacing: 0; text-align: left; text-transform: none; }
+    .hero p { margin: 0; max-width: 720px; font-size: 18px; color: var(--ink); }
+    .hero p.sub { margin-top: 8px; max-width: 720px; font-size: 14.5px; color: var(--ink-2); font-weight: 400; letter-spacing: 0; text-align: left; text-transform: none; }
     .hero p.sub b { color: var(--coral-deep); }
     .hero .kicker { display: none; }
-    main.wrap { max-width: 860px; }
+    main.wrap { max-width: calc(var(--page-width) + 80px); } /* + its 40px side padding, so cards line up with the header */
     .panel { background: #fff; border: 1px solid var(--ink); border-radius: 6px; box-shadow: none; padding: 0; margin: 0 0 18px; overflow: hidden; }
     .panel-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px; margin: 0; border-bottom: 1px solid var(--border); }
     .panel-head .step { width: 26px; height: 26px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center; background: var(--coral); color: #fff; font-family: "Inter", sans-serif; font-size: 13px; font-style: normal; font-weight: 700; line-height: 1; letter-spacing: 0; }
@@ -1246,7 +1246,7 @@ INDEX_HTML = r"""<!doctype html>
     .panel > .actions { margin-bottom: 18px; }
     .panel > #pipeGroups { margin-bottom: 18px; }
     @media (max-width: 640px) {
-      .hero { padding: 26px 20px 24px; }
+      .hero { padding: 26px 16px 24px; }
       .hero h1 { font-size: 32px; }
       .hero p { font-size: 16px; }
       .hero p.sub { font-size: 13.5px; }
@@ -1256,10 +1256,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     /* ---------- Slipstream mock-up parity (controls, sections, footer) ---------- */
-    :root { --line: #dcdcdc; --mute: #6b6b6b; --orange-ink: #b83a16; }
+    :root { --line: #dcdcdc; --mute: #6b6b6b; --orange-ink: #b83a16; --page-width: 1200px; }
     body { font-size: 15px; line-height: 1.55; color: #202124; }
-    header { padding: 22px 24px; }
-    header .wrap.topbar { max-width: 860px; gap: 22px; flex-wrap: nowrap; }
+    header { padding: 22px 40px; }
+    header .wrap.topbar { max-width: var(--page-width); gap: 22px; flex-wrap: nowrap; }
     .brand-lockup { min-width: 0; }
     .brand-logo { width: 150px; display: block; }
     .brand-meta { display: flex; align-items: center; gap: 4px; margin-top: -2px; font-size: 13px; }
@@ -1391,7 +1391,8 @@ INDEX_HTML = r"""<!doctype html>
     .alert.ok { background: #fff; border-color: var(--line); border-left-color: var(--ink); color: var(--ink); }
 
     footer { background: var(--ink); color: #bdbdbd; font-size: 12px; border-top: 4px solid var(--coral); }
-    footer .wrap { max-width: 860px; padding: 16px 24px; }
+    footer { padding: 0 40px; }
+    footer .wrap { max-width: var(--page-width); padding: 16px 0; }
     footer b { color: #fff; font-weight: 500; }
 
     @media (max-width: 640px) {
@@ -1409,7 +1410,8 @@ INDEX_HTML = r"""<!doctype html>
       .hist th:nth-child(3), .hist td.chg-by { display: none; }
       .hist .custom { grid-template-columns: 1fr 1fr; }
       main { padding: 22px 16px 60px; }
-      footer .wrap { padding: 16px; }
+      footer { padding: 0 16px; }
+      footer .wrap { padding: 16px 0; }
     }
   </style>
 </head>
@@ -1543,7 +1545,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="label" id="resolvedOperationLabel">Swap</div>
       <div id="resolvedUsers" class="swap"></div>
     </div>
-    <div class="col" style="max-width: 640px;">
+    <div class="col">
       <label>Boards <span class="small" id="pipePickCount"></span></label>
       <div id="pipePickList" class="field-list"></div>
       <!--div class="small" style="margin-top: 8px; color: var(--muted);">
@@ -1568,7 +1570,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="hint">Finished phases are skipped for you</span>
     </div>
     <div class="row">
-      <div class="col" style="flex: 1 1 300px; max-width: 520px;">
+      <div class="col" style="flex: 1 1 300px;">
         <label id="roleListLabel">Roles to swap <span class="small" id="rolePickCount"></span></label>
         <div id="rolePickList" class="field-list"></div>
         <div class="small" id="roleHelp" style="margin-top: 8px; color: var(--muted);">
@@ -1576,7 +1578,7 @@ INDEX_HTML = r"""<!doctype html>
           everything searches every assignee field, which is slower.
         </div>
       </div>
-      <div class="col" style="flex: 1 1 300px; max-width: 520px;">
+      <div class="col" style="flex: 1 1 300px;">
         <label>Skip these phases <span class="small" id="phasePickCount"></span></label>
         <div id="phasePickList" class="field-list"></div>
         <div class="small" style="margin-top: 8px; color: var(--muted);">
