@@ -322,6 +322,73 @@ INDEX_HTML = r"""<!doctype html>
     .notif-popover .notice { grid-template-columns: auto 1fr; }
     .notif-popover .notice > .small { grid-column: 2; }
 
+    /* ---------- mock-up workflow cards ---------- */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      box-shadow: none;
+      padding: 0;
+      margin: 0 0 18px;
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px;
+      margin: 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-head .step {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      flex: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--coral);
+      color: #fff;
+      font-family: "Inter", sans-serif;
+      font-size: 13px;
+      font-style: normal;
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+    .panel-head h2 {
+      font-size: 17px;
+      line-height: 1.2;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .panel-head .hint {
+      margin-left: auto;
+      max-width: 280px;
+      font-size: 12.5px;
+      letter-spacing: 0;
+      line-height: 1.4;
+      text-transform: none;
+    }
+    .panel > .operation-picker,
+    .panel > .row,
+    .panel > .resolved,
+    .panel > .col,
+    .panel > .actions,
+    .panel > .alert,
+    .panel > #scanSummary,
+    .panel > #pipeGroups,
+    .panel > #phasesAlerts,
+    .panel > #usersAlerts,
+    .panel > #pipesAlerts {
+      margin-left: 18px;
+      margin-right: 18px;
+    }
+    .panel > .operation-picker { margin-top: 18px; }
+    .panel > .actions { margin-bottom: 18px; }
+    .panel > #pipeGroups { margin-bottom: 18px; }
+
     /* Hero strip — sans-led statement with a serif accent word,
        echoing "CREATIVITY ELEVATES everything" on theupandupgroup.com */
     .hero {
@@ -1068,9 +1135,12 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 640px) {
       header, .hero { padding-left: 20px; padding-right: 20px; }
       main { padding-left: 20px; padding-right: 20px; }
+      .hero .wrap { grid-template-columns: 1fr; gap: 20px; }
+      .hero .kicker { max-width: none; text-align: left; padding-bottom: 0; }
+      .hero .kicker .rule { margin-left: 0; }
       .operation-picker { max-width: none; }
-      .panel-head { grid-template-columns: 64px 1fr; }
-      .panel-head .step { font-size: 54px; }
+      .panel-head { display: flex; padding: 14px 16px; }
+      .panel-head .step { width: 24px; height: 24px; font-size: 12px; }
       .panel-head .hint { grid-column: 2; text-align: left; max-width: none; }
       .scan-card .sc-body { padding: 22px 20px; }
       .scan-card .sc-foot { align-items: flex-start; flex-direction: column; padding: 14px 20px; }
