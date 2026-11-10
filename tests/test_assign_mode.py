@@ -277,11 +277,12 @@ def test_assign_scan_age_cutoff_skips_old_cards(monkeypatch):
     old = _card(title="Acme — archive job", fields=[_role_field([])])
     old["created_at"] = "2020-01-01T00:00:00Z"
     new = dict(_card(title="Acme — Q3 banners", fields=[_role_field([])]), id="C2")
-    new["created_at"] = "2026-08-01T00:00:00Z"
+    from datetime import datetime, timedelta, timezone
+    new["created_at"] = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
     client = _assign_client(monkeypatch, [old, new])
     # No cutoff: both planned.
     assert len(_plans_from(client.post("/api/assign/scan/stream", json=_scan_body()))) == 2
-    # 90-day cutoff (today is 2026-08): only the recent card.
+    # 90-day cutoff: only the recent card (created 10 days ago).
     plans = _plans_from(client.post("/api/assign/scan/stream", json=_scan_body(max_age_days=90)))
     assert [p["card_id"] for p in plans] == ["C2"]
 

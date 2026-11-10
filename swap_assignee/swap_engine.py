@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
@@ -294,6 +295,106 @@ def compute_swap(current_ids: Sequence[str], old_id: str, new_id: str) -> Option
     return new_list
 
 
+def compute_remove(current_ids: Sequence[str], user_id: str) -> Optional[List[str]]:
+    """Return the id list without `user_id`, or None when they're absent.
+
+    Pipefy has no "remove one assignee" mutation — both updateCard and
+    updateCardField SET the whole list — so removal is always
+    "current list minus one id", computed from a fresh card read.
+    """
+    current = [str(x) for x in current_ids]
+    uid = str(user_id)
+    if uid not in current:
+        return None
+    return [x for x in current if x != uid]
+
+
+def card_matches_text(card: Dict[str, Any], text: str) -> bool:
+    """True when `text` appears (case-insensitive) in the card title or its client field."""
+    needle = " ".join((text or "").strip().lower().split())
+    if not needle:
+        return False
+    title = (card.get("title") or "").lower()
+    if needle in title:
+        return True
+    return needle in extract_client(card).lower()
+
+
+# Ziflow/online-review cards are process artifacts, not real jobs — every scan
+# mode skips them. Marked either by a card label or the "Online review status"
+# (ziflow_status) label_select field being set to "Review Task".
+REVIEW_TASK_MARKER = "review task"
+_REVIEW_STATUS_FIELD_PATTERNS = ("online review status", "ziflow_status")
+
+
+def _field_text_candidates(fnode: Dict[str, Any]) -> List[str]:
+    """Possible display strings for a field value (handles JSON-encoded lists)."""
+    out: List[str] = []
+    val = fnode.get("value")
+    if isinstance(val, str):
+        s = val.strip()
+        if s[:1] in '[{"':
+            try:
+                dec = json.loads(s)
+            except Exception:
+                dec = None
+            if isinstance(dec, list):
+                out.extend(str(x) for x in dec if isinstance(x, (str, int)))
+            elif isinstance(dec, str):
+                out.append(dec)
+            elif dec is None and s:
+                out.append(s)
+        elif s:
+            out.append(s)
+    elif isinstance(val, list):
+        out.extend(str(x) for x in val if isinstance(x, (str, int)))
+    av = fnode.get("array_value")
+    if isinstance(av, list):
+        for item in av:
+            if isinstance(item, dict) and item.get("name"):
+                out.append(str(item["name"]))
+            elif isinstance(item, str):
+                out.append(item)
+    return out
+
+
+def card_created_ts(card: Dict[str, Any]) -> Optional[float]:
+    """Epoch seconds from the card's created_at, or None when missing/unparseable."""
+    raw = str(card.get("created_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def card_older_than(card: Dict[str, Any], cutoff_ts: Optional[float]) -> bool:
+    """True when the card was created before `cutoff_ts`. Cards with no
+    parseable created_at are kept (never treated as old)."""
+    if cutoff_ts is None:
+        return False
+    ts = card_created_ts(card)
+    return ts is not None and ts < cutoff_ts
+
+
+def is_review_task_card(card: Dict[str, Any]) -> bool:
+    """True when the card is a Review Task (card label or online-review field)."""
+    for lab in card.get("labels") or []:
+        name = lab.get("name") if isinstance(lab, dict) else lab
+        if normalize_phase(str(name or "")) == REVIEW_TASK_MARKER:
+            return True
+    for fnode in card.get("fields") or []:
+        meta = (fnode or {}).get("field") or {}
+        hay = f"{meta.get('label') or ''} {fnode.get('name') or ''} {meta.get('id') or ''}".lower()
+        if not any(p in hay for p in _REVIEW_STATUS_FIELD_PATTERNS):
+            continue
+        for text in _field_text_candidates(fnode):
+            if normalize_phase(text) == REVIEW_TASK_MARKER:
+                return True
+    return False
+
+
 def compute_add_only(current_ids: Sequence[str], old_id: str, new_id: str) -> Optional[List[str]]:
     """Return new id list when we want to *add* new_id without removing old_id.
 
@@ -426,6 +527,140 @@ def plan_card(
                 f"field:{fid}", fid, ids, new_ids, field_label=label,
                 mode="add_only" if operation == "add" else "swap",
                 old_names=_names(ids), new_names=_names(new_ids),
+            ))
+
+    return plan
+
+
+def plan_remove_card(
+    card: Dict[str, Any],
+    *,
+    user_id: str,
+    field_ids: Optional[Set[str]] = None,
+    include_card_level: bool = False,
+    id_names: Optional[Dict[str, str]] = None,
+) -> CardPlan:
+    """Plan removal of one user from a card's recorded scopes only.
+
+    Used by the cover-undo flow: `field_ids` / `include_card_level` come from
+    the stored cover rows, so we never touch a field the tool didn't add the
+    user to. Cards/fields where the user is already gone yield no actions
+    (idempotent — safe to re-run).
+    """
+    plan = CardPlan(
+        card_id=str(card.get("id")),
+        card_url=card.get("url") or "",
+        title=card.get("title") or "",
+        phase_name=((card.get("current_phase") or {}).get("name")) or "",
+        client=extract_client(card),
+        product=extract_product(card),
+    )
+    name_map = build_card_name_lookup(card)
+    if id_names:
+        for k, v in id_names.items():
+            if v:
+                name_map[str(k)] = str(v)
+
+    def _names(ids: Sequence[str]) -> List[str]:
+        return [name_map.get(str(i), str(i)) for i in ids]
+
+    if include_card_level:
+        ids = [str(a.get("id")) for a in (card.get("assignees") or []) if a and a.get("id") is not None]
+        new_ids = compute_remove(ids, user_id)
+        if new_ids is not None:
+            plan.actions.append(PlannedAction(
+                "card", None, ids, new_ids, mode="remove",
+                old_names=_names(ids), new_names=_names(new_ids),
+            ))
+
+    wanted = {str(f) for f in (field_ids or set())}
+    for fnode in card.get("fields") or []:
+        meta = (fnode or {}).get("field") or {}
+        fid = str(meta.get("id")) if meta.get("id") is not None else None
+        if not fid or meta.get("type") not in ASSIGNEE_FIELD_TYPES or fid not in wanted:
+            continue
+        ids = parse_field_user_ids(fnode)
+        new_ids = compute_remove(ids, user_id)
+        if new_ids is not None:
+            label = (meta.get("label") or "").strip() or None
+            plan.actions.append(PlannedAction(
+                f"field:{fid}", fid, ids, new_ids, field_label=label, mode="remove",
+                old_names=_names(ids), new_names=_names(new_ids),
+            ))
+
+    return plan
+
+
+def plan_assign_card(
+    card: Dict[str, Any],
+    *,
+    new_id: str,
+    field_ids: Set[str],
+    excluded_phases: Sequence[str] = (),
+    id_names: Optional[Dict[str, str]] = None,
+    field_meta: Optional[Dict[str, Dict[str, str]]] = None,
+) -> CardPlan:
+    """Plan adding one user to specific assignee fields, no old user required.
+
+    Used by the client-match assign flow: the card was selected by title/client
+    text, so we simply append `new_id` to each target field where they're not
+    already present. Card-level assignees are never touched (avoids Pipefy's
+    updateCard notification storm). Idempotent — already-assigned fields yield
+    no action.
+
+    Empty fields are often omitted from the card payload entirely; when
+    `field_meta` ({field_id: {"label":...}}) is supplied, wanted fields missing
+    from the card are still planned as [] -> [new_id].
+    """
+    phase = ((card.get("current_phase") or {}).get("name")) or ""
+    plan = CardPlan(
+        card_id=str(card.get("id")),
+        card_url=card.get("url") or "",
+        title=card.get("title") or "",
+        phase_name=phase,
+        client=extract_client(card),
+        product=extract_product(card),
+    )
+    excluded_norm = {normalize_phase(p) for p in excluded_phases}
+    if normalize_phase(phase) in excluded_norm:
+        plan.skipped_reason = f"excluded phase: {phase}"
+        return plan
+
+    name_map = build_card_name_lookup(card)
+    if id_names:
+        for k, v in id_names.items():
+            if v:
+                name_map[str(k)] = str(v)
+
+    def _names(ids: Sequence[str]) -> List[str]:
+        return [name_map.get(str(i), str(i)) for i in ids]
+
+    wanted = {str(f) for f in (field_ids or set())}
+    uid = str(new_id)
+    seen: Set[str] = set()
+    for fnode in card.get("fields") or []:
+        meta = (fnode or {}).get("field") or {}
+        fid = str(meta.get("id")) if meta.get("id") is not None else None
+        if not fid or meta.get("type") not in ASSIGNEE_FIELD_TYPES or fid not in wanted:
+            continue
+        seen.add(fid)
+        ids = parse_field_user_ids(fnode)
+        if uid in ids:
+            continue
+        new_ids = ids + [uid]
+        label = (meta.get("label") or "").strip() or None
+        plan.actions.append(PlannedAction(
+            f"field:{fid}", fid, ids, new_ids, field_label=label, mode="add_only",
+            old_names=_names(ids), new_names=_names(new_ids),
+        ))
+
+    if field_meta:
+        for fid in sorted(wanted - seen):
+            meta = field_meta.get(fid) or {}
+            label = (meta.get("label") or "").strip() or None
+            plan.actions.append(PlannedAction(
+                f"field:{fid}", fid, [], [uid], field_label=label, mode="add_only",
+                old_names=[], new_names=_names([uid]),
             ))
 
     return plan

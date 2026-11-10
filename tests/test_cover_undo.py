@@ -298,7 +298,7 @@ def test_history_prefers_shared_sheet(monkeypatch):
     # Rebuild with a sheet sink that has team rows.
     monkeypatch.setattr(web, "build_sheet_sink", lambda *a, **kw: FakeHistorySink(rows))
     c = web.create_app().test_client()
-    data = c.get("/api/history").get_json()
+    data = c.get("/api/history?days=all").get_json()
     assert data["source"] == "sheet"
     assert data["records"][0]["operator_email"] == "other@upandupgroup.com"
 
