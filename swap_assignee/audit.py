@@ -74,6 +74,7 @@ AUDIT_COLUMNS = (
     "status",
     "error",
     "operation",
+    "run_id",   # one id per Apply click, so History can group rows back into one change
 )
 
 
@@ -125,6 +126,7 @@ def build_records(
     status: str,
     error: str = "",
     operation: str = "replace",
+    run_id: str = "",
 ) -> List[Dict[str, Any]]:
     """One audit record per planned action on a card (card-level + each field)."""
     ts = _now_iso()
@@ -146,6 +148,7 @@ def build_records(
         "status": status,
         "error": error or "",
         "operation": operation,
+        "run_id": run_id or "",
     }
     out: List[Dict[str, Any]] = []
     for a in plan_dict.get("actions") or []:
@@ -280,6 +283,7 @@ def record_swap(
     error: str = "",
     operation: str = "replace",
     sheet_sink: Any = None,
+    run_id: str = "",
 ) -> List[Dict[str, Any]]:
     """Build records for one applied card, persist locally, mirror to webhook/sheet."""
     records = build_records(
@@ -293,6 +297,7 @@ def record_swap(
         status=status,
         error=error,
         operation=operation,
+        run_id=run_id,
     )
     try:
         store.append(records)
