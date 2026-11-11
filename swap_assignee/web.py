@@ -1474,7 +1474,7 @@ INDEX_HTML = r"""<!doctype html>
           <button id="notificationsMarkAll" class="linkish" type="button">Mark all as read</button>
           <button id="notificationsRefresh" class="linkish" type="button">Refresh</button>
         </div>
-        <p class="small">Changes made by or affecting your agency, plus developer errors for DYDX Digital.</p>
+        <p class="small" id="notificationsScope">Changes made by or involving people in your agency.</p>
         <div id="notificationsList" class="notice-list"></div>
       </div>
     </div>
@@ -3048,6 +3048,11 @@ function applyDeveloperAccess(email) {
   const isDev = /@dydx\.digital$/i.test(email || '');
   logsEnabled = isDev;
   $('devPanel').classList.toggle('hidden', !isDev);
+  // Other agencies only ever see their own agency's changes, so don't
+  // mention developer errors or DYDX to them.
+  $('notificationsScope').textContent = isDev
+    ? 'Every change made with the tool, plus developer warnings and errors.'
+    : 'Changes made by or involving people in your agency.';
   if (!isDev) $('devPanel').open = false;
 }
 
