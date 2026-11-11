@@ -25,6 +25,10 @@ Environment=SWAP_URL_PREFIX=/user-management-staging
 Environment=SWAP_ENV_LABEL=Staging
 # Keep this copy's local history separate from the live one's.
 Environment=SWAP_AUDIT_STORE=/home/ubuntu/.swap_assignee/history-staging.jsonl
+# The test pipe(s) staging may use are set in .env, e.g.
+#   SWAP_PIPES=306999999:Staging test pipe
+# With SWAP_PIPES set, staging shows only those pipes and refuses any
+# other pipe, so it can't change cards on the real boards.
 
 # One worker, 2 threads: enough for testing, and lighter than live.
 ExecStart=/home/ubuntu/user-management-staging/.venv/bin/gunicorn \

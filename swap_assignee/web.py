@@ -101,6 +101,32 @@ def url_prefix_from_env() -> str:
     return prefix
 
 
+def pipes_from_env() -> Optional[List[Dict[str, str]]]:
+    """Board list override from SWAP_PIPES, or None to use KNOWN_PIPES.
+
+    Format: comma-separated "<pipe id>:<name>" pairs, e.g.
+    SWAP_PIPES=306999999:Staging test pipe. A staging copy sets this to a
+    test pipe so it can never touch the real boards; when it's set, the
+    server also refuses requests for any other pipe.
+    """
+    raw = (os.environ.get("SWAP_PIPES") or "").strip()
+    if not raw:
+        return None
+    pipes: List[Dict[str, str]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pid, sep, name = part.partition(":")
+        pid, name = pid.strip(), name.strip()
+        if not sep or not pid.isdigit() or not name:
+            raise SystemExit(f"SWAP_PIPES entry {part!r} must look like 306999999:Pipe name")
+        pipes.append({"id": pid, "name": name})
+    if not pipes:
+        raise SystemExit("SWAP_PIPES is set but lists no pipes")
+    return pipes
+
+
 def session_cookie_name(prefix: str) -> str:
     """One cookie per copy of the app: /user-management -> user_management_session
     (unchanged for the live site), /user-management-staging ->
@@ -3775,6 +3801,24 @@ def create_app(config_path: str = "config.ini") -> Flask:
     # copy can't be mistaken for the live tool. Empty on the live site.
     env_label = (os.environ.get("SWAP_ENV_LABEL") or "").strip()
     index_html = render_index_html(url_prefix, env_label)
+    # SWAP_PIPES replaces the board list (e.g. staging -> a test pipe only).
+    pipe_override = pipes_from_env()
+    if pipe_override is not None:
+        global KNOWN_PIPES
+        KNOWN_PIPES = pipe_override
+        log.info("Board list limited by SWAP_PIPES to: %s",
+                 ", ".join(f"{p['name']} ({p['id']})" for p in pipe_override))
+
+    def _pipes_refused(pipe_ids) -> Optional[Response]:
+        """With SWAP_PIPES set, refuse any pipe that isn't in it, so a
+        staging copy can't be pointed at a real board by a crafted request."""
+        if pipe_override is None:
+            return None
+        allowed = {p["id"] for p in KNOWN_PIPES}
+        bad = sorted({str(x) for x in pipe_ids if str(x) not in allowed})
+        if not bad:
+            return None
+        return jsonify({"error": f"Pipe(s) {', '.join(bad)} aren't available on this copy of the tool."}), 403
     if not cfg.pipefy_api_token:
         raise SystemExit(
             "Pipefy API token missing. Set [Pipefy] pipefy_api_token in config.ini or PIPEFY_API_TOKEN env var."
@@ -4066,6 +4110,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
     def api_load():
         body = request.get_json(force=True, silent=True) or {}
         pipe_id = (body.get("pipe_id") or "").strip()
+        refused = _pipes_refused([pipe_id] if pipe_id else [])
+        if refused is not None:
+            return refused
         old_user = (body.get("old_user") or "").strip()
         new_user = (body.get("new_user") or "").strip()
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
@@ -4296,6 +4343,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
     @app.post("/api/preview")
     def api_preview():
         body = request.get_json(force=True, silent=True) or {}
+        refused = _pipes_refused([str(body.get("pipe_id") or "").strip()] if body.get("pipe_id") else [])
+        if refused is not None:
+            return refused
         try:
             return jsonify(_run_preview(body))
         except UserResolutionError as exc:
@@ -4307,6 +4357,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
     @app.post("/api/preview/stream")
     def api_preview_stream():
         body = request.get_json(force=True, silent=True) or {}
+        refused = _pipes_refused([str(body.get("pipe_id") or "").strip()] if body.get("pipe_id") else [])
+        if refused is not None:
+            return refused
 
         def _gen():
             try:
@@ -4451,6 +4504,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         """
         body = request.get_json(force=True, silent=True) or {}
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        refused = _pipes_refused(pipe_ids)
+        if refused is not None:
+            return refused
         if not pipe_ids:
             return jsonify({"error": "pipe_ids is required."}), 400
 
@@ -4534,6 +4590,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
           return jsonify({"error": "operation must be 'replace' or 'add'."}), 400
         org_id_override = (body.get("org_id") or "").strip() or None
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        refused = _pipes_refused(pipe_ids)
+        if refused is not None:
+            return refused
         exclude_phases = list(body.get("exclude_phases") or [])
         # Per-pipe phase exclusions {pipe_id: [names]}; falls back to the
         # flat `exclude_phases` list for any pipe not in the map.
@@ -4695,6 +4754,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         match_text = (body.get("match_text") or "").strip()
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        refused = _pipes_refused(pipe_ids)
+        if refused is not None:
+            return refused
         exclude_phases = list(body.get("exclude_phases") or [])
         raw_excl = body.get("exclude_phases_by_pipe") or {}
         exclude_by_pipe = {

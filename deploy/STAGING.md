@@ -12,14 +12,17 @@ happy.
 | Port              | 5010                              | 5011                                      |
 | Service           | `user-management`                 | `user-management-staging`                 |
 | Code              | `main`                            | whichever branch you're testing           |
+| Boards            | the 9 real boards                 | only your test pipe (`SWAP_PIPES`)        |
 | History / Sheet   | the team's audit Sheet            | a separate staging Sheet                  |
 
 The staging page has a coral **STAGING** banner and `[Staging]` in the
 tab title, and its own sign-in, so the two can't be mixed up.
 
-> **Staging still changes real Pipefy cards.** There is no test Pipefy.
-> "Find their jobs" (the test run) never changes anything, so scan freely,
-> but only press **Apply** on test cards (e.g. `dydxtest` cards).
+> **Staging uses the real Pipefy**, so give it a test pipe of its own
+> (step 2 below). With `SWAP_PIPES` set, staging only shows that pipe and
+> the server refuses requests for any other one, so it can't change cards
+> on the real boards. Without it, staging shows the real boards: only
+> press **Apply** on test cards then.
 
 ## One-time setup
 
@@ -40,7 +43,20 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-### 2. A separate Google Sheet
+### 2. A test pipe in Pipefy
+
+1. In Pipefy, make a copy of a real board, e.g. clone **Account
+   Management** without its cards. It needs the same role fields
+   (Account Manager, Job Owner, …) and similar phase names (Completed,
+   Cancelled, …), or the tool won't behave as it does on real boards.
+   It must be in the same organization as the tool's Pipefy token.
+2. Add a few test cards and assign test people on them.
+3. Copy the pipe's ID from its address in Pipefy (the number after
+   `/pipes/`).
+
+You'll put it in `.env` in step 4.
+
+### 3. A separate Google Sheet
 
 So test changes don't show up in the team's History or notifications:
 
@@ -55,7 +71,7 @@ So test changes don't show up in the team's History or notifications:
 
 The app creates the tabs and header rows itself on first use.
 
-### 3. Settings
+### 4. Settings
 
 Start from the live copy's settings and change the Sheet ID:
 
@@ -67,10 +83,25 @@ nano config.ini
 ```
 
 Under `[Audit]`, set `sheet_id = <the staging Sheet ID>`. Everything else
-(Pipefy token, key path, password) can stay the same. The URL, banner and
-separate local history are set in the service file, not here.
+(Pipefy token, key path, password) can stay the same.
 
-### 4. Service
+Then limit staging to the test pipe:
+
+```bash
+nano .env
+```
+
+Add one line with the pipe's ID and a name (several pipes: separate them
+with commas):
+
+```
+SWAP_PIPES=306999999:Staging test pipe
+```
+
+The URL, banner and separate local history are set in the service file,
+not here.
+
+### 5. Service
 
 ```bash
 sudo cp deploy/user-management-staging.service /etc/systemd/system/
@@ -80,8 +111,16 @@ curl -s http://127.0.0.1:5011/user-management-staging/api/session
 ```
 
 The last command should print JSON ending in `"password_required":true`.
+Check staging only lists the test pipe:
 
-### 5. nginx
+```bash
+sudo journalctl -u user-management-staging -n 20 --no-pager | grep "Board list"
+```
+
+It should print `Board list limited by SWAP_PIPES to: …` with your test
+pipe.
+
+### 6. nginx
 
 Back up, then paste the two `location` blocks from
 `deploy/nginx-user-management-staging.conf` into the same `server { }`
