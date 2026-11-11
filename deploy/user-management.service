@@ -16,7 +16,9 @@ After=network.target
 [Service]
 User=ubuntu
 WorkingDirectory=/home/ubuntu/user-management
-# Secrets and settings, one KEY=value per line (template: deploy/env.example).
+# Settings come from config.ini in WorkingDirectory and/or this file
+# (KEY=value lines; template: deploy/env.example). .env must exist, even
+# if empty. Values in .env override config.ini.
 EnvironmentFile=/home/ubuntu/user-management/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=MALLOC_ARENA_MAX=2
