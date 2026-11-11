@@ -1474,7 +1474,7 @@ INDEX_HTML = r"""<!doctype html>
           <button id="notificationsMarkAll" class="linkish" type="button">Mark all as read</button>
           <button id="notificationsRefresh" class="linkish" type="button">Refresh</button>
         </div>
-        <p class="small" id="notificationsScope">Changes made by or involving people in your agency.</p>
+        <p class="small" id="notificationsScope">Changes other people made that involve your agency. Your own changes are in History.</p>
         <div id="notificationsList" class="notice-list"></div>
       </div>
     </div>
@@ -3051,8 +3051,8 @@ function applyDeveloperAccess(email) {
   // Other agencies only ever see their own agency's changes, so don't
   // mention developer errors or DYDX to them.
   $('notificationsScope').textContent = isDev
-    ? 'Every change made with the tool, plus developer warnings and errors.'
-    : 'Changes made by or involving people in your agency.';
+    ? "Other people's changes, plus developer warnings and errors. Your own changes are in History."
+    : "Changes other people made that involve your agency. Your own changes are in History.";
   if (!isDev) $('devPanel').open = false;
 }
 
@@ -3940,6 +3940,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
             if not (is_developer or viewer_domain in domains):
                 continue
             failed = change["failed_count"]
+            # Your own changes that fully worked are noise in the bell (you
+            # already know about them; History has them). Keep your own
+            # failures, and everything other people did.
+            if viewer and normalize_email(change.get("operator_email")) == viewer and not failed:
+                continue
             notifications.append({
                 "id": "change:" + (change.get("run_id") or f"{change.get('ts')}:{change.get('pipe_id')}:{change.get('mode')}"),
                 "ts": _record_epoch({"ts": change.get("ts")}),

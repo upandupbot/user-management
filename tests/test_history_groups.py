@@ -87,3 +87,45 @@ def test_history_api_and_notifications_use_grouped_changes(monkeypatch):
         "Katekani Nyamandi was replaced with Simphiwe Zungu on 3 jobs in Account Management."
     )
     assert notes[0]["by"] == "Robyn Seymour"
+
+
+def test_bell_hides_your_own_successful_changes_only(monkeypatch):
+    mine_ok = _row("2026-11-06T10:30:00Z", "C1", "Job Owner", run_id="mine-ok",
+                   operator_email="robyn.seymour@mcsaatchiabel.co.za")
+    mine_failed = _row("2026-11-06T10:20:00Z", "C2", "Job Owner", run_id="mine-failed",
+                       operator_email="robyn.seymour@mcsaatchiabel.co.za", status="error", error="Card was locked")
+    other_involving_me = _row("2026-11-06T10:10:00Z", "C3", "Job Owner", run_id="other",
+                              operator_email="sam@mcsaatchiabel.co.za",
+                              old_user="Robyn Seymour <robyn.seymour@mcsaatchiabel.co.za>")
+    dev_own = _row("2026-11-06T10:00:00Z", "C4", "Job Owner", run_id="dev-own",
+                   operator_email="katekani@dydx.digital")
+    rows = [mine_ok, mine_failed, other_involving_me, dev_own]
+
+    class FakeAuditStore:
+        retention_days = 365
+
+        def recent(self, *, limit=0, days=None):
+            return list(rows)
+
+    monkeypatch.setattr(web, "AuditStore", FakeAuditStore)
+    monkeypatch.setattr(web.time, "time", lambda: 1794000000.0)  # 2026-11-06
+
+    def change_ids(email):
+        client = _client(monkeypatch)
+        client.post("/api/auth", json={"email": email})
+        notes = client.get("/api/notifications").get_json()["notifications"]
+        return {n["id"] for n in notes if n["kind"] == "change"}
+
+    robyn = change_ids("robyn.seymour@mcsaatchiabel.co.za")
+    assert "change:mine-ok" not in robyn          # own success: hidden
+    assert "change:mine-failed" in robyn          # own failure: kept
+    assert "change:other" in robyn                # someone else's change involving her: kept
+
+    kate = change_ids("katekani@dydx.digital")
+    assert "change:dev-own" not in kate           # dydx users too
+    assert "change:mine-ok" in kate               # but they still see everyone else's
+
+    # History is unchanged: your own changes are all still there.
+    client = _client(monkeypatch)
+    client.post("/api/auth", json={"email": "robyn.seymour@mcsaatchiabel.co.za"})
+    assert client.get("/api/history?days=all").get_json()["change_count"] == 4
