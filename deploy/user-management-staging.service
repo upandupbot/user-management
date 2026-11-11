@@ -1,0 +1,43 @@
+# systemd unit for the STAGING copy of the user-management app.
+# Runs next to the live copy: its own folder, port (5011), URL
+# (/user-management-staging), banner, sign-in cookie and history.
+# Setup and day-to-day use: deploy/STAGING.md
+#
+# Install:
+#   sudo cp deploy/user-management-staging.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now user-management-staging
+
+[Unit]
+Description=User management (Pipefy assignee swap) web UI - STAGING
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/user-management-staging
+# Settings come from config.ini in WorkingDirectory and/or this file.
+# .env must exist, even if empty.
+EnvironmentFile=/home/ubuntu/user-management-staging/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=SWAP_WEB_ALLOW_INSECURE_COOKIE=1
+# What makes this the staging copy:
+Environment=SWAP_URL_PREFIX=/user-management-staging
+Environment=SWAP_ENV_LABEL=Staging
+# Keep this copy's local history separate from the live one's.
+Environment=SWAP_AUDIT_STORE=/home/ubuntu/.swap_assignee/history-staging.jsonl
+# The test pipe(s) staging may use are set in .env, e.g.
+#   SWAP_PIPES=306999999:Staging test pipe
+# With SWAP_PIPES set, staging shows only those pipes and refuses any
+# other pipe, so it can't change cards on the real boards.
+
+# One worker, 2 threads: enough for testing, and lighter than live.
+ExecStart=/home/ubuntu/user-management-staging/.venv/bin/gunicorn \
+    --workers 1 --threads 2 --timeout 600 \
+    --bind 127.0.0.1:5011 \
+    'swap_assignee.web:create_app()'
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

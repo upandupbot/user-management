@@ -20,6 +20,7 @@ import collections
 import hashlib
 import json
 import logging
+import html
 import os
 import re
 import secrets
@@ -83,25 +84,92 @@ from .cover_store import build_cover_store
 log = logging.getLogger("swap_assignee.web")
 
 USER_MANAGEMENT_PREFIX = "/user-management"
+_PREFIX_RE = re.compile(r"^(/[A-Za-z0-9_-]+)+$")
+
+
+def url_prefix_from_env() -> str:
+    """The path the app is served under, from SWAP_URL_PREFIX.
+
+    Defaults to /user-management (the live site). A staging copy sets e.g.
+    SWAP_URL_PREFIX=/user-management-staging. Only letters, digits, "-",
+    "_" and "/" are allowed, because the value is written into the page.
+    """
+    raw = (os.environ.get("SWAP_URL_PREFIX") or USER_MANAGEMENT_PREFIX).strip()
+    prefix = "/" + raw.strip("/")
+    if not _PREFIX_RE.match(prefix):
+        raise SystemExit(f"SWAP_URL_PREFIX {raw!r} is not a simple path like /user-management")
+    return prefix
+
+
+def pipes_from_env() -> Optional[List[Dict[str, str]]]:
+    """Board list override from SWAP_PIPES, or None to use KNOWN_PIPES.
+
+    Format: comma-separated "<pipe id>:<name>" pairs, e.g.
+    SWAP_PIPES=306999999:Staging test pipe. A staging copy sets this to a
+    test pipe so it can never touch the real boards; when it's set, the
+    server also refuses requests for any other pipe.
+    """
+    raw = (os.environ.get("SWAP_PIPES") or "").strip()
+    if not raw:
+        return None
+    pipes: List[Dict[str, str]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pid, sep, name = part.partition(":")
+        pid, name = pid.strip(), name.strip()
+        if not sep or not pid.isdigit() or not name:
+            raise SystemExit(f"SWAP_PIPES entry {part!r} must look like 306999999:Pipe name")
+        pipes.append({"id": pid, "name": name})
+    if not pipes:
+        raise SystemExit("SWAP_PIPES is set but lists no pipes")
+    return pipes
+
+
+def session_cookie_name(prefix: str) -> str:
+    """One cookie per copy of the app: /user-management -> user_management_session
+    (unchanged for the live site), /user-management-staging ->
+    user_management_staging_session, so live and staging sign-ins on the
+    same host never overwrite each other."""
+    return prefix.strip("/").replace("-", "_").replace("/", "_") + "_session"
 
 
 class UserManagementPrefixMiddleware:
-    """Mount the Flask app below /user-management for reverse-proxy hosting.
+    """Mount the Flask app below its URL prefix for reverse-proxy hosting.
 
     nginx forwards the full path (e.g. /user-management/api/session); this
     moves the prefix into SCRIPT_NAME so Flask routes stay unprefixed.
     Unprefixed paths remain accepted for local development and tests.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, prefix: str = USER_MANAGEMENT_PREFIX):
         self.app = app
+        self.prefix = prefix
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
-        if path == USER_MANAGEMENT_PREFIX or path.startswith(USER_MANAGEMENT_PREFIX + "/"):
-            environ["SCRIPT_NAME"] = USER_MANAGEMENT_PREFIX
-            environ["PATH_INFO"] = path[len(USER_MANAGEMENT_PREFIX):] or "/"
+        if path == self.prefix or path.startswith(self.prefix + "/"):
+            environ["SCRIPT_NAME"] = self.prefix
+            environ["PATH_INFO"] = path[len(self.prefix):] or "/"
         return self.app(environ, start_response)
+
+
+def render_index_html(prefix: str, env_label: str = "") -> str:
+    """The page with this copy's URL prefix and, for non-live copies, a
+    banner naming the environment (e.g. "Staging")."""
+    label = html.escape(env_label.strip())
+    banner = (
+        f'<div class="env-banner" role="status"><b>{label}</b> &middot; '
+        "Not the live tool. Pipefy changes made here are real: only apply to test cards.</div>"
+        if label else ""
+    )
+    return (
+        INDEX_HTML
+        .replace("__APP_PREFIX__", prefix)
+        .replace("__ENV_TITLE__", f"[{label}] " if label else "")
+        .replace("__ENV_BANNER__", banner)
+    )
 
 
 # ---------- in-memory log ring for the Developer panel ----------
@@ -251,7 +319,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>slipstream — Assignee Swap</title>
+  <title>__ENV_TITLE__slipstream — Assignee Swap</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23FFFFFF'/%3E%3Ctext x='32' y='50' font-family='Bodoni MT,Didot,Georgia,serif' font-size='52' font-weight='800' text-anchor='middle'%3E%3Ctspan fill='%23F2623A'%3Es%3C/tspan%3E%3Ctspan fill='%23F9BEC0'%3Es%3C/tspan%3E%3C/text%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1420,6 +1488,9 @@ INDEX_HTML = r"""<!doctype html>
     .alert.warn { background: #fff; border-color: var(--line); border-left-color: var(--warn); color: var(--ink); }
     .alert.ok { background: #fff; border-color: var(--line); border-left-color: var(--ink); color: var(--ink); }
 
+    .env-banner { background: var(--coral); color: #fff; font-size: 13.5px; text-align: center; padding: 8px 16px; }
+    .env-banner b { text-transform: uppercase; letter-spacing: .06em; }
+
     footer { background: var(--ink); color: #bdbdbd; font-size: 12px; border-top: 4px solid var(--coral); }
     footer { padding: 0 40px; }
     footer .wrap { max-width: var(--page-width); padding: 16px 0; }
@@ -1446,6 +1517,7 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
+__ENV_BANNER__
 
 <!-- Sign-in gate — blocks the whole app until a valid company email (and,
      when hosted, the shared password) is accepted by the server. The server
@@ -1476,14 +1548,14 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <div class="wrap topbar">
     <div class="brand-lockup">
-      <img class="brand-logo" src="/user-management/static/slipstream-logo.png" alt="slipstream">
+      <img class="brand-logo" src="__APP_PREFIX__/static/slipstream-logo.png" alt="slipstream">
     </div>
     <div class="header-divider"></div>
     <div class="product-heading">
       <strong>Assignee Swap</strong>
       <span>User management tool for Slipstream</span>
     </div>
-    <img class="header-mark" src="/user-management/static/swap-icon.svg" alt="" aria-hidden="true">
+    <img class="header-mark" src="__APP_PREFIX__/static/swap-icon.svg" alt="" aria-hidden="true">
     <div class="notif-wrap">
       <button id="notificationsBell" class="notif-button" type="button" aria-label="Open notifications" title="Notifications">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg><span id="notificationsBadge" class="notif-badge hidden">0</span>
@@ -1857,7 +1929,10 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const APP_PREFIX = '/user-management';
+const APP_PREFIX = '__APP_PREFIX__';
+// Browser storage is shared by every copy on this host; keep the live
+// site's keys unchanged and give other copies (staging) their own.
+const STORAGE_SUFFIX = APP_PREFIX === '/user-management' ? '' : ':' + APP_PREFIX;
 const appUrl = (path) => APP_PREFIX + path;
 
 let operatorEmail = '';  // set once the sign-in gate is cleared
@@ -3042,7 +3117,7 @@ $('devPanel').addEventListener('toggle', () => {
 $('logClear').addEventListener('click', () => { $('logView').innerHTML = ''; });
 
 // ---------- sign-in gate ----------
-const GATE_KEY = 'slipstream.operatorEmail';
+const GATE_KEY = 'slipstream.operatorEmail' + STORAGE_SUFFIX;
 let gatePasswordRequired = false;
 
 async function tryAuth(email, password) {
@@ -3216,7 +3291,7 @@ function fmtNoticeTs(ts) {
 
 // Read/unread state lives in this browser, per signed-in email.
 let _notifRows = [];
-const NOTIF_READ_PREFIX = 'slipstream.notificationsRead.';
+const NOTIF_READ_PREFIX = 'slipstream.notificationsRead' + STORAGE_SUFFIX + '.';
 
 function notifKey(n) { return `${n.id}|${n.ts}`; }
 
@@ -3721,6 +3796,29 @@ initGate();
 def create_app(config_path: str = "config.ini") -> Flask:
     app = Flask(__name__)
     cfg = load_config(config_path)
+    url_prefix = url_prefix_from_env()
+    # SWAP_ENV_LABEL (e.g. "Staging") puts a banner on the page so a test
+    # copy can't be mistaken for the live tool. Empty on the live site.
+    env_label = (os.environ.get("SWAP_ENV_LABEL") or "").strip()
+    index_html = render_index_html(url_prefix, env_label)
+    # SWAP_PIPES replaces the board list (e.g. staging -> a test pipe only).
+    pipe_override = pipes_from_env()
+    if pipe_override is not None:
+        global KNOWN_PIPES
+        KNOWN_PIPES = pipe_override
+        log.info("Board list limited by SWAP_PIPES to: %s",
+                 ", ".join(f"{p['name']} ({p['id']})" for p in pipe_override))
+
+    def _pipes_refused(pipe_ids) -> Optional[Response]:
+        """With SWAP_PIPES set, refuse any pipe that isn't in it, so a
+        staging copy can't be pointed at a real board by a crafted request."""
+        if pipe_override is None:
+            return None
+        allowed = {p["id"] for p in KNOWN_PIPES}
+        bad = sorted({str(x) for x in pipe_ids if str(x) not in allowed})
+        if not bad:
+            return None
+        return jsonify({"error": f"Pipe(s) {', '.join(bad)} aren't available on this copy of the tool."}), 403
     if not cfg.pipefy_api_token:
         raise SystemExit(
             "Pipefy API token missing. Set [Pipefy] pipefy_api_token in config.ini or PIPEFY_API_TOKEN env var."
@@ -3746,7 +3844,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         # but give it its own name so it can't clash with other apps served
         # from the same host (the default Flask cookie is just "session").
         SESSION_COOKIE_PATH="/",
-        SESSION_COOKIE_NAME="user_management_session",
+        SESSION_COOKIE_NAME=session_cookie_name(url_prefix),
         # HTTPS-only cookies when hosted; opt out for local testing with a
         # password by setting SWAP_WEB_ALLOW_INSECURE_COOKIE=1.
         SESSION_COOKIE_SECURE=password_required
@@ -3754,7 +3852,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
     )
     # Render/Fly terminate TLS at a proxy; trust one hop of X-Forwarded-*.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # type: ignore[method-assign]
-    app.wsgi_app = UserManagementPrefixMiddleware(app.wsgi_app)  # type: ignore[method-assign]
+    app.wsgi_app = UserManagementPrefixMiddleware(app.wsgi_app, url_prefix)  # type: ignore[method-assign]
 
     _AUTH_FAIL_LOCK = threading.Lock()
     _auth_failures = {"count": 0, "window_start": 0.0}
@@ -3799,7 +3897,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
 
     @app.get("/")
     def index() -> Response:  # type: ignore[override]
-        return Response(INDEX_HTML, mimetype="text/html; charset=utf-8")
+        return Response(index_html, mimetype="text/html; charset=utf-8")
 
     @app.get("/api/session")
     def api_session():
@@ -4012,6 +4110,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
     def api_load():
         body = request.get_json(force=True, silent=True) or {}
         pipe_id = (body.get("pipe_id") or "").strip()
+        refused = _pipes_refused([pipe_id] if pipe_id else [])
+        if refused is not None:
+            return refused
         old_user = (body.get("old_user") or "").strip()
         new_user = (body.get("new_user") or "").strip()
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
@@ -4242,6 +4343,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
     @app.post("/api/preview")
     def api_preview():
         body = request.get_json(force=True, silent=True) or {}
+        refused = _pipes_refused([str(body.get("pipe_id") or "").strip()] if body.get("pipe_id") else [])
+        if refused is not None:
+            return refused
         try:
             return jsonify(_run_preview(body))
         except UserResolutionError as exc:
@@ -4253,6 +4357,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
     @app.post("/api/preview/stream")
     def api_preview_stream():
         body = request.get_json(force=True, silent=True) or {}
+        refused = _pipes_refused([str(body.get("pipe_id") or "").strip()] if body.get("pipe_id") else [])
+        if refused is not None:
+            return refused
 
         def _gen():
             try:
@@ -4397,6 +4504,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         """
         body = request.get_json(force=True, silent=True) or {}
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        refused = _pipes_refused(pipe_ids)
+        if refused is not None:
+            return refused
         if not pipe_ids:
             return jsonify({"error": "pipe_ids is required."}), 400
 
@@ -4480,6 +4590,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
           return jsonify({"error": "operation must be 'replace' or 'add'."}), 400
         org_id_override = (body.get("org_id") or "").strip() or None
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        refused = _pipes_refused(pipe_ids)
+        if refused is not None:
+            return refused
         exclude_phases = list(body.get("exclude_phases") or [])
         # Per-pipe phase exclusions {pipe_id: [names]}; falls back to the
         # flat `exclude_phases` list for any pipe not in the map.
@@ -4641,6 +4754,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         match_text = (body.get("match_text") or "").strip()
         org_id_override = (body.get("org_id") or "").strip() or cfg.org_id
         pipe_ids = [str(x) for x in (body.get("pipe_ids") or []) if x]
+        refused = _pipes_refused(pipe_ids)
+        if refused is not None:
+            return refused
         exclude_phases = list(body.get("exclude_phases") or [])
         raw_excl = body.get("exclude_phases_by_pipe") or {}
         exclude_by_pipe = {
