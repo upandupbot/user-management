@@ -93,7 +93,7 @@ See `python -m swap_assignee.cli --help`. Highlights:
 python -m swap_assignee.web
 ```
 
-Then open http://127.0.0.1:5000. The UI mirrors the CLI with a few quality-of-life extras:
+Then open http://127.0.0.1:5000/user-management/. The UI mirrors the CLI with a few quality-of-life extras. The app's browser and API endpoints are mounted under `/user-management` for reverse-proxy hosting.
 
 - **Sign in with your company email.** On first load an email gate asks for an approved Up&Up-group email (used for the audit trail). It's remembered in your browser and re-checked server-side on every apply.
 - **Pick a pipe** from the horizontal chip selector (pipe names only; the pipe id shows as a tooltip), or choose **Other** to type an id manually.

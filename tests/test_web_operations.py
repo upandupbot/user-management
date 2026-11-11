@@ -89,6 +89,18 @@ def test_wizard_scan_rejects_invalid_operation(monkeypatch):
     assert response.get_json()["error"] == "operation must be 'replace' or 'add'."
 
 
+def test_user_management_prefix_serves_ui_and_api(monkeypatch):
+    client = _client(monkeypatch)
+    page = client.get("/user-management/")
+    session = client.get("/user-management/api/session")
+    assert page.status_code == 200
+    assert b"user-management" in page.data
+    assert session.status_code == 200
+    assert b'src="/static/' not in page.data
+    assert client.get("/user-management/static/swap-icon.svg").status_code == 200
+    assert client.get("/user-management").status_code == 200
+
+
 def test_wizard_add_stream_preserves_existing_assignees(monkeypatch):
     client = _client(monkeypatch)
     response = client.post("/api/wizard/scan/stream", json={
