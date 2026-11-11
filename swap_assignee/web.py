@@ -82,6 +82,27 @@ from .cover_store import build_cover_store
 
 log = logging.getLogger("swap_assignee.web")
 
+USER_MANAGEMENT_PREFIX = "/user-management"
+
+
+class UserManagementPrefixMiddleware:
+    """Mount the Flask app below /user-management for reverse-proxy hosting.
+
+    nginx forwards the full path (e.g. /user-management/api/session); this
+    moves the prefix into SCRIPT_NAME so Flask routes stay unprefixed.
+    Unprefixed paths remain accepted for local development and tests.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if path == USER_MANAGEMENT_PREFIX or path.startswith(USER_MANAGEMENT_PREFIX + "/"):
+            environ["SCRIPT_NAME"] = USER_MANAGEMENT_PREFIX
+            environ["PATH_INFO"] = path[len(USER_MANAGEMENT_PREFIX):] or "/"
+        return self.app(environ, start_response)
+
 
 # ---------- in-memory log ring for the Developer panel ----------
 _LOG_RING: Deque[Dict[str, Any]] = collections.deque(maxlen=500)
@@ -1455,14 +1476,14 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <div class="wrap topbar">
     <div class="brand-lockup">
-      <img class="brand-logo" src="/static/slipstream-logo.png" alt="slipstream">
+      <img class="brand-logo" src="/user-management/static/slipstream-logo.png" alt="slipstream">
     </div>
     <div class="header-divider"></div>
     <div class="product-heading">
       <strong>Assignee Swap</strong>
       <span>User management tool for Slipstream</span>
     </div>
-    <img class="header-mark" src="/static/swap-icon.svg" alt="" aria-hidden="true">
+    <img class="header-mark" src="/user-management/static/swap-icon.svg" alt="" aria-hidden="true">
     <div class="notif-wrap">
       <button id="notificationsBell" class="notif-button" type="button" aria-label="Open notifications" title="Notifications">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg><span id="notificationsBadge" class="notif-badge hidden">0</span>
@@ -1836,12 +1857,14 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 const $ = (id) => document.getElementById(id);
+const APP_PREFIX = '/user-management';
+const appUrl = (path) => APP_PREFIX + path;
 
 let operatorEmail = '';  // set once the sign-in gate is cleared
 
 // ---------- helpers ----------
 async function api(path, body) {
-  const r = await fetch(path, {
+  const r = await fetch(appUrl(path), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {}),
@@ -2280,7 +2303,7 @@ async function runWizardScan() {
 
   try {
     const isAssign = wizOperation === 'assign';
-    const endpoint = isAssign ? '/api/assign/scan/stream' : '/api/wizard/scan/stream';
+    const endpoint = appUrl(isAssign ? '/api/assign/scan/stream' : '/api/wizard/scan/stream');
     const payload = isAssign ? {
       user: $('newUser').value.trim(),
       match_text: (wizUsers && wizUsers.match_text) || $('clientText').value.trim(),
@@ -2784,7 +2807,7 @@ const _activeApplyIds = new Set();
 window.addEventListener('pagehide', () => {
   _activeApplyIds.forEach(id => {
     try {
-      navigator.sendBeacon('/api/apply/cancel',
+      navigator.sendBeacon(appUrl('/api/apply/cancel'),
         new Blob([JSON.stringify({ apply_id: id })], { type: 'application/json' }));
     } catch (e) {}
   });
@@ -3024,7 +3047,7 @@ let gatePasswordRequired = false;
 
 async function tryAuth(email, password) {
   try {
-    const r = await fetch('/api/auth', {
+    const r = await fetch(appUrl('/api/auth'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password: password || '' }),
@@ -3068,7 +3091,7 @@ function unlockApp(email) {
 }
 
 async function signOut() {
-  try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+  try { await fetch(appUrl('/api/logout'), { method: 'POST' }); } catch (e) {}
   try { localStorage.removeItem(GATE_KEY); } catch (e) {}
   window.location.reload();
 }
@@ -3106,7 +3129,7 @@ async function initGate() {
   if (saved) $('gateEmail').value = saved;
   // Ask the server whether we already have a signed session cookie.
   try {
-    const r = await fetch('/api/session');
+    const r = await fetch(appUrl('/api/session'));
     const s = await r.json();
     gatePasswordRequired = !!s.password_required;
     applyDeveloperAccess(s.authed && s.developer ? s.email : '');
@@ -3164,7 +3187,7 @@ async function loadHistory() {
       if ($('historyFrom').value) params.set('from', $('historyFrom').value);
       if ($('historyTo').value) params.set('to', $('historyTo').value);
     }
-    const r = await fetch('/api/history?' + params.toString());
+    const r = await fetch(appUrl('/api/history?' + params.toString()));
     const data = await r.json();
     if (seq !== _historySeq) return;
     const opts = data.options || {};
@@ -3271,7 +3294,7 @@ function renderNotifications() {
 async function loadNotifications() {
   $('notificationsStatus').textContent = 'Loading…';
   try {
-    const r = await fetch('/api/notifications');
+    const r = await fetch(appUrl('/api/notifications'));
     const data = await r.json();
     _notifRows = data.notifications || [];
     renderNotifications();
@@ -3409,7 +3432,7 @@ async function openRecentModal() {
   $('recentStatus').textContent = 'Loading…';
   $('recentSyncNote').textContent = '';
   try {
-    const r = await fetch('/api/history');
+    const r = await fetch(appUrl('/api/history'));
     const data = await r.json();
     const rows = data.records || [];
     const n = renderHistoryInto(rows, $('recentTbody'));
@@ -3468,7 +3491,7 @@ $('coverSaveCb').addEventListener('change', () => {
 
 async function loadCovers() {
   try {
-    const r = await fetch('/api/covers');
+    const r = await fetch(appUrl('/api/covers'));
     if (!r.ok) return;
     const data = await r.json();
     coversEnabled = !!data.enabled;
@@ -3718,6 +3741,12 @@ def create_app(config_path: str = "config.ini") -> Flask:
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        # Keep the cookie root-scoped so local unprefixed development routes
+        # and the reverse-proxied /user-management routes share a session,
+        # but give it its own name so it can't clash with other apps served
+        # from the same host (the default Flask cookie is just "session").
+        SESSION_COOKIE_PATH="/",
+        SESSION_COOKIE_NAME="user_management_session",
         # HTTPS-only cookies when hosted; opt out for local testing with a
         # password by setting SWAP_WEB_ALLOW_INSECURE_COOKIE=1.
         SESSION_COOKIE_SECURE=password_required
@@ -3725,6 +3754,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
     )
     # Render/Fly terminate TLS at a proxy; trust one hop of X-Forwarded-*.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # type: ignore[method-assign]
+    app.wsgi_app = UserManagementPrefixMiddleware(app.wsgi_app)  # type: ignore[method-assign]
 
     _AUTH_FAIL_LOCK = threading.Lock()
     _auth_failures = {"count": 0, "window_start": 0.0}

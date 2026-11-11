@@ -1,0 +1,43 @@
+# systemd unit for the user-management app on EC2.
+#
+# Assumes the repo is cloned to /home/ubuntu/user-management with a
+# virtualenv at .venv inside it (see deploy/README.md). If you use a
+# different user or folder, change User, WorkingDirectory,
+# EnvironmentFile and ExecStart below to match.
+#
+# Install:
+#   sudo cp deploy/user-management.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now user-management
+
+[Unit]
+Description=User management (Pipefy assignee swap) web UI
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/user-management
+# Secrets and settings, one KEY=value per line (template: deploy/env.example).
+EnvironmentFile=/home/ubuntu/user-management/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+# Site is plain HTTP (no TLS yet): without this, browsers drop the
+# Secure session cookie and sign-in loops. Remove once HTTPS is set up.
+Environment=SWAP_WEB_ALLOW_INSECURE_COOKIE=1
+
+# One worker process (gunicorn's minimum; also required because preview
+# plans and the log ring live in process memory) with 4 threads.
+# Bound to localhost so it's only reachable through nginx.
+#
+# --timeout only restarts a worker that stops responding entirely. With
+# threads, a long request (a big Apply) doesn't trip it; nginx's
+# proxy_read_timeout (3600s) is what limits how long a request can run.
+ExecStart=/home/ubuntu/user-management/.venv/bin/gunicorn \
+    --workers 1 --threads 4 --timeout 600 \
+    --bind 127.0.0.1:5010 \
+    'swap_assignee.web:create_app()'
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

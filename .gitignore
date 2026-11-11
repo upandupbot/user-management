@@ -7,6 +7,8 @@ service-account*.json
 
 # Local config (contains the Pipefy API token + secrets) — use config.example.ini as the template
 config.ini
+# Server environment file (tokens, passwords) — use deploy/env.example as the template
+.env
 
 # Local audit store
 .swap_assignee/
