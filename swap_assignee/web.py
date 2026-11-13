@@ -143,6 +143,73 @@ def describe_change(operation: str, old_user: str, new_user: str) -> str:
     return f"replace {old} with {new}"
 
 
+# Roles that carry over from a job to its child cards on other boards. Same
+# field slug on every board (see PIPES.md), so the label is a fallback only.
+CRUCIAL_ROLE_FIELDS = {"account_manager_1": "Account Manager", "trafficker": "Traffic Manager"}
+_CRUCIAL_ROLE_LABELS = {"account manager": "Account Manager", "traffic manager": "Traffic Manager"}
+
+
+def crucial_roles_in_plan(plan_dict: Dict[str, Any]) -> List[str]:
+    """Account Manager / Traffic Manager roles this planned change touches."""
+    roles: List[str] = []
+    for a in plan_dict.get("actions") or []:
+        fid = str(a.get("field_id") or "").strip().lower()
+        label = " ".join(str(a.get("field_label") or "").lower().split())
+        role = CRUCIAL_ROLE_FIELDS.get(fid) or _CRUCIAL_ROLE_LABELS.get(label)
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def find_unselected_child_boards(
+    client: Any,
+    card_ids: List[str],
+    selected_pipe_ids: set,
+    known_pipes: List[Dict[str, str]],
+    *,
+    batch_size: int = 25,
+) -> List[Dict[str, Any]]:
+    """Job boards (from `known_pipes`) that hold child cards of `card_ids` but
+    weren't selected for the scan. Read-only: one aliased Pipefy query per
+    `batch_size` cards. Lookup databases (Agency DB, client Products,
+    Divisions...) aren't in `known_pipes`, so they're ignored, and review
+    tasks are skipped by label.
+
+    Returns [{"id", "name", "jobs": <parent jobs with children there>,
+    "cards": <child cards there>}], largest first.
+    """
+    names = {str(p["id"]): p["name"] for p in known_pipes}
+    selected = {str(x) for x in selected_pipe_ids}
+    ids = [str(c) for c in card_ids if str(c).isdigit()]
+    jobs_by_pipe: Dict[str, set] = {}
+    cards_by_pipe: Dict[str, set] = {}
+    for start in range(0, len(ids), batch_size):
+        chunk = ids[start:start + batch_size]
+        parts = [
+            f'c{i}: card(id: "{cid}") {{ id child_relations {{ cards {{ id pipe {{ id }} labels {{ name }} }} }} }}'
+            for i, cid in enumerate(chunk)
+        ]
+        data = client.execute("query { " + " ".join(parts) + " }") or {}
+        for i, cid in enumerate(chunk):
+            card = data.get(f"c{i}") or {}
+            for rel in card.get("child_relations") or []:
+                for child in rel.get("cards") or []:
+                    pid = str(((child.get("pipe") or {}).get("id")) or "")
+                    if pid not in names or pid in selected:
+                        continue
+                    labels = {str((lab or {}).get("name") or "").strip().lower() for lab in child.get("labels") or []}
+                    if "review task" in labels:
+                        continue
+                    jobs_by_pipe.setdefault(pid, set()).add(cid)
+                    cards_by_pipe.setdefault(pid, set()).add(str(child.get("id")))
+    boards = [
+        {"id": pid, "name": names[pid], "jobs": len(jobs), "cards": len(cards_by_pipe.get(pid, ()))}
+        for pid, jobs in jobs_by_pipe.items()
+    ]
+    boards.sort(key=lambda b: (-b["jobs"], b["name"]))
+    return boards
+
+
 def _action_roles(plan_dict: Dict[str, Any]) -> str:
     roles: List[str] = []
     for a in plan_dict.get("actions") or []:
@@ -1747,6 +1814,7 @@ __ENV_BANNER__
       <span class="hint" id="resultsHint">Nothing changes until you apply</span>
     </div>
     <div id="scanSummary" class="alert hidden" style="margin-bottom: 16px;"></div>
+    <div id="childBoardsAlert" class="alert warn hidden" role="status"></div>
     <div id="pipeGroups"></div>
   </section>
 
@@ -2057,6 +2125,7 @@ function setWizardOperation(operation) {
   $('phasePickList').innerHTML = '';
   $('pipeGroups').innerHTML = '';
   $('scanSummary').className = 'alert hidden';
+  $('childBoardsAlert').classList.add('hidden');
   ['pipesPanel', 'phasesPanel', 'resultsPanel'].forEach(id => $(id).classList.add('hidden'));
   wizGroups.clear();
   wizUsers = null;
@@ -2375,6 +2444,7 @@ async function runWizardScan() {
   const sum = $('scanSummary');
   sum.className = 'alert';
   sum.classList.remove('hidden');
+  $('childBoardsAlert').classList.add('hidden');
   sum.textContent = wizOperation === 'assign'
     ? 'Scanning for cards that mention the client…'
     : (wizOperation === 'add'
@@ -2569,6 +2639,9 @@ function handleScanEvent(evt) {
     case 'pipe_error':
       pipeGroupError(evt);
       break;
+    case 'child_boards_warning':
+      renderChildBoardsWarning(evt);
+      break;
     case 'all_done': {
       const s = $('scanSummary');
       const withJobs = Array.from(wizGroups.values()).filter(x => x.plans > 0);
@@ -2590,6 +2663,36 @@ function handleScanEvent(evt) {
     default:
       break;
   }
+}
+
+// Replace mode: the leaver is Account Manager / Traffic Manager on jobs that
+// have child cards on boards that weren't ticked in step 2.
+function renderChildBoardsWarning(evt) {
+  const box = $('childBoardsAlert');
+  const boards = evt.boards || [];
+  if (!boards.length) { box.classList.add('hidden'); return; }
+  const roles = (evt.roles || []).join(' and ') || 'Account Manager or Traffic Manager';
+  const list = boards.map(b =>
+    `<li><b>${escapeHtml(b.name)}</b>: child cards on ${b.jobs} job${b.jobs === 1 ? '' : 's'}</li>`).join('');
+  box.innerHTML =
+    `<b>Some of these jobs have child cards on boards you didn't pick.</b>` +
+    `<div style="margin-top:4px;">This person is being replaced as ${escapeHtml(roles)}, and those roles carry over to child cards. ` +
+    `Add these boards so they're replaced there too:</div>` +
+    `<ul style="margin:6px 0 8px 18px;padding:0;">${list}</ul>` +
+    `<button type="button" class="ghost sm" id="childBoardsAdd">Add these boards</button>` +
+    `<span class="small" id="childBoardsStatus" style="margin-left:10px;"></span>`;
+  box.classList.remove('hidden');
+  $('childBoardsAdd').addEventListener('click', () => {
+    const added = [];
+    boards.forEach(b => {
+      const cb = document.querySelector(`#pipePickList input[data-pipe="${CSS.escape(String(b.id))}"]`);
+      if (cb && !cb.checked) { cb.checked = true; added.push(b.name); }
+    });
+    $('childBoardsStatus').textContent = added.length
+      ? `Added ${added.join(', ')} in step 2. Press Continue there, tick the roles, then find their jobs again.`
+      : 'Those boards are already ticked in step 2. Press Continue there to scan again.';
+    $('pipesPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
 }
 
 // ---------- per-pipe result groups ----------
@@ -4685,6 +4788,10 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     return
                 total_plans = 0
                 pipes_scanned = 0
+                # Replace mode: jobs where the leaver is swapped as Account
+                # Manager / Traffic Manager. Their child cards on unticked
+                # boards would keep the leaver, so warn at the end.
+                crucial_jobs: Dict[str, List[str]] = {}
                 for pid in pipe_ids:
                     pname = names.get(pid, pid)
                     try:
@@ -4734,6 +4841,11 @@ def create_app(config_path: str = "config.ini") -> Flask:
                             t = evt.get("type")
                             if t == "plan":
                                 plans_n += 1
+                                if operation == "replace":
+                                    plan_d = evt.get("plan") or {}
+                                    roles = crucial_roles_in_plan(plan_d)
+                                    if roles and plan_d.get("card_id"):
+                                        crucial_jobs[str(plan_d["card_id"])] = roles
                             if t == "done":
                                 yield json.dumps({
                                     "type": "pipe_done", "pipe_id": pid,
@@ -4754,6 +4866,22 @@ def create_app(config_path: str = "config.ini") -> Flask:
                         yield json.dumps({
                             "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
                             "message": f"Scan failed: {exc}",
+                        }) + "\n"
+                if crucial_jobs:
+                    try:
+                        boards = find_unselected_child_boards(
+                            client, list(crucial_jobs), set(pipe_ids), KNOWN_PIPES,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - a warning must never break the scan
+                        log.warning("child board check failed: %s", exc)
+                        boards = []
+                    if boards:
+                        roles_seen = sorted({r for rs in crucial_jobs.values() for r in rs})
+                        yield json.dumps({
+                            "type": "child_boards_warning",
+                            "boards": boards,
+                            "roles": roles_seen,
+                            "jobs_checked": len(crucial_jobs),
                         }) + "\n"
                 yield json.dumps({
                   "type": "all_done", "pipes_scanned": pipes_scanned,
