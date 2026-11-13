@@ -149,6 +149,28 @@ CRUCIAL_ROLE_FIELDS = {"account_manager_1": "Account Manager", "trafficker": "Tr
 _CRUCIAL_ROLE_LABELS = {"account manager": "Account Manager", "traffic manager": "Traffic Manager"}
 
 
+# People fields the web app never offers or changes:
+# - "reviewer": the reviewer on review-task cards, owned by the Ziflow tasking
+#   integration (it closes/creates those tasks itself).
+# - "blank_assignee": a placeholder field on Creative, not a real role.
+# Only these exact fields: real roles such as "Responsible - Reviewer" or
+# "Creative internal reviewer(s)" stay available. The CLI is unaffected.
+HIDDEN_ROLE_FIELD_IDS = frozenset({"reviewer", "blank_assignee"})
+_HIDDEN_ROLE_LABELS = frozenset({"reviewer", "blank_assignee", "blank assignee"})
+
+
+def is_hidden_role_field(field_id: Any, label: Any = "") -> bool:
+    fid = str(field_id or "").strip().lower()
+    lab = " ".join(str(label or "").strip().lower().split())
+    return fid in HIDDEN_ROLE_FIELD_IDS or lab in _HIDDEN_ROLE_LABELS
+
+
+def visible_role_fields(fields: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Discovered assignee fields minus the hidden ones."""
+    return {fid: m for fid, m in (fields or {}).items()
+            if not is_hidden_role_field(fid, (m or {}).get("label"))}
+
+
 def crucial_roles_in_plan(plan_dict: Dict[str, Any]) -> List[str]:
     """Account Manager / Traffic Manager roles this planned change touches."""
     roles: List[str] = []
@@ -4295,7 +4317,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
             )
 
         try:
-            fields_meta = discover_assignee_fields(client, pipe_id)
+            fields_meta = visible_role_fields(discover_assignee_fields(client, pipe_id))
         except Exception as exc:
             return jsonify({"error": f"Could not discover fields: {exc}"}), 500
 
@@ -4355,7 +4377,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
             "new_user": {"id": new_u.id, "name": new_u.name, "email": new_u.email},
         }
 
-        field_filter = set(field_ids)
+        field_filter = {f for f in field_ids if not is_hidden_role_field(f)}
         use_fast_path = include_card_level or bool(field_filter)
 
         # Emit phase metadata up-front so the UI can show what we're
@@ -4572,7 +4594,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     card_hit = probe_card_level_assignee(client, pid, user.id)
                     fields_out = []
                     try:
-                        fields = discover_assignee_fields(client, pid)
+                        fields = visible_role_fields(discover_assignee_fields(client, pid))
                     except Exception as exc:  # noqa: BLE001
                         log.warning("discover: field discovery failed for %s: %s", pid, exc)
                         fields = {}
@@ -4693,7 +4715,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 "phases": pipe_phases,
             })
             try:
-                fields = discover_assignee_fields(client, pid)
+                fields = visible_role_fields(discover_assignee_fields(client, pid))
             except Exception as exc:  # noqa: BLE001
                 log.warning("wizard: field discovery failed for %s: %s", pid, exc)
                 errors.append(f"Could not list roles for {names.get(pid, pid)}.")
@@ -4795,7 +4817,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 for pid in pipe_ids:
                     pname = names.get(pid, pid)
                     try:
-                        fields = discover_assignee_fields(client, pid)
+                        fields = visible_role_fields(discover_assignee_fields(client, pid))
                     except Exception as exc:  # noqa: BLE001
                         yield json.dumps({
                             "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,
@@ -4968,7 +4990,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
                 for pid in pipe_ids:
                     pname = names.get(pid, pid)
                     try:
-                        fields = discover_assignee_fields(client, pid)
+                        fields = visible_role_fields(discover_assignee_fields(client, pid))
                     except Exception as exc:  # noqa: BLE001
                         yield json.dumps({
                             "type": "pipe_error", "pipe_id": pid, "pipe_name": pname,

@@ -44,61 +44,6 @@ def normalize_phase(name: Optional[str]) -> str:
     return " ".join((name or "").strip().lower().split())
 
 
-# Ziflow/online-review cards are process artifacts, not real jobs — every scan
-# mode skips them. Marked either by a card label or the "Online review status"
-# (ziflow_status) label_select field being set to "Review Task".
-REVIEW_TASK_MARKER = "review task"
-_REVIEW_STATUS_FIELD_PATTERNS = ("online review status", "ziflow_status")
-
-
-def _field_text_candidates(fnode: Dict[str, Any]) -> List[str]:
-    """Possible display strings for a field value (handles JSON-encoded lists)."""
-    out: List[str] = []
-    val = fnode.get("value")
-    if isinstance(val, str):
-        s = val.strip()
-        if s[:1] in '[{"':
-            try:
-                dec = json.loads(s)
-            except Exception:
-                dec = None
-            if isinstance(dec, list):
-                out.extend(str(x) for x in dec if isinstance(x, (str, int)))
-            elif isinstance(dec, str):
-                out.append(dec)
-            elif dec is None and s:
-                out.append(s)
-        elif s:
-            out.append(s)
-    elif isinstance(val, list):
-        out.extend(str(x) for x in val if isinstance(x, (str, int)))
-    av = fnode.get("array_value")
-    if isinstance(av, list):
-        for item in av:
-            if isinstance(item, dict) and item.get("name"):
-                out.append(str(item["name"]))
-            elif isinstance(item, str):
-                out.append(item)
-    return out
-
-
-def is_review_task_card(card: Dict[str, Any]) -> bool:
-    """True when the card is a Review Task (card label or online-review field)."""
-    for lab in card.get("labels") or []:
-        name = lab.get("name") if isinstance(lab, dict) else lab
-        if normalize_phase(str(name or "")) == REVIEW_TASK_MARKER:
-            return True
-    for fnode in card.get("fields") or []:
-        meta = (fnode or {}).get("field") or {}
-        hay = f"{meta.get('label') or ''} {fnode.get('name') or ''} {meta.get('id') or ''}".lower()
-        if not any(p in hay for p in _REVIEW_STATUS_FIELD_PATTERNS):
-            continue
-        for text in _field_text_candidates(fnode):
-            if normalize_phase(text) == REVIEW_TASK_MARKER:
-                return True
-    return False
-
-
 def parse_field_user_ids(field_node: Dict[str, Any]) -> List[str]:
     """Coerce a Pipefy field's value/array_value into a list of user-id strings (digits)."""
     out: List[str] = []
@@ -324,7 +269,7 @@ def card_matches_text(card: Dict[str, Any], text: str) -> bool:
 # mode skips them. Marked either by a card label or the "Online review status"
 # (ziflow_status) label_select field being set to "Review Task".
 REVIEW_TASK_MARKER = "review task"
-_REVIEW_STATUS_FIELD_PATTERNS = ("online review status", "ziflow_status")
+_REVIEW_STATUS_FIELD_PATTERNS = ("online review status", "online_review_status", "ziflow_status")
 
 
 def _field_text_candidates(fnode: Dict[str, Any]) -> List[str]:
