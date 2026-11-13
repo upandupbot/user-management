@@ -21,9 +21,10 @@ pipefy_api_url = https://api.pipefy.com/graphql
 pipefy_api_token = <your token>
 
 [PaperTrail]
+papertrail_log_url = <optional; HTTPS log endpoint>
 papertrail_log_token = <optional>
 papertrail_host = logs.papertrailapp.com
-papertrail_port = <optional>
+papertrail_port = <optional; legacy syslog>
 
 [Audit]
 # Optional. Mirror applied swaps into a shared Google Sheet. Pick ONE method:
@@ -122,7 +123,8 @@ All secrets come from env vars — never commit `config.ini` or key files:
 | `PIPEFY_API_TOKEN`                | yes          | Pipefy API token                                                                             |
 | `SWAP_WEB_PASSWORD`               | yes (hosted) | Shared sign-in password for the UI                                                           |
 | `SWAP_WEB_SECRET_KEY`             | no           | Session signing key (auto-derived from the password if omitted)                              |
-| `PAPERTRAIL_LOG_TOKEN`            | no           | Remote logging                                                                               |
+| `PAPERTRAIL_LOG_URL`              | no           | Papertrail HTTPS log endpoint (activity logging)                                            |
+| `PAPERTRAIL_LOG_TOKEN`            | no           | Papertrail token                                                                             |
 | `SWAP_AUDIT_SHEET_ID`             | no           | Google Sheets audit mirror                                                                   |
 | `SWAP_AUDIT_SERVICE_ACCOUNT_JSON` | no           | Paste the whole service-account key-file JSON (hosted alternative to `service_account_file`) |
 

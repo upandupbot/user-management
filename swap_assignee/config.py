@@ -21,6 +21,8 @@ class Config:
     papertrail_token: Optional[str] = None
     papertrail_host: Optional[str] = None
     papertrail_port: Optional[int] = None
+    # HTTPS log endpoint (preferred). Same key as the other integrations' segredo.ini.
+    papertrail_log_url: Optional[str] = None
     audit_webhook_url: Optional[str] = None
     audit_sheet_id: Optional[str] = None
     audit_service_account_file: Optional[str] = None
@@ -78,6 +80,7 @@ def load_config(path: str | os.PathLike[str] = "config.ini") -> Config:
     pt_host = _clean(paper.get("papertrail_host") if paper else None) or DEFAULT_PAPERTRAIL_HOST
     pt_port_raw = _clean(paper.get("papertrail_port") if paper else None)
     pt_port = int(pt_port_raw) if pt_port_raw else None
+    pt_log_url = os.environ.get("PAPERTRAIL_LOG_URL") or _clean(paper.get("papertrail_log_url") if paper else None)
 
     audit_webhook = (
         os.environ.get("SWAP_AUDIT_WEBHOOK_URL")
@@ -106,6 +109,7 @@ def load_config(path: str | os.PathLike[str] = "config.ini") -> Config:
         papertrail_token=pt_token or None,
         papertrail_host=pt_host,
         papertrail_port=pt_port,
+        papertrail_log_url=pt_log_url or None,
         audit_webhook_url=audit_webhook or None,
         audit_sheet_id=audit_sheet_id or None,
         audit_service_account_file=audit_sa_file or None,

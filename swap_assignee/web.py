@@ -50,7 +50,7 @@ from .card_iterator import (
 )
 from .cli import _resolve_users  # reuse exactly the CLI's resolution flow
 from .config import load_config, mask_secret
-from .papertrail_logger import attach_papertrail
+from .papertrail_logger import activity, attach_papertrail
 from .pipefy_client import PipefyClient
 from .swap_engine import (
     DEFAULT_EXCLUDED_PHASES,
@@ -125,6 +125,31 @@ def pipes_from_env() -> Optional[List[Dict[str, str]]]:
     if not pipes:
         raise SystemExit("SWAP_PIPES is set but lists no pipes")
     return pipes
+
+
+def describe_change(operation: str, old_user: str, new_user: str) -> str:
+    """Plain words for what an Apply does, e.g. "replace Kate Ndlovu with
+    Robyn Seymour" or "add Nate to Standard Bank cards", for activity logs."""
+    record = {"operation": operation, "old_user": old_user, "new_user": new_user}
+    mode = change_mode(record)
+    new = _person_label(new_user, fallback="someone")
+    old = _person_label(old_user, fallback="someone")
+    if mode == "client":
+        return f"add {new} to {client_match_text(record) or 'client'} cards"
+    if mode == "coassign":
+        return f"add {new} alongside {old}"
+    if mode == "undo":
+        return f"remove {old} (undo a saved co-assignee addition)"
+    return f"replace {old} with {new}"
+
+
+def _action_roles(plan_dict: Dict[str, Any]) -> str:
+    roles: List[str] = []
+    for a in plan_dict.get("actions") or []:
+        role = "Card assignee" if a.get("scope") == "card" else (a.get("field_label") or "")
+        if role and role not in roles:
+            roles.append(role)
+    return ", ".join(roles) or "no roles"
 
 
 def session_cookie_name(prefix: str) -> str:
@@ -203,7 +228,11 @@ class _RingHandler(logging.Handler):
             }
             _LOG_RING.append(entry)
             optional_dependency_notice = "Google API libraries not installed" in msg
-            if record.levelno >= logging.WARNING and not optional_dependency_notice:
+            # Activity lines (sign-ins, applies) go to Papertrail and the live
+            # log, not the bell: failed cards already show as change
+            # notifications, and a mistyped password isn't a developer alert.
+            is_activity = record.name.startswith("swap_assignee.activity")
+            if record.levelno >= logging.WARNING and not optional_dependency_notice and not is_activity:
                 _NOTIFICATION_RING.append({
                     "id": entry["seq"],
                     "ts": entry["ts"],
@@ -3867,8 +3896,20 @@ def create_app(config_path: str = "config.ini") -> Flask:
             _auth_failures["count"] += 1
             return _auth_failures["count"] > 10
 
-    attach_papertrail(cfg.papertrail_token, cfg.papertrail_host, cfg.papertrail_port)
+    # Papertrail identifier matches the URL: user-management (live) or
+    # user-management-staging, so the copies are easy to tell apart.
+    papertrail_on = attach_papertrail(
+        cfg.papertrail_token, cfg.papertrail_host, cfg.papertrail_port,
+        log_url=cfg.papertrail_log_url, identifier=url_prefix.strip("/").replace("/", "-"),
+    )
     _install_log_capture()
+    activity(
+        "App started%s: boards %s; shared Sheet %s; Papertrail %s",
+        f" ({env_label})" if env_label else "",
+        ", ".join(p["name"] for p in KNOWN_PIPES),
+        "configured" if cfg.audit_sheet_id else "not configured",
+        "on" if papertrail_on else "off",
+    )
     client = PipefyClient(cfg.pipefy_api_url, cfg.pipefy_api_token)
     audit_store = AuditStore()
     audit_sheet_sink = build_sheet_sink(
@@ -3928,6 +3969,8 @@ def create_app(config_path: str = "config.ini") -> Flask:
         body = request.get_json(force=True, silent=True) or {}
         email = normalize_email(body.get("email"))
         if not is_allowed_email(email):
+            activity("Sign-in refused: %s is not on an approved domain", email or "(blank)",
+                     level=logging.WARNING)
             return jsonify({
                 "ok": False,
                 "error": "Enter a valid company email on an approved domain.",
@@ -3937,17 +3980,22 @@ def create_app(config_path: str = "config.ini") -> Flask:
             supplied = str(body.get("password") or "")
             if not secrets.compare_digest(supplied, cfg.web_password or ""):
                 if _throttle_failed_auth():
-                    log.warning("auth: too many failed password attempts")
+                    activity("Sign-in locked: too many wrong passwords (latest from %s)", email,
+                             level=logging.WARNING)
                     return jsonify({"ok": False, "error": "Too many attempts. Try again later."}), 429
+                activity("Sign-in failed: wrong password for %s", email, level=logging.WARNING)
                 time.sleep(0.5)  # slow down guessing
                 return jsonify({"ok": False, "error": "Wrong password."}), 403
         session.permanent = True
         session["operator_email"] = email
-        log.info("auth: %s signed in", email)
+        activity("Signed in: %s", email)
         return jsonify({"ok": True, "email": email})
 
     @app.post("/api/logout")
     def api_logout():
+        who = normalize_email(session.get("operator_email") or "")
+        if who:
+            activity("Signed out: %s", who)
         session.clear()
         return jsonify({"ok": True})
 
@@ -4095,6 +4143,8 @@ def create_app(config_path: str = "config.ini") -> Flask:
     @app.post("/api/logs")
     def api_logs():
         if not session.get("operator_email", "").casefold().endswith("@dydx.digital"):
+            activity("Developer settings refused for %s (not a dydx.digital account)",
+                     session.get("operator_email") or "a signed-out user", level=logging.WARNING)
             return jsonify({"error": "Developer settings are restricted."}), 403
         body = request.get_json(force=True, silent=True) or {}
         try:
@@ -4999,6 +5049,13 @@ def create_app(config_path: str = "config.ini") -> Flask:
         apply_id = str(body.get("apply_id") or "").strip()
         cancelled = False
         processed = 0
+        failed_cards = 0
+        change_words = describe_change(operation, old_user, new_user)
+        apply_started = time.time()
+        activity(
+            "Apply started by %s: %s on %d card(s) in %s (run %s)",
+            operator_email, change_words, len(selected), pipe_name or pipe_id, run_id,
+        )
         for plan in selected:
             if apply_id:
                 with _APPLY_CANCEL_LOCK:
@@ -5037,6 +5094,16 @@ def create_app(config_path: str = "config.ini") -> Flask:
             out_plans.append(d)
             if any_ok:
                 cards_changed += 1
+            if status != "ok":
+                failed_cards += 1
+            roles = _action_roles(d)
+            if status == "ok":
+                activity("%s: %s (%s) done (run %s)", plan.title or "Card", change_words, roles, run_id,
+                         card_id=plan.card_id)
+            else:
+                activity("%s: %s (%s) %s: %s (run %s)", plan.title or "Card", change_words, roles,
+                         "partly failed" if status == "partial" else "failed", "; ".join(err_msgs), run_id,
+                         card_id=plan.card_id, level=logging.ERROR)
             # Audit every applied card (local store + optional Google Sheet).
             try:
                 record_swap(
@@ -5061,6 +5128,14 @@ def create_app(config_path: str = "config.ini") -> Flask:
         # Cards skipped because of a mid-run cancel go back to "planned".
         if cancelled:
             remaining = selected[processed:] + remaining
+        took = time.time() - apply_started
+        if cancelled:
+            activity("Apply cancelled by %s after %d of %d card(s): %d changed, %d failed, %.0fs (run %s)",
+                     operator_email, processed, len(selected), cards_changed, failed_cards, took, run_id)
+        else:
+            activity("Apply finished by %s in %s: %d changed, %d failed, %.0fs (run %s)",
+                     operator_email, pipe_name or pipe_id, cards_changed, failed_cards, took, run_id,
+                     level=logging.WARNING if failed_cards else logging.INFO)
 
         # Surface the untouched cards as still-planned so the UI can keep them
         # selectable for a follow-up Apply.
@@ -5088,6 +5163,12 @@ def create_app(config_path: str = "config.ini") -> Flask:
                     },
                     cover_rows,
                 )
+                activity("Saved for undo by %s: \"%s\", %d card(s)%s (run %s)",
+                         operator_email,
+                         str(cover_req.get("name") or "").strip() or change_words,
+                         len({r["card_id"] for r in cover_rows}),
+                         f", undo planned {cover_req.get('end_date')}" if cover_req.get("end_date") else "",
+                         run_id)
             except Exception:  # noqa: BLE001 - cover memory must never block apply
                 log.exception("cover store write failed (apply succeeded)")
 
@@ -5215,6 +5296,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
         removed = 0
         skipped = 0
         done_ids: set = set()
+        undo_name = batch.get("name") or user_label
+        activity("Undo started by %s: remove %s from %d card(s) of \"%s\" (run %s)",
+                 operator_email, _person_label(user_label, fallback="someone"), len(by_card), undo_name, run_id)
         for card_id, card_rows in by_card.items():
             field_ids = {r["field_id"] for r in card_rows if r.get("field_id")}
             include_card_level = any((r.get("scope") or "") == "card" for r in card_rows)
@@ -5261,6 +5345,13 @@ def create_app(config_path: str = "config.ini") -> Flask:
             d = _plan_to_dict(plan)
             results.append({**base, "status": status, "detail": "; ".join(err_msgs),
                             "actions": d["actions"]})
+            if status == "ok":
+                activity("%s: removed %s (%s), undo of \"%s\" (run %s)", base["title"] or "Card",
+                         _person_label(user_label, fallback="someone"), _action_roles(d), undo_name, run_id,
+                         card_id=card_id)
+            else:
+                activity("%s: undo of \"%s\" failed: %s (run %s)", base["title"] or "Card", undo_name,
+                         "; ".join(err_msgs), run_id, card_id=card_id, level=logging.ERROR)
             # Audit the removal like any other apply.
             try:
                 record_swap(
@@ -5282,6 +5373,9 @@ def create_app(config_path: str = "config.ini") -> Flask:
             except Exception:  # noqa: BLE001 - audit must never block
                 log.exception("audit logging failed for cover removal %s", card_id)
 
+        activity("Undo finished by %s for \"%s\": %d removed, %d already gone, %d failed (run %s)",
+                 operator_email, undo_name, removed, skipped, len(by_card) - removed - skipped, run_id,
+                 level=logging.WARNING if len(by_card) - removed - skipped else logging.INFO)
         batch_ended = False
         if done_ids:
             try:
