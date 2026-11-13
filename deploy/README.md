@@ -52,7 +52,17 @@ service_account_file = /home/ubuntu/user-management-secrets/service-account.json
 
 [Web]
 password = <shared team password>
+
+[PaperTrail]
+papertrail_log_url = <same as the other integrations' segredo.ini>
+papertrail_log_token = <same as the other integrations' segredo.ini>
 ```
+
+The `[PaperTrail]` values send activity logs (sign-ins, applies with one
+line per card, undo, warnings and errors) to Papertrail, under
+`user-management` (or `user-management-staging`). Copy them from the
+`[PaperTrail]` section of `/home/ubuntu/creative-approval-tasking/segredo.ini`.
+Without them, nothing is sent; the app works the same.
 
 - `service_account_file` must be the **full path on the server**. A file
   name copied from a laptop's `config.ini` won't exist there.
