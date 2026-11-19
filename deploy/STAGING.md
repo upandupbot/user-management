@@ -120,6 +120,22 @@ sudo journalctl -u user-management-staging -n 20 --no-pager | grep "Board list"
 It should print `Board list limited by SWAP_PIPES to: …` with your test
 pipe.
 
+Health check (restarts staging if it stops responding; see README step 5):
+
+```bash
+sudo install -m 755 -o root -g root deploy/healthcheck.sh /usr/local/bin/user-management-healthcheck
+sudo cp deploy/user-management-staging-healthcheck.service deploy/user-management-staging-healthcheck.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now user-management-staging-healthcheck.timer
+```
+
+To try it, freeze the app and watch it come back within about 3 minutes:
+
+```bash
+sudo systemctl kill -s STOP user-management-staging
+sudo journalctl -t user-management-staging-healthcheck -f
+```
+
 ### 6. nginx
 
 Back up, then paste the two `location` blocks from

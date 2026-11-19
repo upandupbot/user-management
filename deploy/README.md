@@ -138,6 +138,39 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1/user-management/
 If `nginx -t` fails, nothing changes; restore the backup with
 `sudo cp /home/ubuntu/nginx-default.backup /etc/nginx/sites-enabled/default`.
 
+## 5. Health check (restart if it stops responding)
+
+systemd already restarts the app if it crashes (`Restart=always`) and starts
+it on boot. The health check covers the other case: the app is running but
+frozen. Every minute a timer calls `/api/health` on gunicorn directly; after
+3 failed checks in a row it restarts the app. When the app comes back it logs
+"Restarted by the health check" to Papertrail as a warning.
+
+```bash
+cd /home/ubuntu/user-management
+sudo install -m 755 -o root -g root deploy/healthcheck.sh /usr/local/bin/user-management-healthcheck
+sudo cp deploy/user-management-healthcheck.service deploy/user-management-healthcheck.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now user-management-healthcheck.timer
+systemctl list-timers user-management-healthcheck.timer --no-pager
+```
+
+The script is copied to `/usr/local/bin` owned by root because it runs as
+root (it has to, to restart the service), so it shouldn't run from a folder
+the app user can edit.
+
+Check it's working:
+
+```bash
+curl -s http://127.0.0.1:5010/user-management/api/health
+sudo journalctl -t user-management-healthcheck -n 20 --no-pager
+```
+
+The first prints `{"ok":true,...}`. The journal only has lines when a check
+fails or the app recovers. Stopping the app on purpose
+(`sudo systemctl stop user-management`) doesn't trigger a restart: the check
+skips a service that isn't running.
+
 ## Notes
 
 - **Workers:** gunicorn always runs a small manager process plus at least
@@ -161,6 +194,8 @@ git pull
 .venv/bin/pip install -r requirements.txt
 sudo systemctl restart user-management
 ```
+
+If `deploy/healthcheck.sh` changed, run the `install` line from step 5 again.
 
 Run these from inside `/home/ubuntu/user-management`; `git pull` and the
 `deploy/` paths only work there.
