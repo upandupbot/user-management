@@ -1,0 +1,9 @@
+# Checks the staging app responds; restarts it after 3 failed checks in a
+# row. Run every minute by user-management-staging-healthcheck.timer.
+[Unit]
+Description=Health check for the user-management staging app
+After=user-management-staging.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/user-management-healthcheck user-management-staging http://127.0.0.1:5011/user-management-staging/api/health /home/ubuntu/user-management-staging

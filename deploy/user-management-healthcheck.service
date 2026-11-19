@@ -1,0 +1,12 @@
+# Checks the live app responds; restarts it after 3 failed checks in a row.
+# Run every minute by user-management-healthcheck.timer. Install steps:
+# deploy/README.md, "Health check".
+[Unit]
+Description=Health check for the user-management app
+After=user-management.service
+
+[Service]
+Type=oneshot
+# Talks to gunicorn directly (not through nginx), so an nginx problem never
+# restarts the app.
+ExecStart=/usr/local/bin/user-management-healthcheck user-management http://127.0.0.1:5010/user-management/api/health /home/ubuntu/user-management

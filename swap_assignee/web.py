@@ -3947,8 +3947,37 @@ initGate();
 """
 
 
+# deploy/healthcheck.sh writes this file (in the app's working directory)
+# just before it restarts an app that stopped responding, so the restart is
+# reported on the next start instead of looking like a normal one.
+HEALTH_RESTART_MARKER = ".healthcheck-restart"
+
+
+def report_health_check_restart(marker: str = HEALTH_RESTART_MARKER) -> bool:
+    """Log a warning if the last restart came from the health check. Returns
+    True when it did. Never raises: a bad marker must not stop the app."""
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            note = fh.read(500).strip()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        note = f"marker unreadable: {exc}"
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    activity(
+        "Restarted by the health check: the app stopped responding%s",
+        f" ({note})" if note else "",
+        level=logging.WARNING,
+    )
+    return True
+
+
 def create_app(config_path: str = "config.ini") -> Flask:
     app = Flask(__name__)
+    started_at = time.time()
     cfg = load_config(config_path)
     url_prefix = url_prefix_from_env()
     # SWAP_ENV_LABEL (e.g. "Staging") puts a banner on the page so a test
@@ -4035,6 +4064,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         "configured" if cfg.audit_sheet_id else "not configured",
         "on" if papertrail_on else "off",
     )
+    report_health_check_restart()
     client = PipefyClient(cfg.pipefy_api_url, cfg.pipefy_api_token)
     audit_store = AuditStore()
     audit_sheet_sink = build_sheet_sink(
@@ -4055,7 +4085,7 @@ def create_app(config_path: str = "config.ini") -> Flask:
         if not password_required:
             return None
         path = request.path
-        if not path.startswith("/api/") or path in ("/api/auth", "/api/session"):
+        if not path.startswith("/api/") or path in ("/api/auth", "/api/session", "/api/health"):
             return None
         if session.get("operator_email"):
             return None
@@ -4064,6 +4094,13 @@ def create_app(config_path: str = "config.ini") -> Flask:
     @app.get("/")
     def index() -> Response:  # type: ignore[override]
         return Response(index_html, mimetype="text/html; charset=utf-8")
+
+    @app.get("/api/health")
+    def api_health():
+        # For deploy/healthcheck.sh. Deliberately touches nothing outside this
+        # process (no Pipefy, no Sheet): it answers "is the app responding?",
+        # so a Pipefy outage never triggers a pointless restart.
+        return jsonify({"ok": True, "uptime_seconds": int(time.time() - started_at)})
 
     @app.get("/api/session")
     def api_session():
