@@ -24,6 +24,7 @@ import html
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -3975,7 +3976,34 @@ def report_health_check_restart(marker: str = HEALTH_RESTART_MARKER) -> bool:
     return True
 
 
+# Gunicorn stops (instead of respawning the worker) when a worker exits with
+# this code while booting. See gunicorn.arbiter.Arbiter.WORKER_BOOT_ERROR.
+GUNICORN_WORKER_BOOT_ERROR = 3
+
+
 def create_app(config_path: str = "config.ini") -> Flask:
+    """Build the app. A settings problem (bad SWAP_PIPES, no Pipefy token...)
+    stops the process with exit code 3.
+
+    The settings checks raise SystemExit with a message, which exits with
+    code 1. Under gunicorn a worker exiting with 1 is simply respawned, at
+    once and forever: a bad SWAP_PIPES on staging logged 2.7 million errors
+    and filled 2 GB of disk in four days. Code 3 tells gunicorn the worker
+    can't boot, so gunicorn stops and systemd retries on its slower,
+    backed-off schedule instead.
+    """
+    try:
+        return _build_app(config_path)
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            raise
+        reason = exc.code if isinstance(exc.code, str) else f"exit code {exc.code}"
+        logging.getLogger(__name__).error("Can't start: %s", reason)
+        print(f"user-management can't start: {reason}", file=sys.stderr, flush=True)
+        raise SystemExit(GUNICORN_WORKER_BOOT_ERROR) from None
+
+
+def _build_app(config_path: str) -> Flask:
     app = Flask(__name__)
     started_at = time.time()
     cfg = load_config(config_path)

@@ -40,6 +40,12 @@ ExecStart=/home/ubuntu/user-management/.venv/bin/gunicorn \
 
 Restart=always
 RestartSec=5
+# If it keeps failing to start (e.g. a settings mistake), wait longer
+# between tries, from 5 s up to 5 min, instead of every 5 s forever.
+# Needs systemd 254+ (the server has 255). The wait goes back to 5 s
+# whenever the service is restarted by hand (e.g. on deploy).
+RestartSteps=10
+RestartMaxDelaySec=5min
 
 [Install]
 WantedBy=multi-user.target
